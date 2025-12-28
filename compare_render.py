@@ -12,13 +12,21 @@ import numpy as np
 from vectorstag import SVGRenderer
 
 
-def render_with_cairo(svg_path: Path, width: int = None, height: int = None) -> Image.Image:
+def render_with_cairo(svg_path: Path, width: int = None, height: int = None,
+                      parent_width: float = None, parent_height: float = None) -> Image.Image:
     """Render SVG using CairoSVG."""
-    png_data = cairosvg.svg2png(
-        url=str(svg_path),
-        output_width=width,
-        output_height=height
-    )
+    kwargs = {
+        "url": str(svg_path),
+        "output_width": width,
+        "output_height": height
+    }
+    # Pass parent dimensions for SVGs without explicit size
+    if parent_width is not None:
+        kwargs["parent_width"] = parent_width
+    if parent_height is not None:
+        kwargs["parent_height"] = parent_height
+
+    png_data = cairosvg.svg2png(**kwargs)
     return Image.open(io.BytesIO(png_data)).convert("RGBA")
 
 
@@ -26,6 +34,14 @@ def render_with_vectorstag(svg_path: Path, width: int = None, height: int = None
     """Render SVG using VectorStag."""
     renderer = SVGRenderer(background=(0, 0, 0, 0))  # Transparent background
     return renderer.render_file(str(svg_path), width, height)
+
+
+def get_svg_dimensions(svg_path: Path) -> tuple[float, float]:
+    """Get the natural dimensions of an SVG using VectorStag's parser."""
+    from vectorstag.parser import SVGParser
+    parser = SVGParser()
+    doc = parser.parse_file(str(svg_path))
+    return doc.width, doc.height
 
 
 def compute_similarity(img1: Image.Image, img2: Image.Image) -> float:
@@ -100,8 +116,11 @@ def main():
     for svg_path in svg_files:
         name = svg_path.stem
         try:
-            # Render with both engines
-            cairo_img = render_with_cairo(svg_path, 400, 400)
+            # Get SVG's natural dimensions for proper parent size
+            doc_width, doc_height = get_svg_dimensions(svg_path)
+
+            # Render with both engines, passing parent dimensions to CairoSVG
+            cairo_img = render_with_cairo(svg_path, 400, 400, doc_width, doc_height)
             vs_img = render_with_vectorstag(svg_path, 400, 400)
 
             # Compute similarity

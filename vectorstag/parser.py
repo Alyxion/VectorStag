@@ -300,6 +300,24 @@ class SVGParser:
         # Parse elements
         elements = self._parse_children(root, Transform.identity(), Style())
 
+        # If no explicit dimensions and no viewBox, compute from content
+        has_explicit_width = root.get("width") is not None
+        has_explicit_height = root.get("height") is not None
+
+        if not has_explicit_width or not has_explicit_height or (width == 0 or height == 0):
+            if not viewBox:
+                # Compute bounding box from elements
+                bbox = self._compute_elements_bbox(elements)
+                if bbox:
+                    min_x, min_y, max_x, max_y = bbox
+
+                    # Set dimensions to fit content (with small padding)
+                    padding = 5
+                    if not has_explicit_width or width == 0:
+                        width = max(max_x + padding, self.default_width)
+                    if not has_explicit_height or height == 0:
+                        height = max(max_y + padding, self.default_height)
+
         return SVGDocument(
             width=width,
             height=height,
@@ -830,3 +848,102 @@ class SVGParser:
             font_family=font_family,
             font_size=font_size
         )
+
+    def _compute_elements_bbox(self, elements: list) -> Optional[tuple[float, float, float, float]]:
+        """Compute bounding box of all elements."""
+        min_x = float('inf')
+        min_y = float('inf')
+        max_x = float('-inf')
+        max_y = float('-inf')
+
+        for elem in elements:
+            bbox = self._compute_element_bbox(elem)
+            if bbox:
+                min_x = min(min_x, bbox[0])
+                min_y = min(min_y, bbox[1])
+                max_x = max(max_x, bbox[2])
+                max_y = max(max_y, bbox[3])
+
+        if min_x == float('inf'):
+            return None
+
+        return (min_x, min_y, max_x, max_y)
+
+    def _compute_element_bbox(self, elem) -> Optional[tuple[float, float, float, float]]:
+        """Compute bounding box of a single element."""
+        if isinstance(elem, GroupElement):
+            return self._compute_elements_bbox(elem.children)
+
+        # Get base bounding box before transform
+        bbox = None
+
+        if isinstance(elem, RectElement):
+            bbox = (elem.x, elem.y, elem.x + elem.width, elem.y + elem.height)
+        elif isinstance(elem, CircleElement):
+            bbox = (elem.cx - elem.r, elem.cy - elem.r,
+                    elem.cx + elem.r, elem.cy + elem.r)
+        elif isinstance(elem, EllipseElement):
+            bbox = (elem.cx - elem.rx, elem.cy - elem.ry,
+                    elem.cx + elem.rx, elem.cy + elem.ry)
+        elif isinstance(elem, LineElement):
+            bbox = (min(elem.x1, elem.x2), min(elem.y1, elem.y2),
+                    max(elem.x1, elem.x2), max(elem.y1, elem.y2))
+        elif isinstance(elem, (PolygonElement, PolylineElement)):
+            if elem.points:
+                xs = [p[0] for p in elem.points]
+                ys = [p[1] for p in elem.points]
+                bbox = (min(xs), min(ys), max(xs), max(ys))
+        elif isinstance(elem, PathElement):
+            bbox = self._compute_path_bbox(elem.commands)
+        elif isinstance(elem, TextElement):
+            # Rough estimate for text
+            text_width = len(elem.text) * elem.font_size * 0.6
+            bbox = (elem.x, elem.y - elem.font_size, elem.x + text_width, elem.y)
+
+        if not bbox:
+            return None
+
+        # Apply transform to bounding box corners
+        corners = [
+            (bbox[0], bbox[1]),
+            (bbox[2], bbox[1]),
+            (bbox[2], bbox[3]),
+            (bbox[0], bbox[3])
+        ]
+
+        transformed = [elem.transform.apply(x, y) for x, y in corners]
+        xs = [p[0] for p in transformed]
+        ys = [p[1] for p in transformed]
+
+        # Expand bbox for stroke width
+        stroke_expand = elem.style.stroke_width / 2 if elem.style.stroke else 0
+
+        return (min(xs) - stroke_expand, min(ys) - stroke_expand,
+                max(xs) + stroke_expand, max(ys) + stroke_expand)
+
+    def _compute_path_bbox(self, commands: list) -> Optional[tuple[float, float, float, float]]:
+        """Compute bounding box from path commands."""
+        if not commands:
+            return None
+
+        points = []
+        for cmd in commands:
+            if cmd[0] == 'M':
+                points.append((cmd[1], cmd[2]))
+            elif cmd[0] == 'L':
+                points.append((cmd[1], cmd[2]))
+            elif cmd[0] == 'C':
+                # Include control points for conservative bbox
+                points.append((cmd[1], cmd[2]))
+                points.append((cmd[3], cmd[4]))
+                points.append((cmd[5], cmd[6]))
+            elif cmd[0] == 'Q':
+                points.append((cmd[1], cmd[2]))
+                points.append((cmd[3], cmd[4]))
+
+        if not points:
+            return None
+
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        return (min(xs), min(ys), max(xs), max(ys))

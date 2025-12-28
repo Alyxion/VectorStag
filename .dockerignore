@@ -1,0 +1,25 @@
+# Docker ignore file
+.git
+.gitignore
+.dockerignore
+*.md
+LICENSE
+docker-compose.yml
+
+# Python
+__pycache__
+*.py[cod]
+.venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# IDE
+.vscode
+.idea
+
+# Samples and comparison output (large files)
+samples/
+
+# macOS
+.DS_Store

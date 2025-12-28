@@ -1,7 +1,7 @@
 """SVG Renderer - Render parsed SVG to PIL Images."""
 
 import math
-from typing import Optional, Union
+from typing import Optional, Union, List, Tuple
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
@@ -17,16 +17,19 @@ from .parser import (
 class SVGRenderer:
     """Render SVG documents to PIL Images."""
 
-    def __init__(self, scale: float = 1.0, background: Optional[tuple[int, int, int, int]] = None):
+    def __init__(self, scale: float = 1.0, background: Optional[tuple[int, int, int, int]] = None,
+                 antialias: int = 2):
         """
         Initialize renderer.
 
         Args:
             scale: Scale factor for rendering
             background: Background color (RGBA). Default is white.
+            antialias: Anti-aliasing factor (1=none, 2=2x supersampling, 4=4x). Default is 2.
         """
         self.scale = scale
         self.background = background or (255, 255, 255, 255)
+        self.antialias = max(1, antialias)
         self.parser = SVGParser()
 
     def render(self, svg_content: str, width: Optional[int] = None,
@@ -65,17 +68,22 @@ class SVGRenderer:
         out_width = int((width or doc.width) * self.scale)
         out_height = int((height or doc.height) * self.scale)
 
-        # Create image
-        image = Image.new("RGBA", (out_width, out_height), self.background)
+        # Apply supersampling for anti-aliasing
+        aa = self.antialias
+        render_width = out_width * aa
+        render_height = out_height * aa
 
-        # Calculate scaling transform
-        scale_x = out_width / src_w if src_w else 1
-        scale_y = out_height / src_h if src_h else 1
+        # Create image at higher resolution for anti-aliasing
+        image = Image.new("RGBA", (render_width, render_height), self.background)
+
+        # Calculate scaling transform (including AA factor)
+        scale_x = render_width / src_w if src_w else 1
+        scale_y = render_height / src_h if src_h else 1
         scale = min(scale_x, scale_y)
 
         # Center the content
-        offset_x = (out_width - src_w * scale) / 2 - src_x * scale
-        offset_y = (out_height - src_h * scale) / 2 - src_y * scale
+        offset_x = (render_width - src_w * scale) / 2 - src_x * scale
+        offset_y = (render_height - src_h * scale) / 2 - src_y * scale
 
         transform = Transform.translate(offset_x, offset_y).multiply(
             Transform.scale(scale)
@@ -87,6 +95,10 @@ class SVGRenderer:
         # Render all elements
         for element in doc.elements:
             self._render_element(ctx, element)
+
+        # Downscale for anti-aliasing effect
+        if aa > 1:
+            image = image.resize((out_width, out_height), Image.LANCZOS)
 
         return image
 
@@ -279,11 +291,8 @@ class SVGRenderer:
         points = [(line.x1, line.y1), (line.x2, line.y2)]
         points = self._transform_points(ctx, line.transform, points)
 
-        stroke = self._get_stroke_color(ctx, line.style)
-        if stroke:
-            draw = ImageDraw.Draw(ctx.image, "RGBA")
-            width = max(1, int(line.style.stroke_width * self._get_scale(ctx, line.transform)))
-            draw.line(points, fill=stroke, width=width)
+        # Use proper stroke rendering with linecap
+        self._stroke_path(ctx, points, line.style, line.transform, closed=False)
 
     def _render_polyline(self, ctx: "RenderContext", polyline: PolylineElement):
         """Render a polyline."""
@@ -292,12 +301,8 @@ class SVGRenderer:
 
         points = self._transform_points(ctx, polyline.transform, polyline.points)
 
-        # Stroke only (no fill for polyline)
-        stroke = self._get_stroke_color(ctx, polyline.style)
-        if stroke:
-            draw = ImageDraw.Draw(ctx.image, "RGBA")
-            width = max(1, int(polyline.style.stroke_width * self._get_scale(ctx, polyline.transform)))
-            draw.line(points, fill=stroke, width=width)
+        # Stroke only (no fill for polyline) with proper linecap/linejoin
+        self._stroke_path(ctx, points, polyline.style, polyline.transform, closed=False)
 
     def _render_polygon(self, ctx: "RenderContext", polygon: PolygonElement):
         """Render a polygon."""
@@ -342,14 +347,12 @@ class SVGRenderer:
                     ctx, points, path.style, path.transform, bbox, None, fill_ref
                 )
 
-            # Stroke
-            stroke = self._get_stroke_color(ctx, path.style)
-            if stroke and len(points) >= 2:
-                draw = ImageDraw.Draw(ctx.image, "RGBA")
-                width = max(1, int(path.style.stroke_width * self._get_scale(ctx, path.transform)))
-                # Draw as lines
-                for i in range(len(points) - 1):
-                    draw.line([points[i], points[i + 1]], fill=stroke, width=width)
+            # Stroke with proper linecap/linejoin
+            # Check if polygon is closed (last point equals first)
+            is_closed = len(polygon_points) > 2 and self._point_distance(
+                polygon_points[0], polygon_points[-1]
+            ) < 0.01
+            self._stroke_path(ctx, points, path.style, path.transform, closed=is_closed)
 
     def _path_to_polygons(self, commands: list[tuple]) -> list[list[tuple[float, float]]]:
         """Convert path commands to a list of polygons."""
@@ -439,6 +442,237 @@ class SVGRenderer:
 
         return points
 
+    def _stroke_path(self, ctx: "RenderContext", points: List[Tuple[float, float]],
+                     style: Style, element_transform: Transform, closed: bool = False):
+        """Render a stroke with proper linecap and linejoin."""
+        stroke = self._get_stroke_color(ctx, style)
+        if not stroke or len(points) < 2:
+            return
+
+        width = style.stroke_width * self._get_scale(ctx, element_transform)
+        if width < 0.5:
+            return
+
+        half_width = width / 2.0
+        linecap = style.stroke_linecap
+        linejoin = style.stroke_linejoin
+
+        draw = ImageDraw.Draw(ctx.image, "RGBA")
+
+        # Build stroke outline as polygon
+        stroke_polygon = self._build_stroke_polygon(
+            points, half_width, linecap, linejoin, closed
+        )
+
+        if stroke_polygon and len(stroke_polygon) >= 3:
+            draw.polygon(stroke_polygon, fill=stroke)
+
+    def _build_stroke_polygon(self, points: List[Tuple[float, float]],
+                              half_width: float, linecap: str, linejoin: str,
+                              closed: bool) -> List[Tuple[float, float]]:
+        """Build a polygon representing the stroke outline."""
+        if len(points) < 2:
+            return []
+
+        # Remove duplicate consecutive points
+        clean_points = [points[0]]
+        for p in points[1:]:
+            if self._point_distance(clean_points[-1], p) > 0.01:
+                clean_points.append(p)
+        points = clean_points
+
+        if len(points) < 2:
+            return []
+
+        left_side = []   # Left side of stroke
+        right_side = []  # Right side of stroke
+
+        n = len(points)
+
+        for i in range(n):
+            p = points[i]
+
+            # Get direction vectors
+            if i == 0:
+                # First point
+                d = self._normalize(self._subtract(points[1], points[0]))
+                perp = (-d[1], d[0])
+
+                if closed and n > 2:
+                    # Use join with last segment
+                    d_prev = self._normalize(self._subtract(points[0], points[-1]))
+                    left_pt, right_pt = self._compute_join(
+                        points[-1], p, points[1], d_prev, d, half_width, linejoin
+                    )
+                else:
+                    # Apply linecap
+                    left_pt = (p[0] + perp[0] * half_width, p[1] + perp[1] * half_width)
+                    right_pt = (p[0] - perp[0] * half_width, p[1] - perp[1] * half_width)
+
+                    if linecap == "square":
+                        left_pt = (left_pt[0] - d[0] * half_width, left_pt[1] - d[1] * half_width)
+                        right_pt = (right_pt[0] - d[0] * half_width, right_pt[1] - d[1] * half_width)
+                    elif linecap == "round":
+                        # Add round cap points
+                        cap_points = self._round_cap(p, d, half_width, start=True)
+                        left_side.extend(cap_points)
+
+            elif i == n - 1:
+                # Last point
+                d = self._normalize(self._subtract(points[i], points[i-1]))
+                perp = (-d[1], d[0])
+
+                if closed and n > 2:
+                    # Use join with first segment
+                    d_next = self._normalize(self._subtract(points[1], points[0]))
+                    left_pt, right_pt = self._compute_join(
+                        points[i-1], p, points[0], d, d_next, half_width, linejoin
+                    )
+                else:
+                    # Apply linecap
+                    left_pt = (p[0] + perp[0] * half_width, p[1] + perp[1] * half_width)
+                    right_pt = (p[0] - perp[0] * half_width, p[1] - perp[1] * half_width)
+
+                    if linecap == "square":
+                        left_pt = (left_pt[0] + d[0] * half_width, left_pt[1] + d[1] * half_width)
+                        right_pt = (right_pt[0] + d[0] * half_width, right_pt[1] + d[1] * half_width)
+
+            else:
+                # Middle point - compute join
+                d_prev = self._normalize(self._subtract(p, points[i-1]))
+                d_next = self._normalize(self._subtract(points[i+1], p))
+                left_pt, right_pt = self._compute_join(
+                    points[i-1], p, points[i+1], d_prev, d_next, half_width, linejoin
+                )
+
+            left_side.append(left_pt)
+            right_side.append(right_pt)
+
+            # Add end cap for last point (non-closed paths)
+            if i == n - 1 and not closed and linecap == "round":
+                d = self._normalize(self._subtract(points[i], points[i-1]))
+                cap_points = self._round_cap(p, d, half_width, start=False)
+                right_side.extend(cap_points)
+
+        # Combine into single polygon (left side forward, right side backward)
+        right_side.reverse()
+        return left_side + right_side
+
+    def _compute_join(self, p_prev: Tuple[float, float], p: Tuple[float, float],
+                      p_next: Tuple[float, float], d_prev: Tuple[float, float],
+                      d_next: Tuple[float, float], half_width: float,
+                      linejoin: str) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        """Compute join points at a vertex."""
+        perp_prev = (-d_prev[1], d_prev[0])
+        perp_next = (-d_next[1], d_next[0])
+
+        # Check turn direction (cross product)
+        cross = d_prev[0] * d_next[1] - d_prev[1] * d_next[0]
+
+        if abs(cross) < 0.001:
+            # Nearly collinear - use simple perpendicular
+            left_pt = (p[0] + perp_prev[0] * half_width, p[1] + perp_prev[1] * half_width)
+            right_pt = (p[0] - perp_prev[0] * half_width, p[1] - perp_prev[1] * half_width)
+            return left_pt, right_pt
+
+        if linejoin == "bevel" or linejoin == "round":
+            # For bevel/round, use the outer points directly
+            left_prev = (p[0] + perp_prev[0] * half_width, p[1] + perp_prev[1] * half_width)
+            left_next = (p[0] + perp_next[0] * half_width, p[1] + perp_next[1] * half_width)
+            right_prev = (p[0] - perp_prev[0] * half_width, p[1] - perp_prev[1] * half_width)
+            right_next = (p[0] - perp_next[0] * half_width, p[1] - perp_next[1] * half_width)
+
+            if cross > 0:  # Left turn
+                # Miter on right, bevel on left
+                right_pt = self._line_intersection(
+                    (p[0] - perp_prev[0] * half_width, p[1] - perp_prev[1] * half_width),
+                    d_prev,
+                    (p[0] - perp_next[0] * half_width, p[1] - perp_next[1] * half_width),
+                    d_next
+                )
+                if right_pt is None:
+                    right_pt = right_prev
+                left_pt = left_prev  # Bevel uses the corner point
+            else:  # Right turn
+                left_pt = self._line_intersection(
+                    left_prev, d_prev, left_next, d_next
+                )
+                if left_pt is None:
+                    left_pt = left_prev
+                right_pt = right_prev
+
+            return left_pt, right_pt
+
+        else:  # miter
+            # Compute miter intersection
+            left_prev = (p[0] + perp_prev[0] * half_width, p[1] + perp_prev[1] * half_width)
+            left_next = (p[0] + perp_next[0] * half_width, p[1] + perp_next[1] * half_width)
+            right_prev = (p[0] - perp_prev[0] * half_width, p[1] - perp_prev[1] * half_width)
+            right_next = (p[0] - perp_next[0] * half_width, p[1] - perp_next[1] * half_width)
+
+            left_pt = self._line_intersection(left_prev, d_prev, left_next, d_next)
+            right_pt = self._line_intersection(right_prev, d_prev, right_next, d_next)
+
+            if left_pt is None:
+                left_pt = left_prev
+            if right_pt is None:
+                right_pt = right_prev
+
+            return left_pt, right_pt
+
+    def _round_cap(self, p: Tuple[float, float], d: Tuple[float, float],
+                   half_width: float, start: bool) -> List[Tuple[float, float]]:
+        """Generate points for a round line cap."""
+        points = []
+        n_points = 8
+        perp = (-d[1], d[0])
+
+        if start:
+            # Start cap - goes from right to left (clockwise)
+            for i in range(n_points + 1):
+                angle = math.pi / 2 + math.pi * i / n_points
+                px = p[0] + half_width * (d[0] * math.cos(angle) - d[1] * math.sin(angle))
+                py = p[1] + half_width * (d[1] * math.cos(angle) + d[0] * math.sin(angle))
+                points.append((px, py))
+        else:
+            # End cap - goes from left to right
+            for i in range(n_points + 1):
+                angle = -math.pi / 2 + math.pi * i / n_points
+                px = p[0] + half_width * (d[0] * math.cos(angle) - d[1] * math.sin(angle))
+                py = p[1] + half_width * (d[1] * math.cos(angle) + d[0] * math.sin(angle))
+                points.append((px, py))
+
+        return points
+
+    def _line_intersection(self, p1: Tuple[float, float], d1: Tuple[float, float],
+                           p2: Tuple[float, float], d2: Tuple[float, float]
+                           ) -> Optional[Tuple[float, float]]:
+        """Find intersection of two lines defined by point and direction."""
+        det = d1[0] * d2[1] - d1[1] * d2[0]
+        if abs(det) < 1e-10:
+            return None
+
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        t = (dx * d2[1] - dy * d2[0]) / det
+
+        return (p1[0] + t * d1[0], p1[1] + t * d1[1])
+
+    def _normalize(self, v: Tuple[float, float]) -> Tuple[float, float]:
+        """Normalize a 2D vector."""
+        length = math.sqrt(v[0] * v[0] + v[1] * v[1])
+        if length < 1e-10:
+            return (1.0, 0.0)
+        return (v[0] / length, v[1] / length)
+
+    def _subtract(self, a: Tuple[float, float], b: Tuple[float, float]) -> Tuple[float, float]:
+        """Subtract two 2D points/vectors."""
+        return (a[0] - b[0], a[1] - b[1])
+
+    def _point_distance(self, a: Tuple[float, float], b: Tuple[float, float]) -> float:
+        """Calculate distance between two points."""
+        return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+
     def _fill_and_stroke_polygon(self, ctx: "RenderContext",
                                  points: list[tuple[float, float]],
                                  style: Style,
@@ -454,16 +688,9 @@ class SVGRenderer:
                 ctx, points, style, element_transform, bbox, fill, fill_ref
             )
 
-        # Stroke
-        stroke = self._get_stroke_color(ctx, style)
-        if stroke and len(points) >= 2:
-            draw = ImageDraw.Draw(ctx.image, "RGBA")
-            width = max(1, int(style.stroke_width * self._get_scale(ctx, element_transform)))
-
-            # Close the polygon for stroke
-            closed_points = points + [points[0]]
-            for i in range(len(closed_points) - 1):
-                draw.line([closed_points[i], closed_points[i + 1]], fill=stroke, width=width)
+        # Stroke with proper linecap/linejoin
+        if len(points) >= 2:
+            self._stroke_path(ctx, points, style, element_transform, closed=True)
 
     def _fill_polygon_with_gradient_check(self, ctx: "RenderContext",
                                           points: list[tuple[float, float]],
@@ -481,19 +708,100 @@ class SVGRenderer:
 
             if match in ctx.gradients:
                 gradient = ctx.gradients[match]
-                self._fill_polygon_with_gradient(ctx, points, gradient, bbox, style.opacity)
+                self._fill_polygon_with_gradient(ctx, points, gradient, bbox, style.opacity,
+                                                 style.fill_rule)
                 return
 
-        # Simple fill
+        # Simple fill with fill-rule support
         if fill and len(points) >= 3:
+            self._fill_polygon_with_rule(ctx, points, fill, style.fill_rule)
+
+    def _fill_polygon_with_rule(self, ctx: "RenderContext",
+                                points: list[tuple[float, float]],
+                                fill: tuple[int, int, int, int],
+                                fill_rule: str):
+        """Fill a polygon with the specified fill rule."""
+        if fill_rule == "evenodd":
+            self._fill_polygon_evenodd(ctx, points, fill)
+        else:
+            # Default nonzero - use PIL's default
             draw = ImageDraw.Draw(ctx.image, "RGBA")
             draw.polygon(points, fill=fill)
+
+    def _fill_polygon_evenodd(self, ctx: "RenderContext",
+                              points: list[tuple[float, float]],
+                              fill: tuple[int, int, int, int]):
+        """Fill a polygon using the even-odd rule."""
+        if len(points) < 3:
+            return
+
+        # Get bounding box
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        min_x, max_x = int(min(xs)), int(max(xs)) + 1
+        min_y, max_y = int(min(ys)), int(max(ys)) + 1
+
+        # Clip to image bounds
+        min_x = max(0, min_x)
+        min_y = max(0, min_y)
+        max_x = min(ctx.image.width, max_x)
+        max_y = min(ctx.image.height, max_y)
+
+        if min_x >= max_x or min_y >= max_y:
+            return
+
+        width = max_x - min_x
+        height = max_y - min_y
+
+        # Create mask using scanline algorithm with even-odd rule
+        mask = np.zeros((height, width), dtype=np.uint8)
+
+        # Close the polygon
+        closed_points = list(points)
+        if closed_points[0] != closed_points[-1]:
+            closed_points.append(closed_points[0])
+
+        n = len(closed_points) - 1
+
+        # For each scanline
+        for y in range(height):
+            screen_y = y + min_y + 0.5  # Center of pixel
+
+            # Find intersections with all edges
+            intersections = []
+
+            for i in range(n):
+                p1 = closed_points[i]
+                p2 = closed_points[i + 1]
+
+                # Check if edge crosses this scanline
+                if (p1[1] <= screen_y < p2[1]) or (p2[1] <= screen_y < p1[1]):
+                    # Compute x intersection
+                    if abs(p2[1] - p1[1]) > 1e-10:
+                        t = (screen_y - p1[1]) / (p2[1] - p1[1])
+                        x_intersect = p1[0] + t * (p2[0] - p1[0])
+                        intersections.append(x_intersect)
+
+            # Sort intersections
+            intersections.sort()
+
+            # Fill between pairs (even-odd rule)
+            for i in range(0, len(intersections) - 1, 2):
+                x_start = max(0, int(intersections[i] - min_x))
+                x_end = min(width, int(intersections[i + 1] - min_x) + 1)
+                mask[y, x_start:x_end] = 255
+
+        # Apply fill using mask
+        fill_img = Image.new("RGBA", (width, height), fill)
+        mask_img = Image.fromarray(mask, "L")
+        ctx.image.paste(fill_img, (min_x, min_y), mask_img)
 
     def _fill_polygon_with_gradient(self, ctx: "RenderContext",
                                     points: list[tuple[float, float]],
                                     gradient: Union[LinearGradient, RadialGradient],
                                     bbox: tuple[float, float, float, float],
-                                    opacity: float):
+                                    opacity: float,
+                                    fill_rule: str = "nonzero"):
         """Fill a polygon with a gradient."""
         if not points or len(points) < 3:
             return
@@ -529,16 +837,53 @@ class SVGRenderer:
                 ctx, gradient, grad_width, grad_height, bbox, min_x, min_y, opacity
             )
 
-        # Create mask from polygon
-        mask = Image.new("L", (ctx.image.width, ctx.image.height), 0)
-        mask_draw = ImageDraw.Draw(mask)
-        mask_draw.polygon(points, fill=255)
-
-        # Crop mask to gradient bounds
-        mask_crop = mask.crop((min_x, min_y, max_x, max_y))
+        # Create mask from polygon with fill-rule support
+        if fill_rule == "evenodd":
+            mask_crop = self._create_evenodd_mask(points, min_x, min_y, grad_width, grad_height)
+        else:
+            mask = Image.new("L", (ctx.image.width, ctx.image.height), 0)
+            mask_draw = ImageDraw.Draw(mask)
+            mask_draw.polygon(points, fill=255)
+            mask_crop = mask.crop((min_x, min_y, max_x, max_y))
 
         # Apply gradient with mask
         ctx.image.paste(grad_img, (min_x, min_y), mask_crop)
+
+    def _create_evenodd_mask(self, points: list[tuple[float, float]],
+                             min_x: int, min_y: int, width: int, height: int) -> Image.Image:
+        """Create a mask using even-odd fill rule."""
+        mask = np.zeros((height, width), dtype=np.uint8)
+
+        # Close the polygon
+        closed_points = list(points)
+        if closed_points[0] != closed_points[-1]:
+            closed_points.append(closed_points[0])
+
+        n = len(closed_points) - 1
+
+        # For each scanline
+        for y in range(height):
+            screen_y = y + min_y + 0.5
+
+            intersections = []
+            for i in range(n):
+                p1 = closed_points[i]
+                p2 = closed_points[i + 1]
+
+                if (p1[1] <= screen_y < p2[1]) or (p2[1] <= screen_y < p1[1]):
+                    if abs(p2[1] - p1[1]) > 1e-10:
+                        t = (screen_y - p1[1]) / (p2[1] - p1[1])
+                        x_intersect = p1[0] + t * (p2[0] - p1[0])
+                        intersections.append(x_intersect)
+
+            intersections.sort()
+
+            for i in range(0, len(intersections) - 1, 2):
+                x_start = max(0, int(intersections[i] - min_x))
+                x_end = min(width, int(intersections[i + 1] - min_x) + 1)
+                mask[y, x_start:x_end] = 255
+
+        return Image.fromarray(mask, "L")
 
     def _create_linear_gradient_image(self, ctx: "RenderContext",
                                       gradient: LinearGradient,

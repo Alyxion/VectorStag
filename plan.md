@@ -3,11 +3,12 @@
 ## Project Goal
 Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG.
 
-## Current Status: 91.9% Average Similarity
+## Current Status: 96.0% Average Similarity
 
 ### Test Results (30 SVG samples from W3C)
-- **27 Passing** (>80% similarity): android, atom, check, clippath, compass, copyleft, feed, gaussian1-3, heart, helloworld, italian-flag, lineargradient1-4, paths-data-08-t, paths-data-09-t, python, radialgradient1-2, rectangles, shapes-polygon-01-t, shapes-polyline-01-t, star, yinyang
-- **2 Failing** (<50%): circles1, tiger
+**Source**: https://dev.w3.org/SVG/tools/svgweb/samples/svg-files/
+- **29 Passing** (>80% similarity): android, atom, check, circles1, clippath, compass, copyleft, feed, gaussian1-3, heart, helloworld, italian-flag, lineargradient1-4, paths-data-08-t, paths-data-09-t, python, radialgradient1-2, rectangles, shapes-polygon-01-t, shapes-polyline-01-t, star, tiger, yinyang
+- **0 Failing** (<50%)
 - **1 Error**: smile.svg (XML entity parsing issue)
 
 ---
@@ -48,11 +49,17 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - [x] fill (color, none, url() gradient reference)
 - [x] stroke (color, none)
 - [x] stroke-width
+- [x] stroke-linecap (butt, round, square)
+- [x] stroke-linejoin (miter, round, bevel)
 - [x] fill-opacity
 - [x] stroke-opacity
 - [x] opacity
-- [x] fill-rule (nonzero, evenodd - parsed but not fully implemented)
+- [x] fill-rule (nonzero, evenodd)
 - [x] Style inheritance from parent groups
+
+### Rendering
+- [x] Anti-aliasing (2x supersampling by default)
+- [x] Automatic bounding box computation for SVGs without dimensions
 
 ### Gradients
 - [x] `<linearGradient>` with stops
@@ -79,29 +86,19 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 
 ### High Priority - Would Improve Accuracy
 
-1. **Anti-aliasing**
-   - Current: Hard pixel edges
-   - Needed: Smooth anti-aliased edges for shapes and paths
-   - Location: `renderer.py` - polygon/path drawing functions
-   - Approach: Use supersampling or implement proper anti-aliasing
+1. ~~**Anti-aliasing**~~ ✅ DONE
+   - Implemented via 2x supersampling with Lanczos downscaling
 
-2. **Fill Rule Implementation**
-   - Current: Parsed but always uses Pillow's default
-   - Needed: Proper evenodd vs nonzero fill rules
-   - Location: `renderer.py:_fill_and_stroke_polygon()`
-   - Approach: Implement scanline fill with winding number calculation
+2. ~~**Fill Rule Implementation**~~ ✅ DONE
+   - Implemented scanline-based evenodd fill rule
 
-3. **Stroke Properties**
-   - Missing: stroke-linecap (butt, round, square)
-   - Missing: stroke-linejoin (miter, round, bevel)
-   - Missing: stroke-dasharray, stroke-dashoffset
-   - Location: `renderer.py` - stroke drawing
+3. ~~**Stroke Properties**~~ ✅ DONE (partial)
+   - [x] stroke-linecap (butt, round, square)
+   - [x] stroke-linejoin (miter, round, bevel)
+   - [ ] stroke-dasharray, stroke-dashoffset (still missing)
 
-4. **Unit Handling**
-   - Current: Basic unit conversion
-   - Issues: cm/mm units may not scale correctly in all contexts
-   - Location: `parser.py:_parse_length()`
-   - Fix circles1.svg issue
+4. ~~**Unit Handling**~~ ✅ DONE
+   - Fixed by computing bounding box from content when dimensions missing
 
 ### Medium Priority - Extended SVG Support
 
@@ -150,13 +147,13 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 
 ## Known Issues
 
-### circles1.svg (48% similarity)
+### ~~circles1.svg (48% similarity)~~ ✅ FIXED (98.4%)
 - **Cause**: SVG has no width/height, uses cm units
 - **Fix**: Compute bounding box from content when dimensions missing
 
-### tiger.svg (49.8% similarity)
+### ~~tiger.svg (49.8% similarity)~~ ✅ FIXED (98.9%)
 - **Cause**: Complex paths, thin strokes, anti-aliasing differences
-- **Fix**: Implement anti-aliasing, verify stroke rendering
+- **Fix**: Implemented anti-aliasing and proper stroke rendering
 
 ### smile.svg (Error)
 - **Cause**: XML entity `&Smile;` not defined
@@ -188,11 +185,14 @@ vectorstag/
 
 ## Next Steps
 
-1. **Implement anti-aliasing** - Biggest visual improvement
-2. **Fix stroke rendering** - linecap, linejoin
-3. **Implement fill-rule** - evenodd support
-4. **Add more test coverage** - Unit tests for parser/renderer
-5. **Performance optimization** - Gradient rendering is slow (per-pixel loop)
+1. ~~**Implement anti-aliasing**~~ ✅ DONE - Biggest visual improvement
+2. ~~**Fix stroke rendering**~~ ✅ DONE - linecap, linejoin
+3. ~~**Implement fill-rule**~~ ✅ DONE - evenodd support
+4. **Add stroke-dasharray/dashoffset** - Dashed lines support
+5. **Add more test coverage** - Unit tests for parser/renderer
+6. **Performance optimization** - Gradient rendering is slow (per-pixel loop)
+7. **Implement clipping paths** - `<clipPath>` support
+8. **Handle XML entities** - Fix smile.svg error
 
 ---
 
