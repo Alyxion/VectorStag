@@ -18,7 +18,7 @@ class SVGRenderer:
     """Render SVG documents to PIL Images."""
 
     def __init__(self, scale: float = 1.0, background: Optional[tuple[int, int, int, int]] = None,
-                 antialias: int = 2):
+                 antialias: int = 2, preserve_aspect_ratio: bool = True):
         """
         Initialize renderer.
 
@@ -26,10 +26,12 @@ class SVGRenderer:
             scale: Scale factor for rendering
             background: Background color (RGBA). Default is white.
             antialias: Anti-aliasing factor (1=none, 2=2x supersampling, 4=4x). Default is 2.
+            preserve_aspect_ratio: If True (default), preserve aspect ratio. If False, stretch to fill.
         """
         self.scale = scale
         self.background = background or (255, 255, 255, 255)
         self.antialias = max(1, antialias)
+        self.preserve_aspect_ratio = preserve_aspect_ratio
         self.parser = SVGParser()
 
     def render(self, svg_content: str, width: Optional[int] = None,
@@ -79,15 +81,23 @@ class SVGRenderer:
         # Calculate scaling transform (including AA factor)
         scale_x = render_width / src_w if src_w else 1
         scale_y = render_height / src_h if src_h else 1
-        scale = min(scale_x, scale_y)
 
-        # Center the content
-        offset_x = (render_width - src_w * scale) / 2 - src_x * scale
-        offset_y = (render_height - src_h * scale) / 2 - src_y * scale
-
-        transform = Transform.translate(offset_x, offset_y).multiply(
-            Transform.scale(scale)
-        )
+        if self.preserve_aspect_ratio:
+            # Uniform scaling (preserves aspect ratio)
+            scale = min(scale_x, scale_y)
+            # Center the content
+            offset_x = (render_width - src_w * scale) / 2 - src_x * scale
+            offset_y = (render_height - src_h * scale) / 2 - src_y * scale
+            transform = Transform.translate(offset_x, offset_y).multiply(
+                Transform.scale(scale)
+            )
+        else:
+            # Non-uniform scaling (stretch to fill)
+            offset_x = -src_x * scale_x
+            offset_y = -src_y * scale_y
+            transform = Transform.translate(offset_x, offset_y).multiply(
+                Transform.scale(scale_x, scale_y)
+            )
 
         # Create render context
         ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.filters)
@@ -416,7 +426,7 @@ class SVGRenderer:
             ]
             corners = self._transform_points(ctx, rect.transform, corners)
             self._fill_and_stroke_polygon(ctx, corners, rect.style, rect.transform,
-                                          (x, y, w, h))
+                                          (rect.x, rect.y, rect.width, rect.height))
         else:
             # Rounded rectangle - approximate with path
             if rx == 0:
@@ -586,28 +596,46 @@ class SVGRenderer:
         # Compute bounding box from commands
         bbox = self._compute_path_bbox(path.commands)
 
-        # Render each polygon
+        # Transform all polygons
+        transformed_polygons = []
         for polygon_points in polygons:
-            if len(polygon_points) < 2:
-                continue
+            if len(polygon_points) >= 2:
+                points = self._transform_points(ctx, path.transform, polygon_points)
+                transformed_polygons.append((polygon_points, points))
 
-            points = self._transform_points(ctx, path.transform, polygon_points)
+        if not transformed_polygons:
+            return
 
-            # Fill
-            fill = self._get_fill_color(ctx, path.style)
-            fill_ref = path.style.fill if isinstance(path.style.fill, str) else None
+        # Fill - for evenodd rule with multiple subpaths, combine them
+        fill = self._get_fill_color(ctx, path.style)
+        fill_ref = path.style.fill if isinstance(path.style.fill, str) else None
 
-            if fill and len(points) >= 3:
-                self._fill_polygon_with_gradient_check(
-                    ctx, points, path.style, path.transform, bbox, fill, fill_ref
-                )
-            elif fill_ref and fill_ref.startswith("url(") and len(points) >= 3:
-                self._fill_polygon_with_gradient_check(
-                    ctx, points, path.style, path.transform, bbox, None, fill_ref
-                )
+        if (fill or (fill_ref and fill_ref.startswith("url("))) and len(transformed_polygons) > 0:
+            # Collect all transformed points for combined fill
+            all_points = []
+            for _, points in transformed_polygons:
+                if len(points) >= 3:
+                    all_points.append(points)
 
-            # Stroke with proper linecap/linejoin
-            # Check if polygon is closed (last point equals first)
+            if all_points:
+                if path.style.fill_rule == "evenodd" and len(all_points) > 1:
+                    # Combined evenodd fill for multiple subpaths (creates holes)
+                    self._fill_multi_polygon_evenodd(ctx, all_points, fill, fill_ref,
+                                                     path.style, path.transform, bbox)
+                else:
+                    # Fill each polygon separately (nonzero or single polygon)
+                    for points in all_points:
+                        if fill:
+                            self._fill_polygon_with_gradient_check(
+                                ctx, points, path.style, path.transform, bbox, fill, fill_ref
+                            )
+                        elif fill_ref:
+                            self._fill_polygon_with_gradient_check(
+                                ctx, points, path.style, path.transform, bbox, None, fill_ref
+                            )
+
+        # Stroke each polygon separately
+        for polygon_points, points in transformed_polygons:
             is_closed = len(polygon_points) > 2 and self._point_distance(
                 polygon_points[0], polygon_points[-1]
             ) < 0.01
@@ -1262,6 +1290,122 @@ class SVGRenderer:
                 # Fully opaque - can draw directly
                 draw = ImageDraw.Draw(ctx.image, "RGBA")
                 draw.polygon(points, fill=fill)
+
+    def _fill_multi_polygon_evenodd(self, ctx: "RenderContext",
+                                     polygons: list[list[tuple[float, float]]],
+                                     fill: Optional[tuple[int, int, int, int]],
+                                     fill_ref: Optional[str],
+                                     style: Style,
+                                     element_transform: Transform,
+                                     bbox: tuple[float, float, float, float]):
+        """Fill multiple polygons using evenodd rule (creates holes where they overlap)."""
+        if not polygons:
+            return
+
+        # Collect all points and compute combined bounding box
+        all_xs = []
+        all_ys = []
+        for poly in polygons:
+            all_xs.extend(p[0] for p in poly)
+            all_ys.extend(p[1] for p in poly)
+
+        if not all_xs:
+            return
+
+        min_x, max_x = int(min(all_xs)), int(max(all_xs)) + 1
+        min_y, max_y = int(min(all_ys)), int(max(all_ys)) + 1
+
+        # Clip to image bounds
+        min_x = max(0, min_x)
+        min_y = max(0, min_y)
+        max_x = min(ctx.image.width, max_x)
+        max_y = min(ctx.image.height, max_y)
+
+        if min_x >= max_x or min_y >= max_y:
+            return
+
+        width = max_x - min_x
+        height = max_y - min_y
+
+        # Create mask using scanline algorithm with even-odd rule across ALL polygons
+        mask = np.zeros((height, width), dtype=np.uint8)
+
+        # Build edge list from all polygons
+        all_edges = []
+        for poly in polygons:
+            closed_points = list(poly)
+            if closed_points[0] != closed_points[-1]:
+                closed_points.append(closed_points[0])
+
+            n = len(closed_points) - 1
+            for i in range(n):
+                p1 = closed_points[i]
+                p2 = closed_points[i + 1]
+                all_edges.append((p1, p2))
+
+        # For each scanline
+        for y in range(height):
+            screen_y = y + min_y + 0.5  # Center of pixel
+
+            # Find intersections with all edges from all polygons
+            intersections = []
+
+            for p1, p2 in all_edges:
+                # Check if edge crosses this scanline
+                if (p1[1] <= screen_y < p2[1]) or (p2[1] <= screen_y < p1[1]):
+                    # Compute x intersection
+                    if abs(p2[1] - p1[1]) > 1e-10:
+                        t = (screen_y - p1[1]) / (p2[1] - p1[1])
+                        x_intersect = p1[0] + t * (p2[0] - p1[0])
+                        intersections.append(x_intersect)
+
+            # Sort intersections
+            intersections.sort()
+
+            # Fill between pairs (even-odd rule)
+            for i in range(0, len(intersections) - 1, 2):
+                x_start = max(0, int(intersections[i] - min_x))
+                x_end = min(width, int(intersections[i + 1] - min_x) + 1)
+                mask[y, x_start:x_end] = 255
+
+        # Apply fill using mask
+        mask_img = Image.fromarray(mask, "L")
+
+        if fill_ref and fill_ref.startswith("url("):
+            # Gradient fill
+            match = fill_ref[4:-1]
+            if match.startswith("#"):
+                match = match[1:]
+            if match in ctx.gradients:
+                gradient = ctx.gradients[match]
+                grad_img = self._create_gradient_for_mask(
+                    ctx, gradient, width, height, bbox, min_x, min_y, style.opacity
+                )
+                ctx.image.paste(grad_img, (min_x, min_y), mask_img)
+        elif fill:
+            # Solid fill
+            fill_img = Image.new("RGBA", (width, height), fill)
+            if fill[3] < 255:
+                temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+                temp.paste(fill_img, (min_x, min_y), mask_img)
+                ctx.image.alpha_composite(temp)
+            else:
+                ctx.image.paste(fill_img, (min_x, min_y), mask_img)
+
+    def _create_gradient_for_mask(self, ctx: "RenderContext",
+                                   gradient, width: int, height: int,
+                                   bbox: tuple[float, float, float, float],
+                                   offset_x: int, offset_y: int,
+                                   opacity: float) -> Image.Image:
+        """Create gradient image for use with mask."""
+        if isinstance(gradient, LinearGradient):
+            return self._create_linear_gradient_image(
+                ctx, gradient, width, height, bbox, offset_x, offset_y, opacity
+            )
+        else:
+            return self._create_radial_gradient_image(
+                ctx, gradient, width, height, bbox, offset_x, offset_y, opacity
+            )
 
     def _fill_polygon_evenodd(self, ctx: "RenderContext",
                               points: list[tuple[float, float]],

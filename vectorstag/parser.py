@@ -398,6 +398,11 @@ class SVGParser:
         self.defs: dict[str, ET.Element] = {}
         self.default_width = 300
         self.default_height = 150
+        # ViewBox dimensions for percentage resolution
+        self.viewbox_width = 0
+        self.viewbox_height = 0
+        # CSS classes from <style> blocks
+        self.css_classes: dict[str, dict[str, str]] = {}
 
     def parse(self, svg_content: str) -> SVGDocument:
         """Parse SVG content string into SVGDocument."""
@@ -418,17 +423,28 @@ class SVGParser:
             parts = re.split(r"[\s,]+", viewbox_str.strip())
             if len(parts) == 4:
                 viewBox = tuple(float(p) for p in parts)
+                # Store viewBox dimensions for percentage resolution
+                self.viewbox_width = viewBox[2]
+                self.viewbox_height = viewBox[3]
                 # If width/height not specified, use viewBox dimensions
                 if not root.get("width"):
                     width = viewBox[2]
                 if not root.get("height"):
                     height = viewBox[3]
+        else:
+            # No viewBox - use width/height for percentage resolution
+            self.viewbox_width = width
+            self.viewbox_height = height
 
         # Reset state
         self.gradients = {}
         self.clip_paths = {}
         self.filters = {}
         self.defs = {}
+        self.css_classes = {}
+
+        # Parse CSS from <style> blocks
+        self._parse_css_styles(root)
 
         # First pass: collect defs
         self._collect_defs(root)
@@ -483,6 +499,38 @@ class SVGParser:
         if tag.startswith("{"):
             return tag.split("}", 1)[1]
         return tag
+
+    def _parse_css_styles(self, root: ET.Element):
+        """Parse CSS from <style> blocks."""
+        for elem in root.iter():
+            tag = self._strip_ns(elem.tag)
+            if tag == "style":
+                css_text = elem.text or ""
+                # Handle CDATA
+                css_text = css_text.strip()
+                self._parse_css_text(css_text)
+
+    def _parse_css_text(self, css_text: str):
+        """Parse CSS text and extract class rules."""
+        # Simple CSS parser for class rules: .classname { property: value; }
+        # Remove comments
+        css_text = re.sub(r'/\*.*?\*/', '', css_text, flags=re.DOTALL)
+
+        # Find class rules
+        pattern = r'\.([a-zA-Z_][a-zA-Z0-9_-]*)\s*\{([^}]*)\}'
+        for match in re.finditer(pattern, css_text):
+            class_name = match.group(1)
+            properties_str = match.group(2)
+
+            # Parse properties
+            properties = {}
+            for prop in properties_str.split(';'):
+                prop = prop.strip()
+                if ':' in prop:
+                    key, value = prop.split(':', 1)
+                    properties[key.strip()] = value.strip()
+
+            self.css_classes[class_name] = properties
 
     def _collect_defs(self, root: ET.Element):
         """Collect all definitions (gradients, filters, etc.)."""
@@ -809,11 +857,19 @@ class SVGParser:
             fill_rule=parent_style.fill_rule
         )
 
-        # Parse style attribute
-        style_str = elem.get("style", "")
-        style_dict = self._parse_style_string(style_str)
+        # First apply CSS classes (lowest priority)
+        style_dict = {}
+        class_attr = elem.get("class", "")
+        if class_attr:
+            for class_name in class_attr.split():
+                if class_name in self.css_classes:
+                    style_dict.update(self.css_classes[class_name])
 
-        # Merge with direct attributes
+        # Parse style attribute (higher priority - overrides CSS classes)
+        style_str = elem.get("style", "")
+        style_dict.update(self._parse_style_string(style_str))
+
+        # Merge with direct attributes (highest priority)
         for attr in ["fill", "stroke", "stroke-width", "fill-opacity",
                      "stroke-opacity", "opacity", "fill-rule",
                      "stroke-linecap", "stroke-linejoin", "stroke-miterlimit", "filter"]:
@@ -930,16 +986,24 @@ class SVGParser:
 
         return None
 
-    def _parse_length(self, length_str: str) -> float:
-        """Parse SVG length value."""
+    def _parse_length(self, length_str: str, ref_dim: float = None) -> float:
+        """Parse SVG length value.
+
+        Args:
+            length_str: The length string (e.g., "100", "50%", "10px")
+            ref_dim: Reference dimension for percentage values (e.g., viewBox width/height)
+        """
         if not length_str:
             return 0
 
         length_str = length_str.strip()
 
-        # Handle percentages (treat as-is for now)
+        # Handle percentages
         if length_str.endswith("%"):
-            return float(length_str[:-1])
+            pct = float(length_str[:-1])
+            if ref_dim is not None:
+                return pct * ref_dim / 100.0
+            return pct  # Return raw percentage if no reference
 
         # Unit conversions (approximate)
         units = {
@@ -999,16 +1063,17 @@ class SVGParser:
 
     def _parse_rect(self, elem: ET.Element, style: Style, transform: Transform) -> RectElement:
         """Parse rect element."""
+        # Use viewBox dimensions for percentage resolution
         return RectElement(
             tag="rect",
             style=style,
             transform=transform,
-            x=self._parse_length(elem.get("x", "0")),
-            y=self._parse_length(elem.get("y", "0")),
-            width=self._parse_length(elem.get("width", "0")),
-            height=self._parse_length(elem.get("height", "0")),
-            rx=self._parse_length(elem.get("rx", "0")),
-            ry=self._parse_length(elem.get("ry", "0"))
+            x=self._parse_length(elem.get("x", "0"), self.viewbox_width),
+            y=self._parse_length(elem.get("y", "0"), self.viewbox_height),
+            width=self._parse_length(elem.get("width", "0"), self.viewbox_width),
+            height=self._parse_length(elem.get("height", "0"), self.viewbox_height),
+            rx=self._parse_length(elem.get("rx", "0"), self.viewbox_width),
+            ry=self._parse_length(elem.get("ry", "0"), self.viewbox_height)
         )
 
     def _parse_circle(self, elem: ET.Element, style: Style, transform: Transform) -> CircleElement:

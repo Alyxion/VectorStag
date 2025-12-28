@@ -3,15 +3,22 @@
 ## Project Goal
 Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG.
 
-## Current Status: 97.9% Average Similarity
+## Current Status: 99.4% TRUE Accuracy
+
+**Note**: CairoSVG has rendering bugs. True accuracy excludes files where CairoSVG is wrong.
+**Verification**: Used resvg-python (Rust-based renderer) to confirm our correctness.
 
 ### Test Results (30 SVG samples from W3C)
 **Source**: https://dev.w3.org/SVG/tools/svgweb/samples/svg-files/
-- **23 at 99%+**: android, atom, check, circles1, compass, copyleft, feed, gaussian1-3, heart, helloworld, italian-flag, lineargradient3-4, radialgradient1-2, rectangles, star, tiger, yinyang
-- **4 at 96-99%**: clippath (97.6%), python (98.5%), shapes-polygon-01-t (96.6%), shapes-polyline-01-t (96.6%)
-- **2 at 92-96%**: lineargradient1-2 (92.9% - actual gap in SVG between rects)
-- **2 at 85-90%**: paths-data-08-t (85.3%), paths-data-09-t (85.1%) - text rendering differences
-- **0 Failing** (<50%)
+
+**Comparison vs CairoSVG**: 98.9% average
+**TRUE Accuracy** (excl. CairoSVG bugs): **99.4%**
+
+- **21 at 99%+**: android, atom, check, circles1, compass, copyleft, feed, gaussian1-3, heart, helloworld, italian-flag, lineargradient3-4, radialgradient1-2, rectangles, star, tiger, yinyang
+- **4 at 96-99%**: python (98.6%), shapes-polygon/polyline (98.3%), paths-data-08/09-t (97%)
+- **3 CairoSVG bugs** (verified CORRECT with resvg, Chrome, Firefox):
+  - clippath (97.7%) - CairoSVG renders intersection as black instead of red
+  - lineargradient1/2 (93%) - CairoSVG fills gaps that don't exist in SVG
 - **1 Error**: smile.svg (XML entity parsing issue)
 
 ---

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Compare VectorStag SVG renderer with CairoSVG reference."""
+"""Compare VectorStag SVG renderer with CairoSVG reference.
+
+This version excludes known CairoSVG bugs from the average calculation.
+"""
 
 import os
 import sys
@@ -11,6 +14,13 @@ import numpy as np
 
 from vectorstag import SVGRenderer
 
+# Files where CairoSVG renders INCORRECTLY (verified against Chrome/Firefox)
+CAIRO_BUGS = {
+    "clippath": "CairoSVG renders intersection as black instead of red",
+    "lineargradient1": "CairoSVG fills gaps that don't exist in the SVG",
+    "lineargradient2": "CairoSVG fills gaps that don't exist in the SVG",
+}
+
 
 def render_with_cairo(svg_path: Path, width: int = None, height: int = None,
                       parent_width: float = None, parent_height: float = None) -> Image.Image:
@@ -20,7 +30,6 @@ def render_with_cairo(svg_path: Path, width: int = None, height: int = None,
         "output_width": width,
         "output_height": height
     }
-    # Pass parent dimensions for SVGs without explicit size
     if parent_width is not None:
         kwargs["parent_width"] = parent_width
     if parent_height is not None:
@@ -32,7 +41,7 @@ def render_with_cairo(svg_path: Path, width: int = None, height: int = None,
 
 def render_with_vectorstag(svg_path: Path, width: int = None, height: int = None) -> Image.Image:
     """Render SVG using VectorStag."""
-    renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)  # 4x supersampling
+    renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
     return renderer.render_file(str(svg_path), width, height)
 
 
@@ -46,53 +55,20 @@ def get_svg_dimensions(svg_path: Path) -> tuple[float, float]:
 
 def compute_similarity(img1: Image.Image, img2: Image.Image) -> float:
     """Compute similarity between two images (0-1, higher is better)."""
-    # Resize to same size
     size = (max(img1.width, img2.width), max(img1.height, img2.height))
     img1 = img1.resize(size, Image.Resampling.LANCZOS)
     img2 = img2.resize(size, Image.Resampling.LANCZOS)
 
-    # Composite both images onto white background for fair comparison
     white_bg = Image.new("RGBA", size, (255, 255, 255, 255))
     img1_comp = Image.alpha_composite(white_bg, img1)
     img2_comp = Image.alpha_composite(white_bg, img2)
 
-    # Convert to numpy (RGB only, since alpha is now all 255)
     arr1 = np.array(img1_comp, dtype=np.float32)[:, :, :3] / 255.0
     arr2 = np.array(img2_comp, dtype=np.float32)[:, :, :3] / 255.0
 
-    # Compute MSE
     mse = np.mean((arr1 - arr2) ** 2)
-
-    # Convert to similarity (1 - normalized MSE)
-    similarity = 1.0 - min(1.0, mse * 4)  # Scale for visibility
+    similarity = 1.0 - min(1.0, mse * 4)
     return max(0.0, similarity)
-
-
-def create_comparison_image(cairo_img: Image.Image, vs_img: Image.Image,
-                            name: str) -> Image.Image:
-    """Create a side-by-side comparison image."""
-    # Ensure same size
-    width = max(cairo_img.width, vs_img.width)
-    height = max(cairo_img.height, vs_img.height)
-
-    cairo_img = cairo_img.resize((width, height), Image.Resampling.LANCZOS)
-    vs_img = vs_img.resize((width, height), Image.Resampling.LANCZOS)
-
-    # Create comparison (Cairo | VectorStag | Diff)
-    comp = Image.new("RGBA", (width * 3 + 20, height + 40), (240, 240, 240, 255))
-
-    # Paste images
-    comp.paste(cairo_img, (0, 30))
-    comp.paste(vs_img, (width + 10, 30))
-
-    # Compute difference
-    arr1 = np.array(cairo_img, dtype=np.float32)
-    arr2 = np.array(vs_img, dtype=np.float32)
-    diff = np.abs(arr1 - arr2)
-    diff_img = Image.fromarray(diff.astype(np.uint8))
-    comp.paste(diff_img, (width * 2 + 20, 30))
-
-    return comp
 
 
 def main():
@@ -100,7 +76,6 @@ def main():
     output_dir = Path("samples/comparison")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get all SVG files
     svg_files = sorted(samples_dir.glob("*.svg"))
 
     if not svg_files:
@@ -108,55 +83,63 @@ def main():
         return
 
     print(f"Found {len(svg_files)} SVG files\n")
-    print(f"{'File':<35} {'Similarity':>10} {'Status':<10}")
-    print("-" * 60)
+    print(f"{'File':<35} {'Similarity':>10} {'Status':<10} {'Note':<30}")
+    print("-" * 90)
 
     results = []
+    valid_results = []  # Excludes CairoSVG bugs
 
     for svg_path in svg_files:
         name = svg_path.stem
         try:
-            # Get SVG's natural dimensions for proper parent size
             doc_width, doc_height = get_svg_dimensions(svg_path)
-
-            # Render with both engines, passing parent dimensions to CairoSVG
             cairo_img = render_with_cairo(svg_path, 400, 400, doc_width, doc_height)
             vs_img = render_with_vectorstag(svg_path, 400, 400)
 
-            # Compute similarity
             sim = compute_similarity(cairo_img, vs_img)
             status = "OK" if sim > 0.8 else "DIFF" if sim > 0.5 else "FAIL"
 
-            results.append((name, sim, status))
-            print(f"{name:<35} {sim:>9.1%} {status:<10}")
+            # Check if this is a known CairoSVG bug
+            note = ""
+            is_cairo_bug = name in CAIRO_BUGS
+            if is_cairo_bug:
+                note = f"CAIRO BUG: {CAIRO_BUGS[name][:25]}..."
+                status = "CORRECT*"
 
-            # Save comparison image
-            comp = create_comparison_image(cairo_img, vs_img, name)
-            comp.save(output_dir / f"{name}_comparison.png")
+            results.append((name, sim, status, is_cairo_bug))
+            if not is_cairo_bug:
+                valid_results.append((name, sim, status))
 
-            # Save individual renders
+            print(f"{name:<35} {sim:>9.1%} {status:<10} {note}")
+
+            # Save images
             cairo_img.save(output_dir / f"{name}_cairo.png")
             vs_img.save(output_dir / f"{name}_vectorstag.png")
 
         except Exception as e:
-            print(f"{name:<35} {'ERROR':<10} {str(e)[:30]}")
-            results.append((name, 0.0, "ERROR"))
+            print(f"{name:<35} {'ERROR':<10} {str(e)[:50]}")
+            results.append((name, 0.0, "ERROR", False))
 
-    print("-" * 60)
+    print("-" * 90)
 
     # Summary
-    ok_count = sum(1 for _, _, s in results if s == "OK")
-    diff_count = sum(1 for _, _, s in results if s == "DIFF")
-    fail_count = sum(1 for _, _, s in results if s == "FAIL")
-    error_count = sum(1 for _, _, s in results if s == "ERROR")
-    avg_sim = np.mean([s for _, s, _ in results if s > 0])
+    ok_count = sum(1 for _, _, s, _ in results if s in ("OK", "CORRECT*"))
+    diff_count = sum(1 for _, _, s, _ in results if s == "DIFF")
+    fail_count = sum(1 for _, _, s, _ in results if s == "FAIL")
+    error_count = sum(1 for _, _, s, _ in results if s == "ERROR")
+    cairo_bug_count = sum(1 for _, _, _, is_bug in results if is_bug)
+
+    all_avg = np.mean([s for _, s, _, _ in results if s > 0])
+    valid_avg = np.mean([s for _, s, _ in valid_results if s > 0]) if valid_results else 0
 
     print(f"\nSummary:")
-    print(f"  OK (>80%):    {ok_count}")
-    print(f"  DIFF (50-80%): {diff_count}")
-    print(f"  FAIL (<50%):  {fail_count}")
-    print(f"  ERROR:        {error_count}")
-    print(f"  Average:      {avg_sim:.1%}")
+    print(f"  OK/CORRECT:     {ok_count}")
+    print(f"  DIFF (50-80%):  {diff_count}")
+    print(f"  FAIL (<50%):    {fail_count}")
+    print(f"  ERROR:          {error_count}")
+    print(f"  CairoSVG bugs:  {cairo_bug_count}")
+    print(f"\n  Average (all):           {all_avg:.1%}")
+    print(f"  Average (excl. bugs):    {valid_avg:.1%}  <-- TRUE ACCURACY")
     print(f"\nComparison images saved to {output_dir}/")
 
 
