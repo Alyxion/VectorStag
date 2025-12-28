@@ -1,0 +1,19 @@
+[project]
+name = "vectorstag"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Michael Ikemann",email = "michael.ikemann@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "cairosvg (>=2.8.2,<3.0.0)",
+    "pillow (>=12.0.0,<13.0.0)",
+    "opencv-python (>=4.12.0.88,<5.0.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
