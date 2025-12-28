@@ -311,8 +311,11 @@ class SVGParser:
         # Resolve gradient references
         self._resolve_gradient_refs()
 
+        # Parse root element style (for inherited properties like stroke-width)
+        root_style = self._parse_style(root, Style())
+
         # Parse elements
-        elements = self._parse_children(root, Transform.identity(), Style())
+        elements = self._parse_children(root, Transform.identity(), root_style)
 
         # If no explicit dimensions and no viewBox, compute from content
         has_explicit_width = root.get("width") is not None
@@ -554,6 +557,8 @@ class SVGParser:
             result = self._parse_group(elem, style, transform, parent_style)
         elif tag == "text":
             result = self._parse_text(elem, style, transform)
+        elif tag == "use":
+            result = self._parse_use(elem, style, transform, parent_style)
 
         # Set clip path on the parsed element
         if result and clip_path_id:
@@ -905,6 +910,35 @@ class SVGParser:
             font_family=font_family,
             font_size=font_size
         )
+
+    def _parse_use(self, elem: ET.Element, style: Style, transform: Transform,
+                   parent_style: Style) -> Optional[SVGElement]:
+        """Parse use element (reference to another element)."""
+        # Get the referenced element ID
+        href = elem.get(f"{self.XLINK_NS}href") or elem.get("href")
+        if not href:
+            return None
+
+        if href.startswith("#"):
+            href = href[1:]
+
+        # Find the referenced element in defs
+        ref_elem = self.defs.get(href)
+        if ref_elem is None:
+            return None
+
+        # Get x, y offset for the use element
+        x = self._parse_length(elem.get("x", "0"))
+        y = self._parse_length(elem.get("y", "0"))
+
+        # Apply translation for x, y
+        if x != 0 or y != 0:
+            use_transform = transform.multiply(Transform.translate(x, y))
+        else:
+            use_transform = transform
+
+        # Parse the referenced element with the combined transform
+        return self._parse_element(ref_elem, use_transform, style)
 
     def _compute_elements_bbox(self, elements: list) -> Optional[tuple[float, float, float, float]]:
         """Compute bounding box of all elements."""

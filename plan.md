@@ -3,7 +3,7 @@
 ## Project Goal
 Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG.
 
-## Current Status: 96.6% Average Similarity
+## Current Status: 96.9% Average Similarity
 
 ### Test Results (30 SVG samples from W3C)
 **Source**: https://dev.w3.org/SVG/tools/svgweb/samples/svg-files/
@@ -62,6 +62,7 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - [x] Automatic bounding box computation for SVGs without dimensions
 - [x] ClipPath support (basic shapes: rect, circle, ellipse, polygon, path)
 - [x] Proper alpha compositing for semi-transparent fills and strokes
+- [x] Gap-free stroke rendering for curves (mask-based polygon fill for closed paths)
 
 ### Text
 - [x] Basic `<text>` rendering
@@ -81,6 +82,11 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - [x] width/height attributes
 - [x] viewBox with proper scaling
 - [x] Namespace handling (svg, xlink)
+- [x] Root element style inheritance (stroke-width, etc.)
+
+### Use Element
+- [x] Basic `<use>` element support (xlink:href references)
+- [x] x, y positioning on use elements
 
 ---
 

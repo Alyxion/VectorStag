@@ -358,8 +358,14 @@ class SVGRenderer:
         if circle.r <= 0:
             return
 
-        # Generate circle points
-        n_points = max(32, int(circle.r * 2))
+        # Generate circle points - use more points for smoother strokes
+        scale = self._get_scale(ctx, circle.transform)
+        scaled_r = circle.r * scale
+        stroke_w = circle.style.stroke_width * scale if circle.style.stroke else 0
+        # More points for larger circles and thicker strokes
+        n_points = max(72, int(scaled_r * 2), int(stroke_w * 8))
+        n_points = min(n_points, 360)
+
         points = []
         for i in range(n_points):
             angle = 2 * math.pi * i / n_points
@@ -377,8 +383,14 @@ class SVGRenderer:
         if ellipse.rx <= 0 or ellipse.ry <= 0:
             return
 
-        # Generate ellipse points
-        n_points = max(32, int(max(ellipse.rx, ellipse.ry) * 2))
+        # Generate ellipse points - use more points for smoother strokes
+        scale = self._get_scale(ctx, ellipse.transform)
+        scaled_r = max(ellipse.rx, ellipse.ry) * scale
+        stroke_w = ellipse.style.stroke_width * scale if ellipse.style.stroke else 0
+        # More points for larger ellipses and thicker strokes
+        n_points = max(72, int(scaled_r * 2), int(stroke_w * 8))
+        n_points = min(n_points, 360)
+
         points = []
         for i in range(n_points):
             angle = 2 * math.pi * i / n_points
@@ -558,6 +570,13 @@ class SVGRenderer:
         if width < 0.5:
             return
 
+        half_width = width / 2.0
+
+        # For closed paths with many points (smooth curves), use polygon-based rendering
+        if closed and len(points) >= 8:
+            self._stroke_closed_polygon(ctx, points, stroke, half_width)
+            return
+
         int_width = max(1, int(width))
 
         # Use temp image for semi-transparent strokes
@@ -568,10 +587,8 @@ class SVGRenderer:
             temp = None
             draw = ImageDraw.Draw(ctx.image, "RGBA")
 
-        # For simple cases, use PIL's line drawing
-        # This handles most cases well with the anti-aliasing from supersampling
+        # Draw line segments
         if closed:
-            # Close the path for stroke
             stroke_points = list(points)
             if stroke_points[0] != stroke_points[-1]:
                 stroke_points.append(stroke_points[0])
@@ -583,26 +600,110 @@ class SVGRenderer:
 
         # Draw round caps for line endpoints if needed
         if style.stroke_linecap == "round" and not closed:
-            radius = int_width // 2
+            radius = int_width / 2.0
             if radius > 0:
-                # Start cap
                 x, y = points[0]
                 draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=stroke)
-                # End cap
                 x, y = points[-1]
                 draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=stroke)
 
-        # Draw round joins at corners if needed
-        if style.stroke_linejoin == "round" and len(points) > 2:
-            radius = int_width // 2
+        # Draw round joints at vertices for linejoin="round"
+        if style.stroke_linejoin == "round":
+            radius = int_width / 2.0
             if radius > 0:
-                for i in range(1, len(points) - (0 if closed else 1)):
-                    x, y = points[i]
+                # For closed paths, draw at all original vertices
+                # For open paths, draw at interior vertices only
+                joint_points = points[:-1] if (closed and len(points) > 1 and
+                    self._point_distance(points[0], points[-1]) < 0.01) else points
+                start_idx = 0 if closed else 1
+                end_idx = len(joint_points) if closed else len(joint_points) - 1
+                for i in range(start_idx, end_idx):
+                    x, y = joint_points[i]
                     draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=stroke)
 
-        # Composite temp image if we used one
         if temp is not None:
             ctx.image.alpha_composite(temp)
+
+    def _stroke_closed_polygon(self, ctx: "RenderContext", points: List[Tuple[float, float]],
+                               stroke: Tuple[int, int, int, int], half_width: float):
+        """Render a closed polygon stroke using mask-based approach (gap-free)."""
+        n = len(points)
+        if n < 3:
+            return
+
+        # Remove duplicate consecutive points
+        clean_points = [points[0]]
+        for p in points[1:]:
+            if self._point_distance(clean_points[-1], p) > 0.01:
+                clean_points.append(p)
+        # Also check if last point equals first
+        if len(clean_points) > 1 and self._point_distance(clean_points[-1], clean_points[0]) < 0.01:
+            clean_points = clean_points[:-1]
+
+        points = clean_points
+        n = len(points)
+        if n < 3:
+            return
+
+        # Compute offset polygons in both directions
+        plus_points = []
+        minus_points = []
+
+        for i in range(n):
+            p_prev = points[(i - 1) % n]
+            p_curr = points[i]
+            p_next = points[(i + 1) % n]
+
+            # Compute edge directions
+            d1 = self._normalize(self._subtract(p_curr, p_prev))
+            d2 = self._normalize(self._subtract(p_next, p_curr))
+
+            # Average direction for smooth curves
+            avg_dir = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
+
+            # Perpendicular (rotate 90 degrees)
+            perp = (-avg_dir[1], avg_dir[0])
+
+            plus_pt = (p_curr[0] + perp[0] * half_width, p_curr[1] + perp[1] * half_width)
+            minus_pt = (p_curr[0] - perp[0] * half_width, p_curr[1] - perp[1] * half_width)
+
+            plus_points.append(plus_pt)
+            minus_points.append(minus_pt)
+
+        # Determine which is outer (larger area) vs inner (smaller area)
+        def polygon_area(pts):
+            area = 0.0
+            for i in range(len(pts)):
+                j = (i + 1) % len(pts)
+                area += pts[i][0] * pts[j][1]
+                area -= pts[j][0] * pts[i][1]
+            return abs(area) / 2.0
+
+        plus_area = polygon_area(plus_points)
+        minus_area = polygon_area(minus_points)
+
+        if plus_area > minus_area:
+            outer_points, inner_points = plus_points, minus_points
+        else:
+            outer_points, inner_points = minus_points, plus_points
+
+        # Use mask-based approach: draw outer filled, cut out inner
+        # This avoids the seam issue with annular polygons
+        temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(temp, "RGBA")
+
+        # Draw outer polygon filled with stroke color
+        draw.polygon(outer_points, fill=stroke)
+
+        # Create mask for inner polygon and cut it out
+        mask = Image.new("L", ctx.image.size, 255)
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.polygon(inner_points, fill=0)
+
+        # Apply mask to temp image (keeps only the ring)
+        temp.putalpha(ImageChops.multiply(temp.getchannel("A"), mask))
+
+        ctx.image.alpha_composite(temp)
 
     def _build_stroke_polygon(self, points: List[Tuple[float, float]],
                               half_width: float, linecap: str, linejoin: str,
