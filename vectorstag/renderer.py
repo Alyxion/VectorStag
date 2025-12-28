@@ -2,7 +2,7 @@
 
 import math
 from typing import Optional, Union, List, Tuple
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageChops
 import numpy as np
 
 from .parser import (
@@ -10,7 +10,7 @@ from .parser import (
     RectElement, CircleElement, EllipseElement, LineElement,
     PolylineElement, PolygonElement, PathElement, GroupElement,
     TextElement, LinearGradient, RadialGradient, GradientStop,
-    FILL_NOT_SET
+    ClipPath, FILL_NOT_SET
 )
 
 
@@ -90,7 +90,7 @@ class SVGRenderer:
         )
 
         # Create render context
-        ctx = RenderContext(image, doc.gradients, transform)
+        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths)
 
         # Render all elements
         for element in doc.elements:
@@ -104,6 +104,11 @@ class SVGRenderer:
 
     def _render_element(self, ctx: "RenderContext", element: SVGElement):
         """Render a single element."""
+        # Check if element has a clip path
+        if element.clip_path_id and element.clip_path_id in ctx.clip_paths:
+            self._render_element_with_clip(ctx, element)
+            return
+
         if isinstance(element, GroupElement):
             for child in element.children:
                 self._render_element(ctx, child)
@@ -123,6 +128,106 @@ class SVGRenderer:
             self._render_path(ctx, element)
         elif isinstance(element, TextElement):
             self._render_text(ctx, element)
+
+    def _render_element_with_clip(self, ctx: "RenderContext", element: SVGElement):
+        """Render an element with a clip path applied."""
+        clip_path = ctx.clip_paths[element.clip_path_id]
+
+        # Create a temporary image for the element
+        temp_image = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths)
+
+        # Render the element without clipping to the temp image
+        element_copy = element
+        element_copy.clip_path_id = None  # Temporarily remove clip path
+
+        if isinstance(element, GroupElement):
+            for child in element.children:
+                self._render_element(temp_ctx, child)
+        elif isinstance(element, RectElement):
+            self._render_rect(temp_ctx, element)
+        elif isinstance(element, CircleElement):
+            self._render_circle(temp_ctx, element)
+        elif isinstance(element, EllipseElement):
+            self._render_ellipse(temp_ctx, element)
+        elif isinstance(element, LineElement):
+            self._render_line(temp_ctx, element)
+        elif isinstance(element, PolylineElement):
+            self._render_polyline(temp_ctx, element)
+        elif isinstance(element, PolygonElement):
+            self._render_polygon(temp_ctx, element)
+        elif isinstance(element, PathElement):
+            self._render_path(temp_ctx, element)
+        elif isinstance(element, TextElement):
+            self._render_text(temp_ctx, element)
+
+        # Create clip mask from clip path shapes
+        mask = self._create_clip_mask(ctx, clip_path, element.transform)
+
+        # Apply the mask and composite onto main image
+        temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], mask))
+        ctx.image.alpha_composite(temp_image)
+
+    def _create_clip_mask(self, ctx: "RenderContext", clip_path: ClipPath,
+                          element_transform: Transform) -> Image.Image:
+        """Create a mask image from a clip path."""
+        mask = Image.new("L", ctx.image.size, 0)
+        mask_draw = ImageDraw.Draw(mask)
+
+        for clip_elem in clip_path.elements:
+            # Get points from the clip element
+            points = self._get_element_points(clip_elem)
+            if not points:
+                continue
+
+            # Transform points
+            full_transform = ctx.base_transform.multiply(element_transform).multiply(clip_elem.transform)
+            transformed = [full_transform.apply(x, y) for x, y in points]
+
+            # Draw filled polygon on mask
+            if len(transformed) >= 3:
+                mask_draw.polygon(transformed, fill=255)
+
+        return mask
+
+    def _get_element_points(self, element: SVGElement) -> List[Tuple[float, float]]:
+        """Get the outline points of an element for clipping."""
+        if isinstance(element, RectElement):
+            x, y, w, h = element.x, element.y, element.width, element.height
+            return [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+
+        elif isinstance(element, CircleElement):
+            n_points = max(32, int(element.r * 2))
+            points = []
+            for i in range(n_points):
+                angle = 2 * math.pi * i / n_points
+                px = element.cx + element.r * math.cos(angle)
+                py = element.cy + element.r * math.sin(angle)
+                points.append((px, py))
+            return points
+
+        elif isinstance(element, EllipseElement):
+            n_points = max(32, int(max(element.rx, element.ry) * 2))
+            points = []
+            for i in range(n_points):
+                angle = 2 * math.pi * i / n_points
+                px = element.cx + element.rx * math.cos(angle)
+                py = element.cy + element.ry * math.sin(angle)
+                points.append((px, py))
+            return points
+
+        elif isinstance(element, PolygonElement):
+            return list(element.points)
+
+        elif isinstance(element, PathElement):
+            # Convert path to polygons and return all points
+            polygons = self._path_to_polygons(element.commands)
+            all_points = []
+            for poly in polygons:
+                all_points.extend(poly)
+            return all_points
+
+        return []
 
     def _get_fill_color(self, ctx: "RenderContext", style: Style,
                         bbox: Optional[tuple[float, float, float, float]] = None
@@ -453,19 +558,51 @@ class SVGRenderer:
         if width < 0.5:
             return
 
-        half_width = width / 2.0
-        linecap = style.stroke_linecap
-        linejoin = style.stroke_linejoin
+        int_width = max(1, int(width))
 
-        draw = ImageDraw.Draw(ctx.image, "RGBA")
+        # Use temp image for semi-transparent strokes
+        if stroke[3] < 255:
+            temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(temp, "RGBA")
+        else:
+            temp = None
+            draw = ImageDraw.Draw(ctx.image, "RGBA")
 
-        # Build stroke outline as polygon
-        stroke_polygon = self._build_stroke_polygon(
-            points, half_width, linecap, linejoin, closed
-        )
+        # For simple cases, use PIL's line drawing
+        # This handles most cases well with the anti-aliasing from supersampling
+        if closed:
+            # Close the path for stroke
+            stroke_points = list(points)
+            if stroke_points[0] != stroke_points[-1]:
+                stroke_points.append(stroke_points[0])
+            for i in range(len(stroke_points) - 1):
+                draw.line([stroke_points[i], stroke_points[i + 1]], fill=stroke, width=int_width)
+        else:
+            for i in range(len(points) - 1):
+                draw.line([points[i], points[i + 1]], fill=stroke, width=int_width)
 
-        if stroke_polygon and len(stroke_polygon) >= 3:
-            draw.polygon(stroke_polygon, fill=stroke)
+        # Draw round caps for line endpoints if needed
+        if style.stroke_linecap == "round" and not closed:
+            radius = int_width // 2
+            if radius > 0:
+                # Start cap
+                x, y = points[0]
+                draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=stroke)
+                # End cap
+                x, y = points[-1]
+                draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=stroke)
+
+        # Draw round joins at corners if needed
+        if style.stroke_linejoin == "round" and len(points) > 2:
+            radius = int_width // 2
+            if radius > 0:
+                for i in range(1, len(points) - (0 if closed else 1)):
+                    x, y = points[i]
+                    draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=stroke)
+
+        # Composite temp image if we used one
+        if temp is not None:
+            ctx.image.alpha_composite(temp)
 
     def _build_stroke_polygon(self, points: List[Tuple[float, float]],
                               half_width: float, linecap: str, linejoin: str,
@@ -724,9 +861,17 @@ class SVGRenderer:
         if fill_rule == "evenodd":
             self._fill_polygon_evenodd(ctx, points, fill)
         else:
-            # Default nonzero - use PIL's default
-            draw = ImageDraw.Draw(ctx.image, "RGBA")
-            draw.polygon(points, fill=fill)
+            # Use alpha compositing for proper transparency blending
+            if fill[3] < 255:
+                # Semi-transparent - need to composite properly
+                temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+                draw = ImageDraw.Draw(temp, "RGBA")
+                draw.polygon(points, fill=fill)
+                ctx.image.alpha_composite(temp)
+            else:
+                # Fully opaque - can draw directly
+                draw = ImageDraw.Draw(ctx.image, "RGBA")
+                draw.polygon(points, fill=fill)
 
     def _fill_polygon_evenodd(self, ctx: "RenderContext",
                               points: list[tuple[float, float]],
@@ -791,10 +936,17 @@ class SVGRenderer:
                 x_end = min(width, int(intersections[i + 1] - min_x) + 1)
                 mask[y, x_start:x_end] = 255
 
-        # Apply fill using mask
+        # Apply fill using mask with proper alpha compositing
         fill_img = Image.new("RGBA", (width, height), fill)
         mask_img = Image.fromarray(mask, "L")
-        ctx.image.paste(fill_img, (min_x, min_y), mask_img)
+
+        if fill[3] < 255:
+            # Semi-transparent - need proper compositing
+            temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+            temp.paste(fill_img, (min_x, min_y), mask_img)
+            ctx.image.alpha_composite(temp)
+        else:
+            ctx.image.paste(fill_img, (min_x, min_y), mask_img)
 
     def _fill_polygon_with_gradient(self, ctx: "RenderContext",
                                     points: list[tuple[float, float]],
@@ -1030,6 +1182,80 @@ class SVGRenderer:
 
         return stops[-1].color
 
+    # Font mapping for common font families
+    FONT_PATHS = {
+        # Serif fonts
+        "serif": [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+            "/System/Library/Fonts/Times.ttc",
+            "times.ttf",
+        ],
+        "times": [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/System/Library/Fonts/Times.ttc",
+        ],
+        "times new roman": [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/System/Library/Fonts/Times.ttc",
+        ],
+        # Sans-serif fonts
+        "sans-serif": [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "arial.ttf",
+        ],
+        "arial": [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "arial.ttf",
+        ],
+        "helvetica": [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ],
+        # Monospace fonts
+        "monospace": [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+            "/System/Library/Fonts/Courier.ttc",
+            "cour.ttf",
+        ],
+        "courier": [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/System/Library/Fonts/Courier.ttc",
+        ],
+    }
+
+    def _get_font(self, font_family: str, font_size: int) -> ImageFont.FreeTypeFont:
+        """Get a font for the given family and size."""
+        # Normalize font family name
+        family_lower = font_family.lower().strip()
+
+        # Try exact match first, then fallback to sans-serif
+        font_paths = self.FONT_PATHS.get(family_lower, self.FONT_PATHS["sans-serif"])
+
+        for path in font_paths:
+            try:
+                return ImageFont.truetype(path, font_size)
+            except (OSError, IOError):
+                continue
+
+        # Final fallback to any available DejaVu font
+        fallbacks = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        ]
+        for path in fallbacks:
+            try:
+                return ImageFont.truetype(path, font_size)
+            except (OSError, IOError):
+                continue
+
+        # Last resort - default font (will be small)
+        return ImageFont.load_default()
+
     def _render_text(self, ctx: "RenderContext", text: TextElement):
         """Render text element."""
         if not text.text:
@@ -1044,15 +1270,9 @@ class SVGRenderer:
 
         draw = ImageDraw.Draw(ctx.image, "RGBA")
 
-        # Try to use a font
-        font_size = int(text.font_size * self._get_scale(ctx, text.transform))
-        try:
-            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
-        except (OSError, IOError):
-            try:
-                font = ImageFont.truetype("arial.ttf", font_size)
-            except (OSError, IOError):
-                font = ImageFont.load_default()
+        # Calculate font size with transform scaling
+        font_size = max(1, int(text.font_size * self._get_scale(ctx, text.transform)))
+        font = self._get_font(text.font_family, font_size)
 
         draw.text((x, y), text.text, fill=fill, font=font, anchor="ls")
 
@@ -1095,7 +1315,9 @@ class RenderContext:
 
     def __init__(self, image: Image.Image,
                  gradients: dict[str, Union[LinearGradient, RadialGradient]],
-                 base_transform: Transform):
+                 base_transform: Transform,
+                 clip_paths: dict[str, ClipPath] = None):
         self.image = image
         self.gradients = gradients
         self.base_transform = base_transform
+        self.clip_paths = clip_paths or {}

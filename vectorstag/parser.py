@@ -138,6 +138,7 @@ class SVGElement:
     style: Style
     transform: Transform
     children: list["SVGElement"] = field(default_factory=list)
+    clip_path_id: Optional[str] = None
 
 
 @dataclass
@@ -212,6 +213,13 @@ class TextElement(SVGElement):
 
 
 @dataclass
+class ClipPath:
+    """Clip path definition."""
+    id: str
+    elements: list[SVGElement] = field(default_factory=list)
+
+
+@dataclass
 class SVGDocument:
     """Parsed SVG document."""
     width: float
@@ -219,6 +227,7 @@ class SVGDocument:
     viewBox: Optional[tuple[float, float, float, float]] = None
     elements: list[SVGElement] = field(default_factory=list)
     gradients: dict[str, Union[LinearGradient, RadialGradient]] = field(default_factory=dict)
+    clip_paths: dict[str, ClipPath] = field(default_factory=dict)
 
 
 class SVGParser:
@@ -258,6 +267,7 @@ class SVGParser:
 
     def __init__(self):
         self.gradients: dict[str, Union[LinearGradient, RadialGradient]] = {}
+        self.clip_paths: dict[str, ClipPath] = {}
         self.defs: dict[str, ET.Element] = {}
         self.default_width = 300
         self.default_height = 150
@@ -289,10 +299,14 @@ class SVGParser:
 
         # Reset state
         self.gradients = {}
+        self.clip_paths = {}
         self.defs = {}
 
         # First pass: collect defs
         self._collect_defs(root)
+
+        # Parse clip paths
+        self._parse_clip_paths(root)
 
         # Resolve gradient references
         self._resolve_gradient_refs()
@@ -323,7 +337,8 @@ class SVGParser:
             height=height,
             viewBox=viewBox,
             elements=elements,
-            gradients=self.gradients
+            gradients=self.gradients,
+            clip_paths=self.clip_paths
         )
 
     def parse_file(self, filepath: str) -> SVGDocument:
@@ -350,6 +365,28 @@ class SVGParser:
                 self._parse_linear_gradient(elem)
             elif tag == "radialGradient":
                 self._parse_radial_gradient(elem)
+
+    def _parse_clip_paths(self, root: ET.Element):
+        """Parse all clipPath elements."""
+        for elem in root.iter():
+            tag = self._strip_ns(elem.tag)
+            if tag == "clipPath":
+                clip_id = elem.get("id")
+                if clip_id:
+                    # Parse child elements as clip path shapes
+                    clip_elements = []
+                    for child in elem:
+                        child_tag = self._strip_ns(child.tag)
+                        parsed = self._parse_element(
+                            child, Transform.identity(), Style()
+                        )
+                        if parsed:
+                            clip_elements.append(parsed)
+
+                    self.clip_paths[clip_id] = ClipPath(
+                        id=clip_id,
+                        elements=clip_elements
+                    )
 
     def _parse_linear_gradient(self, elem: ET.Element):
         """Parse a linearGradient element."""
@@ -495,25 +532,45 @@ class SVGParser:
         local_transform = self._parse_transform(transform_str) if transform_str else Transform.identity()
         transform = parent_transform.multiply(local_transform)
 
-        if tag == "rect":
-            return self._parse_rect(elem, style, transform)
-        elif tag == "circle":
-            return self._parse_circle(elem, style, transform)
-        elif tag == "ellipse":
-            return self._parse_ellipse(elem, style, transform)
-        elif tag == "line":
-            return self._parse_line(elem, style, transform)
-        elif tag == "polyline":
-            return self._parse_polyline(elem, style, transform)
-        elif tag == "polygon":
-            return self._parse_polygon(elem, style, transform)
-        elif tag == "path":
-            return self._parse_path(elem, style, transform)
-        elif tag == "g":
-            return self._parse_group(elem, style, transform, parent_style)
-        elif tag == "text":
-            return self._parse_text(elem, style, transform)
+        # Parse clip-path attribute
+        clip_path_id = self._parse_url_reference(elem.get("clip-path", ""))
 
+        result = None
+        if tag == "rect":
+            result = self._parse_rect(elem, style, transform)
+        elif tag == "circle":
+            result = self._parse_circle(elem, style, transform)
+        elif tag == "ellipse":
+            result = self._parse_ellipse(elem, style, transform)
+        elif tag == "line":
+            result = self._parse_line(elem, style, transform)
+        elif tag == "polyline":
+            result = self._parse_polyline(elem, style, transform)
+        elif tag == "polygon":
+            result = self._parse_polygon(elem, style, transform)
+        elif tag == "path":
+            result = self._parse_path(elem, style, transform)
+        elif tag == "g":
+            result = self._parse_group(elem, style, transform, parent_style)
+        elif tag == "text":
+            result = self._parse_text(elem, style, transform)
+
+        # Set clip path on the parsed element
+        if result and clip_path_id:
+            result.clip_path_id = clip_path_id
+
+        return result
+
+    def _parse_url_reference(self, value: str) -> Optional[str]:
+        """Parse a url() reference and return the ID."""
+        if not value:
+            return None
+        value = value.strip()
+        if value.startswith("url(") and value.endswith(")"):
+            ref = value[4:-1].strip()
+            if ref.startswith("#"):
+                return ref[1:]
+            return ref
         return None
 
     def _parse_style(self, elem: ET.Element, parent_style: Style) -> Style:

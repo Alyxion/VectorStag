@@ -3,7 +3,7 @@
 ## Project Goal
 Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG.
 
-## Current Status: 96.0% Average Similarity
+## Current Status: 96.6% Average Similarity
 
 ### Test Results (30 SVG samples from W3C)
 **Source**: https://dev.w3.org/SVG/tools/svgweb/samples/svg-files/
@@ -60,6 +60,14 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 ### Rendering
 - [x] Anti-aliasing (2x supersampling by default)
 - [x] Automatic bounding box computation for SVGs without dimensions
+- [x] ClipPath support (basic shapes: rect, circle, ellipse, polygon, path)
+- [x] Proper alpha compositing for semi-transparent fills and strokes
+
+### Text
+- [x] Basic `<text>` rendering
+- [x] x, y positioning
+- [x] font-size
+- [x] font-family mapping (serif, sans-serif, monospace with DejaVu fallbacks)
 
 ### Gradients
 - [x] `<linearGradient>` with stops
@@ -68,12 +76,6 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - [x] gradientUnits: userSpaceOnUse
 - [x] Gradient href inheritance (xlink:href)
 - [x] stop-color, stop-opacity
-
-### Text
-- [x] Basic `<text>` rendering
-- [x] x, y positioning
-- [x] font-size
-- [x] font-family (falls back to system fonts)
 
 ### Document
 - [x] width/height attributes
@@ -102,10 +104,8 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 
 ### Medium Priority - Extended SVG Support
 
-5. **Clipping Paths**
-   - Current: `<clipPath>` elements ignored
-   - Needed: Apply clip paths to contained elements
-   - Location: New `_apply_clip_path()` in renderer
+5. ~~**Clipping Paths**~~ ✅ DONE
+   - Implemented basic clip path support for rect, circle, ellipse, polygon, path shapes
 
 6. **Masks**
    - Current: Not implemented
