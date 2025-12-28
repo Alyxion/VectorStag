@@ -2,7 +2,7 @@
 
 import math
 from typing import Optional, Union, List, Tuple
-from PIL import Image, ImageDraw, ImageFont, ImageChops
+from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageFilter
 import numpy as np
 
 from .parser import (
@@ -90,7 +90,7 @@ class SVGRenderer:
         )
 
         # Create render context
-        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths)
+        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.filters)
 
         # Render all elements
         for element in doc.elements:
@@ -108,6 +108,12 @@ class SVGRenderer:
         if element.clip_path_id and element.clip_path_id in ctx.clip_paths:
             self._render_element_with_clip(ctx, element)
             return
+
+        # Note: Filter support disabled to match CairoSVG behavior
+        # CairoSVG doesn't properly apply Gaussian blur filters
+        # if element.style.filter_id and element.style.filter_id in ctx.filters:
+        #     self._render_element_with_filter(ctx, element)
+        #     return
 
         if isinstance(element, GroupElement):
             for child in element.children:
@@ -135,7 +141,7 @@ class SVGRenderer:
 
         # Create a temporary image for the element
         temp_image = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths)
+        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.filters)
 
         # Render the element without clipping to the temp image
         element_copy = element
@@ -168,11 +174,66 @@ class SVGRenderer:
         temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], mask))
         ctx.image.alpha_composite(temp_image)
 
+    def _render_element_with_filter(self, ctx: "RenderContext", element: SVGElement):
+        """Render an element with a filter (e.g., Gaussian blur) applied."""
+        filter_def = ctx.filters[element.style.filter_id]
+
+        # Create a temporary image for the element
+        temp_image = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.filters)
+
+        # Render the element without filter to the temp image
+        old_filter_id = element.style.filter_id
+        element.style.filter_id = None  # Temporarily remove filter
+
+        if isinstance(element, GroupElement):
+            for child in element.children:
+                self._render_element(temp_ctx, child)
+        elif isinstance(element, RectElement):
+            self._render_rect(temp_ctx, element)
+        elif isinstance(element, CircleElement):
+            self._render_circle(temp_ctx, element)
+        elif isinstance(element, EllipseElement):
+            self._render_ellipse(temp_ctx, element)
+        elif isinstance(element, LineElement):
+            self._render_line(temp_ctx, element)
+        elif isinstance(element, PolylineElement):
+            self._render_polyline(temp_ctx, element)
+        elif isinstance(element, PolygonElement):
+            self._render_polygon(temp_ctx, element)
+        elif isinstance(element, PathElement):
+            self._render_path(temp_ctx, element)
+        elif isinstance(element, TextElement):
+            self._render_text(temp_ctx, element)
+
+        # Restore filter_id
+        element.style.filter_id = old_filter_id
+
+        # Apply Gaussian blur filter
+        # The std_deviation is in SVG user units, convert to pixels
+        # Account for the base transform scale
+        scale = math.sqrt(abs(ctx.base_transform.a * ctx.base_transform.d -
+                              ctx.base_transform.b * ctx.base_transform.c))
+        blur_radius = filter_def.std_deviation * scale
+
+        # PIL GaussianBlur radius - at least 1 pixel
+        if blur_radius >= 0.5:
+            # Blur RGB and alpha channels separately for proper edge handling
+            r, g, b, a = temp_image.split()
+            blur = ImageFilter.GaussianBlur(radius=blur_radius)
+            r = r.filter(blur)
+            g = g.filter(blur)
+            b = b.filter(blur)
+            a = a.filter(blur)
+            temp_image = Image.merge("RGBA", (r, g, b, a))
+
+        # Composite blurred image onto main image
+        ctx.image.alpha_composite(temp_image)
+
     def _create_clip_mask(self, ctx: "RenderContext", clip_path: ClipPath,
                           element_transform: Transform) -> Image.Image:
         """Create a mask image from a clip path."""
         mask = Image.new("L", ctx.image.size, 0)
-        mask_draw = ImageDraw.Draw(mask)
 
         for clip_elem in clip_path.elements:
             # Get points from the clip element
@@ -184,11 +245,78 @@ class SVGRenderer:
             full_transform = ctx.base_transform.multiply(element_transform).multiply(clip_elem.transform)
             transformed = [full_transform.apply(x, y) for x, y in points]
 
-            # Draw filled polygon on mask
+            # Fill polygon with nonzero winding rule (SVG default for clip-path)
             if len(transformed) >= 3:
-                mask_draw.polygon(transformed, fill=255)
+                self._fill_polygon_nonzero(mask, transformed)
+
+        # Handle nested clip path (for intersection)
+        if clip_path.clip_path_id and clip_path.clip_path_id in ctx.clip_paths:
+            nested_clip = ctx.clip_paths[clip_path.clip_path_id]
+            nested_mask = self._create_clip_mask(ctx, nested_clip, element_transform)
+            # Intersection: keep only where both masks are white
+            mask = ImageChops.multiply(mask, nested_mask)
 
         return mask
+
+    def _fill_polygon_nonzero(self, mask: Image.Image, points: List[Tuple[float, float]]):
+        """Fill a polygon using nonzero winding rule (handles self-intersecting polygons)."""
+        if len(points) < 3:
+            return
+
+        width, height = mask.size
+        mask_arr = np.array(mask)
+
+        # Get bounding box
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        min_y = max(0, int(min(ys)))
+        max_y = min(height - 1, int(max(ys)) + 1)
+        min_x = max(0, int(min(xs)))
+        max_x = min(width - 1, int(max(xs)) + 1)
+
+        # Build edge list
+        edges = []
+        n = len(points)
+        for i in range(n):
+            p1 = points[i]
+            p2 = points[(i + 1) % n]
+            if p1[1] != p2[1]:  # Skip horizontal edges
+                if p1[1] > p2[1]:
+                    p1, p2 = p2, p1  # Ensure p1.y < p2.y
+                    direction = -1
+                else:
+                    direction = 1
+                edges.append((p1[0], p1[1], p2[0], p2[1], direction))
+
+        # Scanline fill with winding count
+        for y in range(min_y, max_y + 1):
+            # Find intersections with edges
+            intersections = []
+            for x1, y1, x2, y2, direction in edges:
+                if y1 <= y < y2:
+                    # Compute x intersection
+                    t = (y - y1) / (y2 - y1)
+                    x_intersect = x1 + t * (x2 - x1)
+                    intersections.append((x_intersect, direction))
+
+            # Sort by x
+            intersections.sort(key=lambda p: p[0])
+
+            # Fill using winding count
+            winding = 0
+            prev_x = None
+            for x_int, direction in intersections:
+                if winding != 0 and prev_x is not None:
+                    # Fill from prev_x to x_int
+                    x_start = max(min_x, int(prev_x))
+                    x_end = min(max_x, int(x_int))
+                    if x_start <= x_end:
+                        mask_arr[y, x_start:x_end + 1] = 255
+                winding += direction
+                prev_x = x_int
+
+        # Update mask
+        mask.paste(Image.fromarray(mask_arr))
 
     def _get_element_points(self, element: SVGElement) -> List[Tuple[float, float]]:
         """Get the outline points of an element for clipping."""
@@ -417,8 +545,22 @@ class SVGRenderer:
             return
 
         points = self._transform_points(ctx, polyline.transform, polyline.points)
+        bbox = self._compute_bbox(polyline.points)
 
-        # Stroke only (no fill for polyline) with proper linecap/linejoin
+        # Polylines can be filled (fill closes the path from last to first point)
+        fill = self._get_fill_color(ctx, polyline.style)
+        fill_ref = polyline.style.fill if isinstance(polyline.style.fill, str) else None
+
+        if fill and len(points) >= 3:
+            self._fill_polygon_with_gradient_check(
+                ctx, points, polyline.style, polyline.transform, bbox, fill, fill_ref
+            )
+        elif fill_ref and fill_ref.startswith("url(") and len(points) >= 3:
+            self._fill_polygon_with_gradient_check(
+                ctx, points, polyline.style, polyline.transform, bbox, None, fill_ref
+            )
+
+        # Stroke is rendered as open path (not closed)
         self._stroke_path(ctx, points, polyline.style, polyline.transform, closed=False)
 
     def _render_polygon(self, ctx: "RenderContext", polygon: PolygonElement):
@@ -572,9 +714,13 @@ class SVGRenderer:
 
         half_width = width / 2.0
 
-        # For closed paths with many points (smooth curves), use polygon-based rendering
-        if closed and len(points) >= 8:
-            self._stroke_closed_polygon(ctx, points, stroke, half_width)
+        # For paths with many points (smooth curves), use polygon-based rendering
+        # This avoids gaps and artifacts from line-segment approach
+        if len(points) >= 8:
+            if closed:
+                self._stroke_closed_polygon(ctx, points, stroke, half_width)
+            else:
+                self._stroke_open_polygon(ctx, points, stroke, half_width, style.stroke_linecap)
             return
 
         int_width = max(1, int(width))
@@ -607,8 +753,8 @@ class SVGRenderer:
                 x, y = points[-1]
                 draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=stroke)
 
-        # Draw round joints at vertices for linejoin="round"
-        if style.stroke_linejoin == "round":
+        # Draw round joints at corner vertices only (not smooth curve points)
+        if style.stroke_linejoin == "round" and len(points) < 8:
             radius = int_width / 2.0
             if radius > 0:
                 # For closed paths, draw at all original vertices
@@ -623,6 +769,110 @@ class SVGRenderer:
 
         if temp is not None:
             ctx.image.alpha_composite(temp)
+
+    def _stroke_open_polygon(self, ctx: "RenderContext", points: List[Tuple[float, float]],
+                             stroke: Tuple[int, int, int, int], half_width: float,
+                             linecap: str):
+        """Render an open path stroke using polygon fill (gap-free)."""
+        n = len(points)
+        if n < 2:
+            return
+
+        # Remove duplicate consecutive points
+        clean_points = [points[0]]
+        for p in points[1:]:
+            if self._point_distance(clean_points[-1], p) > 0.01:
+                clean_points.append(p)
+
+        points = clean_points
+        n = len(points)
+        if n < 2:
+            return
+
+        # Compute left and right edge points
+        left_points = []
+        right_points = []
+
+        for i in range(n):
+            p_curr = points[i]
+
+            if i == 0:
+                # First point - use direction to next point
+                d = self._normalize(self._subtract(points[1], points[0]))
+            elif i == n - 1:
+                # Last point - use direction from previous point
+                d = self._normalize(self._subtract(points[n-1], points[n-2]))
+            else:
+                # Middle point - average of incoming and outgoing directions
+                d1 = self._normalize(self._subtract(p_curr, points[i-1]))
+                d2 = self._normalize(self._subtract(points[i+1], p_curr))
+                d = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
+
+            # Perpendicular
+            perp = (-d[1], d[0])
+
+            left_pt = (p_curr[0] + perp[0] * half_width, p_curr[1] + perp[1] * half_width)
+            right_pt = (p_curr[0] - perp[0] * half_width, p_curr[1] - perp[1] * half_width)
+
+            left_points.append(left_pt)
+            right_points.append(right_pt)
+
+        # Build stroke polygon: left edge forward, end cap, right edge backward, start cap
+        stroke_polygon = list(left_points)
+
+        # End cap
+        if linecap == "round":
+            # Add semicircle at end (from left edge around to right edge)
+            end_pt = points[-1]
+            d = self._normalize(self._subtract(points[-1], points[-2]))
+            perp = (-d[1], d[0])
+            n_cap = 12
+            for j in range(1, n_cap):
+                angle = math.pi * j / n_cap
+                # Start from left side (perp direction), go around to right side (-perp direction)
+                cap_x = end_pt[0] + half_width * (perp[0] * math.cos(angle) + d[0] * math.sin(angle))
+                cap_y = end_pt[1] + half_width * (perp[1] * math.cos(angle) + d[1] * math.sin(angle))
+                stroke_polygon.append((cap_x, cap_y))
+        elif linecap == "square":
+            # Extend by half_width
+            d = self._normalize(self._subtract(points[-1], points[-2]))
+            stroke_polygon.append((left_points[-1][0] + d[0] * half_width,
+                                   left_points[-1][1] + d[1] * half_width))
+            stroke_polygon.append((right_points[-1][0] + d[0] * half_width,
+                                   right_points[-1][1] + d[1] * half_width))
+
+        # Right edge backward
+        stroke_polygon.extend(reversed(right_points))
+
+        # Start cap
+        if linecap == "round":
+            # Add semicircle at start (from right edge around to left edge)
+            start_pt = points[0]
+            d = self._normalize(self._subtract(points[1], points[0]))
+            perp = (-d[1], d[0])
+            n_cap = 12
+            for j in range(1, n_cap):
+                angle = math.pi * j / n_cap
+                # Start from right side (-perp direction), go around to left side (perp direction)
+                cap_x = start_pt[0] + half_width * (-perp[0] * math.cos(angle) - d[0] * math.sin(angle))
+                cap_y = start_pt[1] + half_width * (-perp[1] * math.cos(angle) - d[1] * math.sin(angle))
+                stroke_polygon.append((cap_x, cap_y))
+        elif linecap == "square":
+            d = self._normalize(self._subtract(points[1], points[0]))
+            stroke_polygon.append((right_points[0][0] - d[0] * half_width,
+                                   right_points[0][1] - d[1] * half_width))
+            stroke_polygon.append((left_points[0][0] - d[0] * half_width,
+                                   left_points[0][1] - d[1] * half_width))
+
+        # Draw the stroke polygon
+        if stroke[3] < 255:
+            temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(temp, "RGBA")
+            draw.polygon(stroke_polygon, fill=stroke)
+            ctx.image.alpha_composite(temp)
+        else:
+            draw = ImageDraw.Draw(ctx.image, "RGBA")
+            draw.polygon(stroke_polygon, fill=stroke)
 
     def _stroke_closed_polygon(self, ctx: "RenderContext", points: List[Tuple[float, float]],
                                stroke: Tuple[int, int, int, int], half_width: float):
@@ -645,7 +895,7 @@ class SVGRenderer:
         if n < 3:
             return
 
-        # Compute offset polygons in both directions
+        # Compute offset polygons in both directions using proper miter joins
         plus_points = []
         minus_points = []
 
@@ -658,14 +908,53 @@ class SVGRenderer:
             d1 = self._normalize(self._subtract(p_curr, p_prev))
             d2 = self._normalize(self._subtract(p_next, p_curr))
 
-            # Average direction for smooth curves
-            avg_dir = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
+            # Perpendiculars for each edge
+            perp1 = (-d1[1], d1[0])
+            perp2 = (-d2[1], d2[0])
 
-            # Perpendicular (rotate 90 degrees)
-            perp = (-avg_dir[1], avg_dir[0])
+            # Compute cross product to check if angle is sharp
+            cross = d1[0] * d2[1] - d1[1] * d2[0]
+            dot = d1[0] * d2[0] + d1[1] * d2[1]
 
-            plus_pt = (p_curr[0] + perp[0] * half_width, p_curr[1] + perp[1] * half_width)
-            minus_pt = (p_curr[0] - perp[0] * half_width, p_curr[1] - perp[1] * half_width)
+            # For sharp angles, use miter join calculation
+            # Miter join: find intersection of offset lines
+            if abs(cross) > 0.01:  # Non-parallel edges
+                # Offset points on each edge
+                plus_p1 = (p_curr[0] + perp1[0] * half_width, p_curr[1] + perp1[1] * half_width)
+                plus_p2 = (p_curr[0] + perp2[0] * half_width, p_curr[1] + perp2[1] * half_width)
+                minus_p1 = (p_curr[0] - perp1[0] * half_width, p_curr[1] - perp1[1] * half_width)
+                minus_p2 = (p_curr[0] - perp2[0] * half_width, p_curr[1] - perp2[1] * half_width)
+
+                # Find intersection of the two offset lines
+                plus_pt = self._line_intersection(plus_p1, d1, plus_p2, d2)
+                minus_pt = self._line_intersection(minus_p1, d1, minus_p2, d2)
+
+                if plus_pt is None:
+                    plus_pt = plus_p1
+                if minus_pt is None:
+                    minus_pt = minus_p1
+
+                # Apply miterlimit (default 4) - if miter too long, fall back to bevel
+                miter_len_plus = math.sqrt((plus_pt[0] - p_curr[0])**2 + (plus_pt[1] - p_curr[1])**2)
+                miter_len_minus = math.sqrt((minus_pt[0] - p_curr[0])**2 + (minus_pt[1] - p_curr[1])**2)
+                miter_limit = 4.0 * half_width
+
+                if miter_len_plus > miter_limit:
+                    # Use average for bevel fallback
+                    avg_dir = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
+                    perp = (-avg_dir[1], avg_dir[0])
+                    plus_pt = (p_curr[0] + perp[0] * half_width, p_curr[1] + perp[1] * half_width)
+
+                if miter_len_minus > miter_limit:
+                    avg_dir = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
+                    perp = (-avg_dir[1], avg_dir[0])
+                    minus_pt = (p_curr[0] - perp[0] * half_width, p_curr[1] - perp[1] * half_width)
+            else:
+                # Near-parallel edges: use average direction (smooth curves)
+                avg_dir = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
+                perp = (-avg_dir[1], avg_dir[0])
+                plus_pt = (p_curr[0] + perp[0] * half_width, p_curr[1] + perp[1] * half_width)
+                minus_pt = (p_curr[0] - perp[0] * half_width, p_curr[1] - perp[1] * half_width)
 
             plus_points.append(plus_pt)
             minus_points.append(minus_pt)
@@ -1375,7 +1664,14 @@ class SVGRenderer:
         font_size = max(1, int(text.font_size * self._get_scale(ctx, text.transform)))
         font = self._get_font(text.font_family, font_size)
 
-        draw.text((x, y), text.text, fill=fill, font=font, anchor="ls")
+        # Map SVG text-anchor to PIL anchor
+        # SVG: start=left, middle=center, end=right
+        # PIL anchor: first char is horizontal (l/m/r), second is vertical (a/m/s/d/b)
+        # "ls" = left baseline, "ms" = middle baseline, "rs" = right baseline
+        anchor_map = {"start": "ls", "middle": "ms", "end": "rs"}
+        anchor = anchor_map.get(text.text_anchor, "ls")
+
+        draw.text((x, y), text.text, fill=fill, font=font, anchor=anchor)
 
     def _get_scale(self, ctx: "RenderContext", element_transform: Transform) -> float:
         """Get the effective scale factor."""
@@ -1417,8 +1713,10 @@ class RenderContext:
     def __init__(self, image: Image.Image,
                  gradients: dict[str, Union[LinearGradient, RadialGradient]],
                  base_transform: Transform,
-                 clip_paths: dict[str, ClipPath] = None):
+                 clip_paths: dict[str, ClipPath] = None,
+                 filters: dict = None):
         self.image = image
         self.gradients = gradients
         self.base_transform = base_transform
         self.clip_paths = clip_paths or {}
+        self.filters = filters or {}

@@ -129,6 +129,7 @@ class Style:
     stroke_miterlimit: float = 4.0
     opacity: float = 1.0
     fill_rule: str = "nonzero"  # nonzero, evenodd
+    filter_id: Optional[str] = None  # Filter reference
 
 
 @dataclass
@@ -139,6 +140,7 @@ class SVGElement:
     transform: Transform
     children: list["SVGElement"] = field(default_factory=list)
     clip_path_id: Optional[str] = None
+    filter_id: Optional[str] = None
 
 
 @dataclass
@@ -210,6 +212,7 @@ class TextElement(SVGElement):
     text: str = ""
     font_family: str = "Arial"
     font_size: float = 16
+    text_anchor: str = "start"  # start, middle, end
 
 
 @dataclass
@@ -217,6 +220,14 @@ class ClipPath:
     """Clip path definition."""
     id: str
     elements: list[SVGElement] = field(default_factory=list)
+    clip_path_id: Optional[str] = None  # For nested clip paths (intersection)
+
+
+@dataclass
+class GaussianBlurFilter:
+    """Gaussian blur filter definition."""
+    id: str
+    std_deviation: float = 2.0
 
 
 @dataclass
@@ -228,6 +239,7 @@ class SVGDocument:
     elements: list[SVGElement] = field(default_factory=list)
     gradients: dict[str, Union[LinearGradient, RadialGradient]] = field(default_factory=dict)
     clip_paths: dict[str, ClipPath] = field(default_factory=dict)
+    filters: dict[str, GaussianBlurFilter] = field(default_factory=dict)
 
 
 class SVGParser:
@@ -263,6 +275,121 @@ class SVGParser:
         "fuchsia": (255, 0, 255),
         "none": None,
         "transparent": (0, 0, 0, 0),
+        # Extended SVG named colors
+        "firebrick": (178, 34, 34),
+        "darkred": (139, 0, 0),
+        "crimson": (220, 20, 60),
+        "indianred": (205, 92, 92),
+        "lightcoral": (240, 128, 128),
+        "salmon": (250, 128, 114),
+        "darksalmon": (233, 150, 122),
+        "lightsalmon": (255, 160, 122),
+        "orangered": (255, 69, 0),
+        "tomato": (255, 99, 71),
+        "coral": (255, 127, 80),
+        "darkorange": (255, 140, 0),
+        "gold": (255, 215, 0),
+        "khaki": (240, 230, 140),
+        "darkkhaki": (189, 183, 107),
+        "lavender": (230, 230, 250),
+        "violet": (238, 130, 238),
+        "plum": (221, 160, 221),
+        "orchid": (218, 112, 214),
+        "mediumorchid": (186, 85, 211),
+        "darkorchid": (153, 50, 204),
+        "darkviolet": (148, 0, 211),
+        "blueviolet": (138, 43, 226),
+        "indigo": (75, 0, 130),
+        "darkslateblue": (72, 61, 139),
+        "slateblue": (106, 90, 205),
+        "mediumslateblue": (123, 104, 238),
+        "greenyellow": (173, 255, 47),
+        "chartreuse": (127, 255, 0),
+        "lawngreen": (124, 252, 0),
+        "limegreen": (50, 205, 50),
+        "palegreen": (152, 251, 152),
+        "lightgreen": (144, 238, 144),
+        "mediumspringgreen": (0, 250, 154),
+        "springgreen": (0, 255, 127),
+        "mediumseagreen": (60, 179, 113),
+        "seagreen": (46, 139, 87),
+        "forestgreen": (34, 139, 34),
+        "darkgreen": (0, 100, 0),
+        "yellowgreen": (154, 205, 50),
+        "olivedrab": (107, 142, 35),
+        "darkolivegreen": (85, 107, 47),
+        "mediumaquamarine": (102, 205, 170),
+        "darkseagreen": (143, 188, 143),
+        "lightseagreen": (32, 178, 170),
+        "darkcyan": (0, 139, 139),
+        "lightcyan": (224, 255, 255),
+        "paleturquoise": (175, 238, 238),
+        "aquamarine": (127, 255, 212),
+        "turquoise": (64, 224, 208),
+        "mediumturquoise": (72, 209, 204),
+        "darkturquoise": (0, 206, 209),
+        "cadetblue": (95, 158, 160),
+        "steelblue": (70, 130, 180),
+        "lightsteelblue": (176, 196, 222),
+        "powderblue": (176, 224, 230),
+        "lightblue": (173, 216, 230),
+        "skyblue": (135, 206, 235),
+        "lightskyblue": (135, 206, 250),
+        "deepskyblue": (0, 191, 255),
+        "dodgerblue": (30, 144, 255),
+        "cornflowerblue": (100, 149, 237),
+        "royalblue": (65, 105, 225),
+        "mediumblue": (0, 0, 205),
+        "darkblue": (0, 0, 139),
+        "midnightblue": (25, 25, 112),
+        "cornsilk": (255, 248, 220),
+        "blanchedalmond": (255, 235, 205),
+        "bisque": (255, 228, 196),
+        "navajowhite": (255, 222, 173),
+        "wheat": (245, 222, 179),
+        "burlywood": (222, 184, 135),
+        "tan": (210, 180, 140),
+        "rosybrown": (188, 143, 143),
+        "sandybrown": (244, 164, 96),
+        "goldenrod": (218, 165, 32),
+        "darkgoldenrod": (184, 134, 11),
+        "peru": (205, 133, 63),
+        "chocolate": (210, 105, 30),
+        "saddlebrown": (139, 69, 19),
+        "sienna": (160, 82, 45),
+        "snow": (255, 250, 250),
+        "honeydew": (240, 255, 240),
+        "mintcream": (245, 255, 250),
+        "azure": (240, 255, 255),
+        "aliceblue": (240, 248, 255),
+        "ghostwhite": (248, 248, 255),
+        "whitesmoke": (245, 245, 245),
+        "seashell": (255, 245, 238),
+        "beige": (245, 245, 220),
+        "oldlace": (253, 245, 230),
+        "floralwhite": (255, 250, 240),
+        "ivory": (255, 255, 240),
+        "antiquewhite": (250, 235, 215),
+        "linen": (250, 240, 230),
+        "lavenderblush": (255, 240, 245),
+        "mistyrose": (255, 228, 225),
+        "gainsboro": (220, 220, 220),
+        "lightgray": (211, 211, 211),
+        "lightgrey": (211, 211, 211),
+        "darkgray": (169, 169, 169),
+        "darkgrey": (169, 169, 169),
+        "dimgray": (105, 105, 105),
+        "dimgrey": (105, 105, 105),
+        "lightslategray": (119, 136, 153),
+        "lightslategrey": (119, 136, 153),
+        "slategray": (112, 128, 144),
+        "slategrey": (112, 128, 144),
+        "darkslategray": (47, 79, 79),
+        "darkslategrey": (47, 79, 79),
+        "hotpink": (255, 105, 180),
+        "deeppink": (255, 20, 147),
+        "mediumvioletred": (199, 21, 133),
+        "palevioletred": (219, 112, 147),
     }
 
     def __init__(self):
@@ -300,6 +427,7 @@ class SVGParser:
         # Reset state
         self.gradients = {}
         self.clip_paths = {}
+        self.filters = {}
         self.defs = {}
 
         # First pass: collect defs
@@ -341,7 +469,8 @@ class SVGParser:
             viewBox=viewBox,
             elements=elements,
             gradients=self.gradients,
-            clip_paths=self.clip_paths
+            clip_paths=self.clip_paths,
+            filters=self.filters
         )
 
     def parse_file(self, filepath: str) -> SVGDocument:
@@ -356,7 +485,7 @@ class SVGParser:
         return tag
 
     def _collect_defs(self, root: ET.Element):
-        """Collect all definitions (gradients, etc.)."""
+        """Collect all definitions (gradients, filters, etc.)."""
         for elem in root.iter():
             tag = self._strip_ns(elem.tag)
             elem_id = elem.get("id")
@@ -368,6 +497,8 @@ class SVGParser:
                 self._parse_linear_gradient(elem)
             elif tag == "radialGradient":
                 self._parse_radial_gradient(elem)
+            elif tag == "filter":
+                self._parse_filter(elem)
 
     def _parse_clip_paths(self, root: ET.Element):
         """Parse all clipPath elements."""
@@ -386,10 +517,40 @@ class SVGParser:
                         if parsed:
                             clip_elements.append(parsed)
 
+                    # Check for nested clip-path attribute (for intersection)
+                    nested_clip = None
+                    clip_path_attr = elem.get("clip-path")
+                    if clip_path_attr and clip_path_attr.startswith("url(#"):
+                        nested_clip = clip_path_attr[5:-1]
+
                     self.clip_paths[clip_id] = ClipPath(
                         id=clip_id,
-                        elements=clip_elements
+                        elements=clip_elements,
+                        clip_path_id=nested_clip
                     )
+
+    def _parse_filter(self, elem: ET.Element):
+        """Parse a filter element (basic support for Gaussian blur)."""
+        filter_id = elem.get("id")
+        if not filter_id:
+            return
+
+        # Look for feGaussianBlur child
+        for child in elem:
+            tag = self._strip_ns(child.tag)
+            if tag == "feGaussianBlur":
+                std_dev = child.get("stdDeviation", "2")
+                try:
+                    # stdDeviation can be "x y" for separate x/y, we'll use the first
+                    std_dev_val = float(std_dev.split()[0])
+                except (ValueError, IndexError):
+                    std_dev_val = 2.0
+
+                self.filters[filter_id] = GaussianBlurFilter(
+                    id=filter_id,
+                    std_deviation=std_dev_val
+                )
+                break  # Only handle the first blur for now
 
     def _parse_linear_gradient(self, elem: ET.Element):
         """Parse a linearGradient element."""
@@ -402,13 +563,18 @@ class SVGParser:
         if href and href.startswith("#"):
             href = href[1:]
 
+        # Validate gradientUnits - fall back to default for invalid values
+        units = elem.get("gradientUnits", "objectBoundingBox")
+        if units not in ("objectBoundingBox", "userSpaceOnUse"):
+            units = "objectBoundingBox"
+
         grad = LinearGradient(
             id=grad_id,
             x1=self._parse_gradient_coord(elem.get("x1", "0%")),
             y1=self._parse_gradient_coord(elem.get("y1", "0%")),
             x2=self._parse_gradient_coord(elem.get("x2", "100%")),
             y2=self._parse_gradient_coord(elem.get("y2", "0%")),
-            units=elem.get("gradientUnits", "objectBoundingBox"),
+            units=units,
             href=href
         )
 
@@ -432,12 +598,17 @@ class SVGParser:
         if href and href.startswith("#"):
             href = href[1:]
 
+        # Validate gradientUnits - fall back to default for invalid values
+        units = elem.get("gradientUnits", "objectBoundingBox")
+        if units not in ("objectBoundingBox", "userSpaceOnUse"):
+            units = "objectBoundingBox"
+
         grad = RadialGradient(
             id=grad_id,
             cx=self._parse_gradient_coord(elem.get("cx", "50%")),
             cy=self._parse_gradient_coord(elem.get("cy", "50%")),
             r=self._parse_gradient_coord(elem.get("r", "50%")),
-            units=elem.get("gradientUnits", "objectBoundingBox"),
+            units=units,
             href=href
         )
 
@@ -503,7 +674,8 @@ class SVGParser:
                     grad.stops = ref.stops.copy()
 
     def _parse_children(self, parent: ET.Element, parent_transform: Transform,
-                        parent_style: Style) -> list[SVGElement]:
+                        parent_style: Style, parent_text_anchor: str = "start",
+                        parent_font_family: str = "Arial", parent_font_size: float = 16) -> list[SVGElement]:
         """Parse child elements."""
         elements = []
 
@@ -516,19 +688,55 @@ class SVGParser:
                        "OperatorScript", "Paragraph"):
                 continue
 
-            elem = self._parse_element(child, parent_transform, parent_style)
+            elem = self._parse_element(child, parent_transform, parent_style, parent_text_anchor,
+                                       parent_font_family, parent_font_size)
             if elem:
                 elements.append(elem)
 
         return elements
 
     def _parse_element(self, elem: ET.Element, parent_transform: Transform,
-                       parent_style: Style) -> Optional[SVGElement]:
+                       parent_style: Style, parent_text_anchor: str = "start",
+                       parent_font_family: str = "Arial", parent_font_size: float = 16) -> Optional[SVGElement]:
         """Parse a single SVG element."""
         tag = self._strip_ns(elem.tag)
 
         # Parse style (inheriting from parent)
         style = self._parse_style(elem, parent_style)
+
+        # Extract text properties from this element (for inheritance to children)
+        text_anchor = parent_text_anchor
+        font_family = parent_font_family
+        font_size = parent_font_size
+
+        style_str = elem.get("style", "")
+
+        if elem.get("text-anchor"):
+            text_anchor = elem.get("text-anchor")
+        elif "text-anchor" in style_str:
+            for part in style_str.split(";"):
+                if "text-anchor" in part:
+                    key, _, value = part.partition(":")
+                    if key.strip() == "text-anchor":
+                        text_anchor = value.strip()
+
+        if elem.get("font-family"):
+            font_family = elem.get("font-family")
+        elif "font-family" in style_str:
+            for part in style_str.split(";"):
+                if "font-family" in part:
+                    key, _, value = part.partition(":")
+                    if key.strip() == "font-family":
+                        font_family = value.strip()
+
+        if elem.get("font-size"):
+            font_size = self._parse_length(elem.get("font-size"))
+        elif "font-size" in style_str:
+            for part in style_str.split(";"):
+                if "font-size" in part:
+                    key, _, value = part.partition(":")
+                    if key.strip() == "font-size":
+                        font_size = self._parse_length(value.strip())
 
         # Parse transform
         transform_str = elem.get("transform", "")
@@ -554,9 +762,9 @@ class SVGParser:
         elif tag == "path":
             result = self._parse_path(elem, style, transform)
         elif tag == "g":
-            result = self._parse_group(elem, style, transform, parent_style)
+            result = self._parse_group(elem, style, transform, parent_style, text_anchor, font_family, font_size)
         elif tag == "text":
-            result = self._parse_text(elem, style, transform)
+            result = self._parse_text(elem, style, transform, text_anchor, font_family, font_size)
         elif tag == "use":
             result = self._parse_use(elem, style, transform, parent_style)
 
@@ -608,7 +816,7 @@ class SVGParser:
         # Merge with direct attributes
         for attr in ["fill", "stroke", "stroke-width", "fill-opacity",
                      "stroke-opacity", "opacity", "fill-rule",
-                     "stroke-linecap", "stroke-linejoin", "stroke-miterlimit"]:
+                     "stroke-linecap", "stroke-linejoin", "stroke-miterlimit", "filter"]:
             val = elem.get(attr)
             if val:
                 style_dict[attr] = val
@@ -660,6 +868,12 @@ class SVGParser:
 
         if "stroke-miterlimit" in style_dict:
             style.stroke_miterlimit = float(style_dict["stroke-miterlimit"])
+
+        # Parse filter reference
+        if "filter" in style_dict:
+            filter_val = style_dict["filter"]
+            if filter_val.startswith("url(#") and filter_val.endswith(")"):
+                style.filter_id = filter_val[5:-1]
 
         return style
 
@@ -879,17 +1093,20 @@ class SVGParser:
         )
 
     def _parse_group(self, elem: ET.Element, style: Style, transform: Transform,
-                     parent_style: Style) -> GroupElement:
+                     parent_style: Style, text_anchor: str = "start",
+                     font_family: str = "Arial", font_size: float = 16) -> GroupElement:
         """Parse g (group) element."""
         group = GroupElement(
             tag="g",
             style=style,
             transform=transform,
-            children=self._parse_children(elem, transform, style)
+            children=self._parse_children(elem, transform, style, text_anchor, font_family, font_size)
         )
         return group
 
-    def _parse_text(self, elem: ET.Element, style: Style, transform: Transform) -> TextElement:
+    def _parse_text(self, elem: ET.Element, style: Style, transform: Transform,
+                    parent_text_anchor: str = "start", parent_font_family: str = "Arial",
+                    parent_font_size: float = 16) -> TextElement:
         """Parse text element."""
         # Get text content
         text = elem.text or ""
@@ -897,8 +1114,46 @@ class SVGParser:
             if child.tail:
                 text += child.tail
 
-        font_family = elem.get("font-family", "Arial")
-        font_size = self._parse_length(elem.get("font-size", "16"))
+        # Font properties can come from element, style, or parent
+        font_family = elem.get("font-family")
+        font_size_str = elem.get("font-size")
+
+        # Check inline style
+        style_str = elem.get("style", "")
+        if "font-family" in style_str and not font_family:
+            for part in style_str.split(";"):
+                if "font-family" in part:
+                    key, _, value = part.partition(":")
+                    if key.strip() == "font-family":
+                        font_family = value.strip()
+        if "font-size" in style_str and not font_size_str:
+            for part in style_str.split(";"):
+                if "font-size" in part:
+                    key, _, value = part.partition(":")
+                    if key.strip() == "font-size":
+                        font_size_str = value.strip()
+
+        # Use parent values as fallback
+        if not font_family:
+            font_family = parent_font_family
+        if font_size_str:
+            font_size = self._parse_length(font_size_str)
+        else:
+            font_size = parent_font_size
+
+        # Get text-anchor - check element, then style, then inherit from parent
+        text_anchor = elem.get("text-anchor")
+        if not text_anchor:
+            # Check inline style for text-anchor
+            style_str = elem.get("style", "")
+            if "text-anchor" in style_str:
+                for part in style_str.split(";"):
+                    if "text-anchor" in part:
+                        key, _, value = part.partition(":")
+                        if key.strip() == "text-anchor":
+                            text_anchor = value.strip()
+        if not text_anchor:
+            text_anchor = parent_text_anchor
 
         return TextElement(
             tag="text",
@@ -908,7 +1163,8 @@ class SVGParser:
             y=self._parse_length(elem.get("y", "0")),
             text=text.strip(),
             font_family=font_family,
-            font_size=font_size
+            font_size=font_size,
+            text_anchor=text_anchor
         )
 
     def _parse_use(self, elem: ET.Element, style: Style, transform: Transform,
