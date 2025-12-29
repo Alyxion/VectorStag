@@ -119,9 +119,10 @@ def main():
             # Get SVG's natural dimensions for proper parent size
             doc_width, doc_height = get_svg_dimensions(svg_path)
 
-            # Render with both engines, passing parent dimensions to CairoSVG
-            cairo_img = render_with_cairo(svg_path, 400, 400, doc_width, doc_height)
-            vs_img = render_with_vectorstag(svg_path, 400, 400)
+            # Render with both engines at 3x resolution (1200px) for detail preservation
+            render_size = 1200
+            cairo_img = render_with_cairo(svg_path, render_size, render_size, doc_width, doc_height)
+            vs_img = render_with_vectorstag(svg_path, render_size, render_size)
 
             # Compute similarity
             sim = compute_similarity(cairo_img, vs_img)

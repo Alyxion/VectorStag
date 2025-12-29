@@ -119,6 +119,10 @@ class SVGRenderer:
 
     def _render_element(self, ctx: "RenderContext", element: SVGElement):
         """Render a single element."""
+        # Skip elements with display: none
+        if element.style.display == "none":
+            return
+
         # Check if element has a clip path
         if element.clip_path_id and element.clip_path_id in ctx.clip_paths:
             self._render_element_with_clip(ctx, element)
@@ -623,12 +627,17 @@ class SVGRenderer:
                     all_points.append(points)
 
             if all_points:
-                if path.style.fill_rule == "evenodd" and len(all_points) > 1:
-                    # Combined evenodd fill for multiple subpaths (creates holes)
-                    self._fill_multi_polygon_evenodd(ctx, all_points, fill, fill_ref,
-                                                     path.style, path.transform, bbox)
+                if len(all_points) > 1:
+                    # Multiple subpaths - combine and apply fill rule
+                    if path.style.fill_rule == "evenodd":
+                        self._fill_multi_polygon_evenodd(ctx, all_points, fill, fill_ref,
+                                                         path.style, path.transform, bbox)
+                    else:
+                        # Nonzero rule - combine subpaths (creates holes with opposite winding)
+                        self._fill_multi_polygon_nonzero(ctx, all_points, fill, fill_ref,
+                                                          path.style, path.transform, bbox)
                 else:
-                    # Fill each polygon separately (nonzero or single polygon)
+                    # Single polygon
                     for points in all_points:
                         if fill:
                             self._fill_polygon_with_gradient_check(
@@ -735,14 +744,25 @@ class SVGRenderer:
         return points
 
     def _stroke_path(self, ctx: "RenderContext", points: List[Tuple[float, float]],
-                     style: Style, element_transform: Transform, closed: bool = False):
+                     style: Style, element_transform: Transform, closed: bool = False,
+                     bbox: tuple = None):
         """Render a stroke with proper linecap and linejoin."""
+        # Check for gradient stroke
+        if isinstance(style.stroke, str) and style.stroke.startswith("url("):
+            self._stroke_path_with_gradient(ctx, points, style, element_transform, closed, bbox)
+            return
+
         stroke = self._get_stroke_color(ctx, style)
         if not stroke or len(points) < 2:
             return
 
         width = style.stroke_width * self._get_scale(ctx, element_transform)
         if width < 0.5:
+            return
+
+        # Handle stroke-dasharray
+        if style.stroke_dasharray and len(style.stroke_dasharray) > 0:
+            self._stroke_dashed_path(ctx, points, style, element_transform, width, stroke, closed)
             return
 
         half_width = width / 2.0
@@ -802,6 +822,136 @@ class SVGRenderer:
 
         if temp is not None:
             ctx.image.alpha_composite(temp)
+
+    def _stroke_path_with_gradient(self, ctx: "RenderContext", points: List[Tuple[float, float]],
+                                    style: Style, element_transform: Transform,
+                                    closed: bool, bbox: tuple):
+        """Render a stroke with gradient fill."""
+        if len(points) < 2:
+            return
+
+        width = style.stroke_width * self._get_scale(ctx, element_transform)
+        if width < 0.5:
+            return
+
+        half_width = width / 2.0
+
+        # Build stroke polygon
+        stroke_polygon = self._build_stroke_polygon(points, half_width, style.stroke_linecap,
+                                                    style.stroke_linejoin, closed, style.stroke_miterlimit)
+        if not stroke_polygon or len(stroke_polygon) < 3:
+            return
+
+        # Get bounding box for gradient
+        if bbox is None:
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            # Convert back to user space for bbox
+            inv_transform = ctx.base_transform.multiply(element_transform)
+            # Use screen-space bbox
+            sxs = [p[0] for p in stroke_polygon]
+            sys = [p[1] for p in stroke_polygon]
+            screen_bbox = (min(sxs), min(sys), max(sxs) - min(sxs), max(sys) - min(sys))
+        else:
+            screen_bbox = bbox
+
+        # Create a temporary style with fill set to the stroke gradient
+        stroke_ref = style.stroke
+        opacity = style.stroke_opacity * style.opacity
+
+        # Fill the stroke polygon with gradient
+        self._fill_polygon_with_gradient_check(ctx, stroke_polygon, style, element_transform,
+                                               screen_bbox, None, stroke_ref)
+
+    def _stroke_dashed_path(self, ctx: "RenderContext", points: List[Tuple[float, float]],
+                            style: Style, element_transform: Transform, width: float,
+                            stroke: Tuple[int, int, int, int], closed: bool):
+        """Render a dashed stroke along a path."""
+        if len(points) < 2:
+            return
+
+        dasharray = style.stroke_dasharray
+        if not dasharray:
+            return
+
+        # Normalize dasharray (must have even number of elements)
+        if len(dasharray) % 2 == 1:
+            dasharray = dasharray * 2  # Repeat to make even
+
+        scale = self._get_scale(ctx, element_transform)
+        scaled_dashes = [d * scale for d in dasharray]
+
+        # Walk along the path and collect dash segments
+        total_dash_length = sum(scaled_dashes)
+        if total_dash_length <= 0:
+            return
+
+        # Compute cumulative distances along path
+        distances = [0.0]
+        for i in range(1, len(points)):
+            d = self._point_distance(points[i-1], points[i])
+            distances.append(distances[-1] + d)
+
+        total_length = distances[-1]
+        if total_length <= 0:
+            return
+
+        # Generate dash segments
+        dash_idx = 0
+        dash_offset = 0.0
+        current_pos = 0.0
+        is_on = True  # Start with a dash (not gap)
+
+        half_width = width / 2.0
+
+        while current_pos < total_length:
+            dash_len = scaled_dashes[dash_idx % len(scaled_dashes)]
+            segment_end = min(current_pos + dash_len, total_length)
+
+            if is_on and dash_len > 0:
+                # Extract points for this dash segment
+                segment_points = self._extract_path_segment(points, distances, current_pos, segment_end)
+                if len(segment_points) >= 2:
+                    # Render this dash segment
+                    self._stroke_open_polygon(ctx, segment_points, stroke, half_width, style.stroke_linecap)
+
+            current_pos = segment_end
+            dash_idx += 1
+            is_on = not is_on
+
+    def _extract_path_segment(self, points: List[Tuple[float, float]],
+                              distances: List[float], start_dist: float,
+                              end_dist: float) -> List[Tuple[float, float]]:
+        """Extract a segment of the path between two distance values."""
+        result = []
+
+        for i in range(len(points) - 1):
+            d0, d1 = distances[i], distances[i + 1]
+            p0, p1 = points[i], points[i + 1]
+
+            # Check if this segment overlaps with [start_dist, end_dist]
+            if d1 <= start_dist or d0 >= end_dist:
+                continue
+
+            # Compute start point of overlap
+            if d0 < start_dist:
+                t = (start_dist - d0) / (d1 - d0) if d1 > d0 else 0
+                start_pt = (p0[0] + t * (p1[0] - p0[0]), p0[1] + t * (p1[1] - p0[1]))
+            else:
+                start_pt = p0
+
+            # Compute end point of overlap
+            if d1 > end_dist:
+                t = (end_dist - d0) / (d1 - d0) if d1 > d0 else 1
+                end_pt = (p0[0] + t * (p1[0] - p0[0]), p0[1] + t * (p1[1] - p0[1]))
+            else:
+                end_pt = p1
+
+            if not result:
+                result.append(start_pt)
+            result.append(end_pt)
+
+        return result
 
     def _stroke_open_polygon(self, ctx: "RenderContext", points: List[Tuple[float, float]],
                              stroke: Tuple[int, int, int, int], half_width: float,
@@ -1029,7 +1179,7 @@ class SVGRenderer:
 
     def _build_stroke_polygon(self, points: List[Tuple[float, float]],
                               half_width: float, linecap: str, linejoin: str,
-                              closed: bool) -> List[Tuple[float, float]]:
+                              closed: bool, miterlimit: float = 4.0) -> List[Tuple[float, float]]:
         """Build a polygon representing the stroke outline."""
         if len(points) < 2:
             return []
@@ -1062,7 +1212,7 @@ class SVGRenderer:
                     # Use join with last segment
                     d_prev = self._normalize(self._subtract(points[0], points[-1]))
                     left_pt, right_pt = self._compute_join(
-                        points[-1], p, points[1], d_prev, d, half_width, linejoin
+                        points[-1], p, points[1], d_prev, d, half_width, linejoin, miterlimit
                     )
                 else:
                     # Apply linecap
@@ -1086,7 +1236,7 @@ class SVGRenderer:
                     # Use join with first segment
                     d_next = self._normalize(self._subtract(points[1], points[0]))
                     left_pt, right_pt = self._compute_join(
-                        points[i-1], p, points[0], d, d_next, half_width, linejoin
+                        points[i-1], p, points[0], d, d_next, half_width, linejoin, miterlimit
                     )
                 else:
                     # Apply linecap
@@ -1102,7 +1252,7 @@ class SVGRenderer:
                 d_prev = self._normalize(self._subtract(p, points[i-1]))
                 d_next = self._normalize(self._subtract(points[i+1], p))
                 left_pt, right_pt = self._compute_join(
-                    points[i-1], p, points[i+1], d_prev, d_next, half_width, linejoin
+                    points[i-1], p, points[i+1], d_prev, d_next, half_width, linejoin, miterlimit
                 )
 
             left_side.append(left_pt)
@@ -1121,7 +1271,7 @@ class SVGRenderer:
     def _compute_join(self, p_prev: Tuple[float, float], p: Tuple[float, float],
                       p_next: Tuple[float, float], d_prev: Tuple[float, float],
                       d_next: Tuple[float, float], half_width: float,
-                      linejoin: str) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+                      linejoin: str, miterlimit: float = 4.0) -> Tuple[Tuple[float, float], Tuple[float, float]]:
         """Compute join points at a vertex."""
         perp_prev = (-d_prev[1], d_prev[0])
         perp_next = (-d_next[1], d_next[0])
@@ -1134,6 +1284,9 @@ class SVGRenderer:
             left_pt = (p[0] + perp_prev[0] * half_width, p[1] + perp_prev[1] * half_width)
             right_pt = (p[0] - perp_prev[0] * half_width, p[1] - perp_prev[1] * half_width)
             return left_pt, right_pt
+
+        # Calculate max miter length based on miterlimit
+        max_miter_length = miterlimit * half_width
 
         if linejoin == "bevel" or linejoin == "round":
             # For bevel/round, use the outer points directly
@@ -1177,6 +1330,21 @@ class SVGRenderer:
                 left_pt = left_prev
             if right_pt is None:
                 right_pt = right_prev
+
+            # Apply miterlimit - if miter extends too far, fall back to bevel
+            if left_pt:
+                left_dist = math.sqrt((left_pt[0] - p[0])**2 + (left_pt[1] - p[1])**2)
+                if left_dist > max_miter_length:
+                    # Fall back to bevel-like point
+                    avg_perp = self._normalize((perp_prev[0] + perp_next[0], perp_prev[1] + perp_next[1]))
+                    left_pt = (p[0] + avg_perp[0] * half_width, p[1] + avg_perp[1] * half_width)
+
+            if right_pt:
+                right_dist = math.sqrt((right_pt[0] - p[0])**2 + (right_pt[1] - p[1])**2)
+                if right_dist > max_miter_length:
+                    # Fall back to bevel-like point
+                    avg_perp = self._normalize((perp_prev[0] + perp_next[0], perp_prev[1] + perp_next[1]))
+                    right_pt = (p[0] - avg_perp[0] * half_width, p[1] - avg_perp[1] * half_width)
 
             return left_pt, right_pt
 
@@ -1284,17 +1452,172 @@ class SVGRenderer:
         if fill_rule == "evenodd":
             self._fill_polygon_evenodd(ctx, points, fill)
         else:
-            # Use alpha compositing for proper transparency blending
-            if fill[3] < 255:
-                # Semi-transparent - need to composite properly
-                temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-                draw = ImageDraw.Draw(temp, "RGBA")
-                draw.polygon(points, fill=fill)
-                ctx.image.alpha_composite(temp)
+            # Check if polygon is self-intersecting (stars, complex shapes)
+            # PIL's polygon() uses even-odd rule, so we need scanline nonzero for self-intersecting
+            if self._is_self_intersecting(points):
+                self._fill_polygon_nonzero_color(ctx, points, fill)
             else:
-                # Fully opaque - can draw directly
-                draw = ImageDraw.Draw(ctx.image, "RGBA")
-                draw.polygon(points, fill=fill)
+                # Simple non-intersecting polygon - PIL's polygon works fine
+                if fill[3] < 255:
+                    temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+                    draw = ImageDraw.Draw(temp, "RGBA")
+                    draw.polygon(points, fill=fill)
+                    ctx.image.alpha_composite(temp)
+                else:
+                    draw = ImageDraw.Draw(ctx.image, "RGBA")
+                    draw.polygon(points, fill=fill)
+
+    def _is_self_intersecting(self, points: list[tuple[float, float]]) -> bool:
+        """Check if a polygon has self-intersecting edges (optimized)."""
+        n = len(points)
+        if n < 4:
+            return False
+
+        # For very complex polygons, assume they might be self-intersecting
+        # to avoid O(n²) complexity on thousands of edges
+        if n > 200:
+            return True  # Conservative: use scanline for complex shapes
+
+        # Close the polygon
+        pts = list(points)
+        if pts[0] != pts[-1]:
+            pts.append(pts[0])
+
+        n = len(pts) - 1
+
+        # Use numpy for faster computation
+        pts_arr = np.array(pts)
+
+        # Check only a sample of edge pairs for medium-sized polygons
+        max_checks = 5000
+        total_pairs = n * (n - 3) // 2  # Non-adjacent pairs
+
+        if total_pairs <= max_checks:
+            # Full check for smaller polygons
+            for i in range(n):
+                for j in range(i + 2, n):
+                    if i == 0 and j == n - 1:
+                        continue
+                    if self._segments_intersect(pts[i], pts[i + 1], pts[j], pts[j + 1]):
+                        return True
+        else:
+            # Sample-based check for medium polygons
+            import random
+            checked = 0
+            for i in range(n):
+                for j in range(i + 2, n):
+                    if i == 0 and j == n - 1:
+                        continue
+                    if self._segments_intersect(pts[i], pts[i + 1], pts[j], pts[j + 1]):
+                        return True
+                    checked += 1
+                    if checked >= max_checks:
+                        return False  # Assume OK if no intersection found in sample
+
+        return False
+
+    def _segments_intersect(self, A, B, C, D) -> bool:
+        """Check if line segment AB intersects with CD."""
+        def ccw(P, Q, R):
+            return (R[1] - P[1]) * (Q[0] - P[0]) > (Q[1] - P[1]) * (R[0] - P[0])
+        return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
+
+    def _fill_polygon_nonzero_color(self, ctx: "RenderContext",
+                                     points: list[tuple[float, float]],
+                                     fill: tuple[int, int, int, int]):
+        """Fill a polygon using nonzero winding rule with a color (vectorized)."""
+        if len(points) < 3:
+            return
+
+        width, height = ctx.image.size
+
+        # Get bounding box using numpy for speed
+        pts_arr = np.array(points)
+        min_x = max(0, int(pts_arr[:, 0].min()))
+        max_x = min(width - 1, int(pts_arr[:, 0].max()) + 1)
+        min_y = max(0, int(pts_arr[:, 1].min()))
+        max_y = min(height - 1, int(pts_arr[:, 1].max()) + 1)
+
+        if min_x >= max_x or min_y >= max_y:
+            return
+
+        crop_width = max_x - min_x
+        crop_height = max_y - min_y
+
+        # Create mask using nonzero winding rule
+        mask_arr = np.zeros((crop_height, crop_width), dtype=np.uint8)
+
+        # Close the polygon
+        pts = np.vstack([pts_arr, pts_arr[0:1]]) if not np.allclose(pts_arr[0], pts_arr[-1]) else pts_arr
+
+        # Build edge arrays for vectorized processing
+        p1 = pts[:-1]
+        p2 = pts[1:]
+
+        # Filter non-horizontal edges
+        non_horiz = p1[:, 1] != p2[:, 1]
+        if not np.any(non_horiz):
+            return
+
+        p1_f = p1[non_horiz]
+        p2_f = p2[non_horiz]
+
+        # Determine direction and sort so p1.y < p2.y
+        swap = p1_f[:, 1] > p2_f[:, 1]
+        p1_f[swap], p2_f[swap] = p2_f[swap].copy(), p1_f[swap].copy()
+        directions = np.where(swap, -1, 1)
+
+        # Extract edge data
+        x1 = p1_f[:, 0]
+        y1 = p1_f[:, 1]
+        x2 = p2_f[:, 0]
+        y2 = p2_f[:, 1]
+        dy = y2 - y1
+        dx = x2 - x1
+
+        # Vectorized scanline fill
+        for y in range(crop_height):
+            screen_y = y + min_y + 0.5
+
+            # Find edges that cross this scanline
+            active = (y1 <= screen_y) & (screen_y < y2)
+            if not np.any(active):
+                continue
+
+            # Compute x intersections for active edges
+            t = (screen_y - y1[active]) / dy[active]
+            x_intersects = x1[active] + t * dx[active]
+            dirs = directions[active]
+
+            # Sort by x
+            sort_idx = np.argsort(x_intersects)
+            x_sorted = x_intersects[sort_idx]
+            dirs_sorted = dirs[sort_idx]
+
+            # Fill using winding count (nonzero rule)
+            winding = 0
+            prev_x = None
+            for i in range(len(x_sorted)):
+                x_int = x_sorted[i]
+                direction = dirs_sorted[i]
+                if winding != 0 and prev_x is not None:
+                    x_start = max(0, int(prev_x - min_x))
+                    x_end = min(crop_width, int(x_int - min_x))
+                    if x_start < x_end:
+                        mask_arr[y, x_start:x_end] = 255
+                winding += direction
+                prev_x = x_int
+
+        # Apply fill using mask
+        mask_img = Image.fromarray(mask_arr, "L")
+        fill_img = Image.new("RGBA", (crop_width, crop_height), fill)
+
+        if fill[3] < 255:
+            temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+            temp.paste(fill_img, (min_x, min_y), mask_img)
+            ctx.image.alpha_composite(temp)
+        else:
+            ctx.image.paste(fill_img, (min_x, min_y), mask_img)
 
     def _fill_multi_polygon_evenodd(self, ctx: "RenderContext",
                                      polygons: list[list[tuple[float, float]]],
@@ -1387,6 +1710,122 @@ class SVGRenderer:
                     ctx, gradient, width, height, bbox, min_x, min_y, style.opacity
                 )
                 ctx.image.paste(grad_img, (min_x, min_y), mask_img)
+        elif fill:
+            # Solid fill
+            fill_img = Image.new("RGBA", (width, height), fill)
+            if fill[3] < 255:
+                temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+                temp.paste(fill_img, (min_x, min_y), mask_img)
+                ctx.image.alpha_composite(temp)
+            else:
+                ctx.image.paste(fill_img, (min_x, min_y), mask_img)
+
+    def _fill_multi_polygon_nonzero(self, ctx: "RenderContext",
+                                      polygons: list[list[tuple[float, float]]],
+                                      fill: Optional[tuple[int, int, int, int]],
+                                      fill_ref: Optional[str],
+                                      style: Style,
+                                      element_transform: Transform,
+                                      bbox: tuple[float, float, float, float]):
+        """Fill multiple polygons using nonzero winding rule (creates holes with opposite winding)."""
+        if not polygons:
+            return
+
+        # Collect all points and compute combined bounding box
+        all_xs = []
+        all_ys = []
+        for poly in polygons:
+            all_xs.extend(p[0] for p in poly)
+            all_ys.extend(p[1] for p in poly)
+
+        if not all_xs:
+            return
+
+        min_x, max_x = int(min(all_xs)), int(max(all_xs)) + 1
+        min_y, max_y = int(min(all_ys)), int(max(all_ys)) + 1
+
+        # Clip to image bounds
+        min_x = max(0, min_x)
+        min_y = max(0, min_y)
+        max_x = min(ctx.image.width, max_x)
+        max_y = min(ctx.image.height, max_y)
+
+        if min_x >= max_x or min_y >= max_y:
+            return
+
+        width = max_x - min_x
+        height = max_y - min_y
+
+        # Create mask using scanline algorithm with nonzero winding rule
+        mask = np.zeros((height, width), dtype=np.uint8)
+
+        # Build edge list with direction from all polygons
+        all_edges = []
+        for poly in polygons:
+            closed_points = list(poly)
+            if closed_points[0] != closed_points[-1]:
+                closed_points.append(closed_points[0])
+
+            n = len(closed_points) - 1
+            for i in range(n):
+                p1 = closed_points[i]
+                p2 = closed_points[i + 1]
+                if p1[1] != p2[1]:  # Skip horizontal edges
+                    # Determine direction: +1 if going up, -1 if going down
+                    if p1[1] > p2[1]:
+                        p1, p2 = p2, p1
+                        direction = -1
+                    else:
+                        direction = 1
+                    all_edges.append((p1[0], p1[1], p2[0], p2[1], direction))
+
+        # For each scanline
+        for y in range(height):
+            screen_y = y + min_y + 0.5  # Center of pixel
+
+            # Find intersections with direction
+            intersections = []
+            for x1, y1, x2, y2, direction in all_edges:
+                if y1 <= screen_y < y2:
+                    t = (screen_y - y1) / (y2 - y1)
+                    x_intersect = x1 + t * (x2 - x1)
+                    intersections.append((x_intersect, direction))
+
+            # Sort by x
+            intersections.sort(key=lambda p: p[0])
+
+            # Fill using winding count (nonzero rule)
+            winding = 0
+            prev_x = None
+            for x_int, direction in intersections:
+                if winding != 0 and prev_x is not None:
+                    x_start = max(0, int(prev_x - min_x))
+                    x_end = min(width, int(x_int - min_x))
+                    if x_start < x_end:
+                        mask[y, x_start:x_end] = 255
+                winding += direction
+                prev_x = x_int
+
+        # Apply fill using mask
+        mask_img = Image.fromarray(mask, "L")
+
+        if fill_ref and fill_ref.startswith("url("):
+            # Gradient fill
+            match = fill_ref[4:-1]
+            if match.startswith("#"):
+                match = match[1:]
+            if match in ctx.gradients:
+                gradient = ctx.gradients[match]
+                grad_img = self._create_gradient_for_mask(
+                    ctx, gradient, width, height, bbox, min_x, min_y, style.opacity
+                )
+                # Use proper alpha compositing for gradients
+                temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+                grad_r, grad_g, grad_b, grad_a = grad_img.split()
+                masked_alpha = ImageChops.multiply(grad_a, mask_img)
+                grad_masked = Image.merge("RGBA", (grad_r, grad_g, grad_b, masked_alpha))
+                temp.paste(grad_masked, (min_x, min_y))
+                ctx.image.alpha_composite(temp)
         elif fill:
             # Solid fill
             fill_img = Image.new("RGBA", (width, height), fill)
@@ -1537,8 +1976,15 @@ class SVGRenderer:
             mask_draw.polygon(points, fill=255)
             mask_crop = mask.crop((min_x, min_y, max_x, max_y))
 
-        # Apply gradient with mask
-        ctx.image.paste(grad_img, (min_x, min_y), mask_crop)
+        # Apply gradient with mask using proper alpha compositing
+        # Create temp image for compositing
+        temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+        # Apply mask to gradient's alpha channel
+        grad_r, grad_g, grad_b, grad_a = grad_img.split()
+        masked_alpha = ImageChops.multiply(grad_a, mask_crop)
+        grad_masked = Image.merge("RGBA", (grad_r, grad_g, grad_b, masked_alpha))
+        temp.paste(grad_masked, (min_x, min_y))
+        ctx.image.alpha_composite(temp)
 
     def _create_evenodd_mask(self, points: list[tuple[float, float]],
                              min_x: int, min_y: int, width: int, height: int) -> Image.Image:
@@ -1582,27 +2028,29 @@ class SVGRenderer:
                                       bbox: tuple[float, float, float, float],
                                       offset_x: int, offset_y: int,
                                       opacity: float) -> Image.Image:
-        """Create an image filled with a linear gradient."""
-        img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-
+        """Create an image filled with a linear gradient (vectorized)."""
         if not gradient.stops:
-            return img
+            return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
-        # Get gradient vector
+        # Get gradient vector in gradient space
         if gradient.units == "objectBoundingBox":
             bx, by, bw, bh = bbox
-            # For objectBoundingBox, use the transformed bbox
             x1 = bx + gradient.x1 * bw
             y1 = by + gradient.y1 * bh
             x2 = bx + gradient.x2 * bw
             y2 = by + gradient.y2 * bh
-            # Apply base transform to get screen coords
-            x1, y1 = ctx.base_transform.apply(x1, y1)
-            x2, y2 = ctx.base_transform.apply(x2, y2)
         else:
-            # For userSpaceOnUse, coordinates are in SVG space, transform them
-            x1, y1 = ctx.base_transform.apply(gradient.x1, gradient.y1)
-            x2, y2 = ctx.base_transform.apply(gradient.x2, gradient.y2)
+            x1, y1 = gradient.x1, gradient.y1
+            x2, y2 = gradient.x2, gradient.y2
+
+        # Apply gradient transform if present
+        if gradient.transform:
+            x1, y1 = gradient.transform.apply(x1, y1)
+            x2, y2 = gradient.transform.apply(x2, y2)
+
+        # Apply base transform to get screen coords
+        x1, y1 = ctx.base_transform.apply(x1, y1)
+        x2, y2 = ctx.base_transform.apply(x2, y2)
 
         # Direction vector
         dx = x2 - x1
@@ -1610,29 +2058,22 @@ class SVGRenderer:
         length = math.sqrt(dx * dx + dy * dy)
 
         if length == 0:
-            return img
+            return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
         dx /= length
         dy /= length
 
-        # Create gradient
-        pixels = np.zeros((height, width, 4), dtype=np.uint8)
+        # Vectorized: create coordinate grids
+        y_coords, x_coords = np.mgrid[0:height, 0:width]
+        wx = x_coords + offset_x
+        wy = y_coords + offset_y
 
-        for y in range(height):
-            for x in range(width):
-                # Screen coordinates
-                wx = x + offset_x
-                wy = y + offset_y
+        # Project onto gradient line
+        t = ((wx - x1) * dx + (wy - y1) * dy) / length
+        t = np.clip(t, 0, 1)
 
-                # Project onto gradient line
-                t = ((wx - x1) * dx + (wy - y1) * dy) / length
-                t = max(0, min(1, t))
-
-                # Get color at t
-                color = self._interpolate_gradient_color(gradient.stops, t)
-                pixels[y, x] = [color[0], color[1], color[2],
-                                int(color[3] * opacity)]
-
+        # Vectorized color interpolation
+        pixels = self._interpolate_gradient_colors_vectorized(gradient.stops, t, opacity)
         return Image.fromarray(pixels, "RGBA")
 
     def _create_radial_gradient_image(self, ctx: "RenderContext",
@@ -1641,55 +2082,115 @@ class SVGRenderer:
                                       bbox: tuple[float, float, float, float],
                                       offset_x: int, offset_y: int,
                                       opacity: float) -> Image.Image:
-        """Create an image filled with a radial gradient."""
-        img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-
+        """Create an image filled with a radial gradient (vectorized)."""
         if not gradient.stops:
-            return img
+            return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
-        # Get gradient parameters and transform to screen coords
+        # Get gradient parameters in gradient space
         if gradient.units == "objectBoundingBox":
             bx, by, bw, bh = bbox
             cx = bx + gradient.cx * bw
             cy = by + gradient.cy * bh
             r = gradient.r * max(bw, bh)
-            fx = bx + (gradient.fx if gradient.fx is not None else gradient.cx) * bw
-            fy = by + (gradient.fy if gradient.fy is not None else gradient.cy) * bh
-            # Transform to screen coords
-            cx, cy = ctx.base_transform.apply(cx, cy)
-            fx, fy = ctx.base_transform.apply(fx, fy)
-            # Scale radius
-            scale = self._get_scale(ctx, Transform.identity())
-            r = r * scale
         else:
-            # For userSpaceOnUse, transform coordinates
-            cx, cy = ctx.base_transform.apply(gradient.cx, gradient.cy)
-            r = gradient.r * self._get_scale(ctx, Transform.identity())
-            fx = gradient.fx if gradient.fx is not None else gradient.cx
-            fy = gradient.fy if gradient.fy is not None else gradient.cy
-            fx, fy = ctx.base_transform.apply(fx, fy)
+            cx, cy = gradient.cx, gradient.cy
+            r = gradient.r
 
         if r == 0:
-            return img
+            return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
-        # Create gradient
+        # Build combined transform and compute inverse
+        combined_transform = ctx.base_transform
+        if gradient.transform:
+            combined_transform = ctx.base_transform.multiply(gradient.transform)
+
+        det = combined_transform.a * combined_transform.d - combined_transform.b * combined_transform.c
+        if abs(det) < 1e-10:
+            det = 1e-10
+
+        inv_a = combined_transform.d / det
+        inv_b = -combined_transform.c / det  # Fixed: was .b, should be .c
+        inv_c = -combined_transform.b / det  # Fixed: was .c, should be .b
+        inv_d = combined_transform.a / det
+        inv_e = (combined_transform.c * combined_transform.f - combined_transform.d * combined_transform.e) / det  # Fixed
+        inv_f = (combined_transform.b * combined_transform.e - combined_transform.a * combined_transform.f) / det  # Fixed
+
+        # Vectorized: create coordinate grids
+        y_coords, x_coords = np.mgrid[0:height, 0:width]
+        wx = x_coords + offset_x
+        wy = y_coords + offset_y
+
+        # Inverse transform to gradient space
+        gx = inv_a * wx + inv_b * wy + inv_e
+        gy = inv_c * wx + inv_d * wy + inv_f
+
+        # Distance from center, normalized to 0-1
+        t = np.sqrt((gx - cx) ** 2 + (gy - cy) ** 2) / r
+        t = np.clip(t, 0, 1)
+
+        # Vectorized color interpolation
+        pixels = self._interpolate_gradient_colors_vectorized(gradient.stops, t, opacity)
+        return Image.fromarray(pixels, "RGBA")
+
+    def _interpolate_gradient_colors_vectorized(self, stops: list[GradientStop],
+                                                  t: np.ndarray, opacity: float) -> np.ndarray:
+        """Vectorized color interpolation for entire gradient image."""
+        height, width = t.shape
         pixels = np.zeros((height, width, 4), dtype=np.uint8)
 
-        for y in range(height):
-            for x in range(width):
-                wx = x + offset_x
-                wy = y + offset_y
+        if not stops:
+            return pixels
 
-                # Distance from center
-                d = math.sqrt((wx - cx) ** 2 + (wy - cy) ** 2)
-                t = d / r
-                t = max(0, min(1, t))
+        # Build arrays of stop offsets and colors
+        offsets = np.array([s.offset for s in stops])
+        colors = np.array([s.color for s in stops], dtype=np.float32)
 
-                color = self._interpolate_gradient_color(gradient.stops, t)
-                pixels[y, x] = [color[0], color[1], color[2],
-                                int(color[3] * opacity)]
+        # For each pair of adjacent stops, fill in the pixels
+        for i in range(len(stops) - 1):
+            s1_offset, s2_offset = offsets[i], offsets[i + 1]
+            s1_color, s2_color = colors[i], colors[i + 1]
 
-        return Image.fromarray(pixels, "RGBA")
+            # Mask for pixels in this range
+            if i == 0:
+                mask = t <= s2_offset
+            elif i == len(stops) - 2:
+                mask = t > s1_offset
+            else:
+                mask = (t > s1_offset) & (t <= s2_offset)
+
+            if not np.any(mask):
+                continue
+
+            # Compute interpolation ratio
+            denom = s2_offset - s1_offset
+            if denom < 1e-10:
+                ratio = np.zeros_like(t)
+            else:
+                ratio = np.clip((t - s1_offset) / denom, 0, 1)
+
+            # Interpolate colors for masked pixels
+            for c in range(4):
+                interp = s1_color[c] + ratio * (s2_color[c] - s1_color[c])
+                if c == 3:  # Alpha channel
+                    pixels[:, :, c] = np.where(mask, (interp * opacity).astype(np.uint8), pixels[:, :, c])
+                else:
+                    pixels[:, :, c] = np.where(mask, interp.astype(np.uint8), pixels[:, :, c])
+
+        # Handle pixels before first stop
+        before_mask = t <= offsets[0]
+        if np.any(before_mask):
+            for c in range(4):
+                val = colors[0][c] if c < 3 else colors[0][c] * opacity
+                pixels[:, :, c] = np.where(before_mask, int(val), pixels[:, :, c])
+
+        # Handle pixels after last stop
+        after_mask = t >= offsets[-1]
+        if np.any(after_mask):
+            for c in range(4):
+                val = colors[-1][c] if c < 3 else colors[-1][c] * opacity
+                pixels[:, :, c] = np.where(after_mask, int(val), pixels[:, :, c])
+
+        return pixels
 
     def _interpolate_gradient_color(self, stops: list[GradientStop],
                                     t: float) -> tuple[int, int, int, int]:

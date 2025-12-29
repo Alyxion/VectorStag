@@ -127,9 +127,11 @@ class Style:
     stroke_linecap: str = "butt"  # butt, round, square
     stroke_linejoin: str = "miter"  # miter, round, bevel
     stroke_miterlimit: float = 4.0
+    stroke_dasharray: Optional[list[float]] = None  # Dash pattern [dash, gap, dash, gap, ...]
     opacity: float = 1.0
     fill_rule: str = "nonzero"  # nonzero, evenodd
     filter_id: Optional[str] = None  # Filter reference
+    display: str = "inline"  # none, inline, block, etc.
 
 
 @dataclass
@@ -818,6 +820,8 @@ class SVGParser:
             result = self._parse_path(elem, style, transform)
         elif tag == "g":
             result = self._parse_group(elem, style, transform, parent_style, text_anchor, font_family, font_size)
+        elif tag == "switch":
+            result = self._parse_switch(elem, style, transform, parent_style, text_anchor, font_family, font_size)
         elif tag == "text":
             result = self._parse_text(elem, style, transform, text_anchor, font_family, font_size)
         elif tag == "use":
@@ -861,7 +865,8 @@ class SVGParser:
             stroke_linejoin=parent_style.stroke_linejoin,
             stroke_miterlimit=parent_style.stroke_miterlimit,
             opacity=parent_style.opacity,
-            fill_rule=parent_style.fill_rule
+            fill_rule=parent_style.fill_rule,
+            display=parent_style.display
         )
 
         # First apply CSS classes (lowest priority)
@@ -879,7 +884,7 @@ class SVGParser:
         # Merge with direct attributes (highest priority)
         for attr in ["fill", "stroke", "stroke-width", "fill-opacity",
                      "stroke-opacity", "opacity", "fill-rule",
-                     "stroke-linecap", "stroke-linejoin", "stroke-miterlimit", "filter"]:
+                     "stroke-linecap", "stroke-linejoin", "stroke-miterlimit", "stroke-dasharray", "filter", "display"]:
             val = elem.get(attr)
             if val:
                 style_dict[attr] = val
@@ -931,6 +936,22 @@ class SVGParser:
 
         if "stroke-miterlimit" in style_dict:
             style.stroke_miterlimit = float(style_dict["stroke-miterlimit"])
+
+        if "stroke-dasharray" in style_dict:
+            dasharray_str = style_dict["stroke-dasharray"].strip()
+            if dasharray_str and dasharray_str.lower() != "none":
+                # Parse comma or space separated values
+                parts = dasharray_str.replace(",", " ").split()
+                try:
+                    style.stroke_dasharray = [float(p) for p in parts if p]
+                except ValueError:
+                    pass
+
+        if "display" in style_dict:
+            # Only allow display override if parent is NOT display:none
+            # CSS spec: children of display:none elements are never rendered
+            if parent_style.display != "none":
+                style.display = style_dict["display"]
 
         # Parse filter reference
         if "filter" in style_dict:
@@ -1175,6 +1196,30 @@ class SVGParser:
             children=self._parse_children(elem, transform, style, text_anchor, font_family, font_size)
         )
         return group
+
+    def _parse_switch(self, elem: ET.Element, style: Style, transform: Transform,
+                      parent_style: Style, text_anchor: str = "start",
+                      font_family: str = "Arial", font_size: float = 16) -> Optional[SVGElement]:
+        """Parse switch element - returns first supported child."""
+        # The switch element evaluates children in order and renders the first
+        # one whose requiredExtensions/requiredFeatures are supported.
+        # Since we don't support any extensions, skip children with requiredExtensions.
+        for child in elem:
+            tag = self._strip_ns(child.tag)
+            # Skip non-element nodes
+            if tag is None:
+                continue
+            # Skip foreignObject and elements with requiredExtensions we don't support
+            if tag == "foreignObject":
+                continue
+            if child.get("requiredExtensions"):
+                # We don't support any extensions
+                continue
+            # This child is supported - parse and return it
+            result = self._parse_element(child, transform, style, text_anchor, font_family, font_size)
+            if result:
+                return result
+        return None
 
     def _parse_text(self, elem: ET.Element, style: Style, transform: Transform,
                     parent_text_anchor: str = "start", parent_font_family: str = "Arial",

@@ -1,25 +1,50 @@
 # VectorStag - Pure Python SVG Renderer
 
 ## Project Goal
-Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG.
+Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG and resvg.
 
-## Current Status: 99.4% TRUE Accuracy
+## Current Status: 99.9% Emoji / 99.8% Flag Accuracy
 
-**Note**: CairoSVG has rendering bugs. True accuracy excludes files where CairoSVG is wrong.
-**Verification**: Used resvg-python (Rust-based renderer) to confirm our correctness.
+**Date**: 2025-12-29
 
-### Test Results (30 SVG samples from W3C)
-**Source**: https://dev.w3.org/SVG/tools/svgweb/samples/svg-files/
+### Emoji Test Results (3427 Noto emojis)
+- **Average Accuracy**: 99.9%
+- **99%+ Accuracy**: 99.8% (3421 files)
+- **95-99%**: 0.2% (6 files)
+- **<80%**: 0.0% (0 files)
+- **Throughput**: ~82 files/sec
 
-**Comparison vs CairoSVG**: 98.9% average
-**TRUE Accuracy** (excl. CairoSVG bugs): **99.4%**
+### Flag Test Results (358 Noto flags)
+- **Average Accuracy**: 99.8%
+- **99%+ Accuracy**: 97.8% (350 files)
+- **95-99%**: 1.7% (6 files)
+- **90-95%**: 0.6% (2 files)
+- **<80%**: 0.0% (0 files)
 
-- **21 at 99%+**: android, atom, check, circles1, compass, copyleft, feed, gaussian1-3, heart, helloworld, italian-flag, lineargradient3-4, radialgradient1-2, rectangles, star, tiger, yinyang
-- **4 at 96-99%**: python (98.6%), shapes-polygon/polyline (98.3%), paths-data-08/09-t (97%)
-- **3 CairoSVG bugs** (verified CORRECT with resvg, Chrome, Firefox):
-  - clippath (97.7%) - CairoSVG renders intersection as black instead of red
-  - lineargradient1/2 (93%) - CairoSVG fills gaps that don't exist in SVG
-- **1 Error**: smile.svg (XML entity parsing issue)
+### W3C SVG Samples (30 files)
+- **True Accuracy**: 99.4% (excluding CairoSVG bugs)
+- **Raw Comparison**: 98.9%
+
+---
+
+## Recent Optimizations & Fixes
+
+### Performance (2025-12-29)
+1. **Vectorized gradient rendering** - 5.7x faster using numpy
+2. **Optimized self-intersection check** - Skip for >200 points, limit to 5000 pairs
+3. **Vectorized scanline fill** - Numpy-based edge processing
+4. **Multiprocessing** - 16-worker parallel testing
+
+### Bug Fixes (2025-12-29)
+1. **Gradient alpha compositing** - Fixed `paste` → `alpha_composite` for proper transparency
+2. **Nonzero winding rule** - Fixed multi-polygon fills to create proper holes
+3. **display:none support** - Added CSS display property parsing and rendering skip
+4. **GradientTransform** - Now properly applied in renderer
+5. **Radial gradient inverse transform** - Fixed matrix inversion formula for transformed radial gradients
+6. **Stroke gradient support** - Added gradient fills for strokes (clown mouth, etc.)
+7. **Stroke miterlimit** - Apply miterlimit to prevent infinitely long miters
+8. **stroke-dasharray** - Added dashed/dotted stroke support
+9. **Switch element** - Added `<switch>` element support for fallback rendering
 
 ---
 
@@ -54,161 +79,110 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - [x] skewY(angle)
 - [x] matrix(a, b, c, d, e, f)
 - [x] Transform inheritance through groups
+- [x] gradientTransform support
 
 ### Styles
 - [x] fill (color, none, url() gradient reference)
-- [x] stroke (color, none)
+- [x] stroke (color, none, url() gradient reference)
 - [x] stroke-width
 - [x] stroke-linecap (butt, round, square)
 - [x] stroke-linejoin (miter, round, bevel)
+- [x] stroke-miterlimit
+- [x] stroke-dasharray
 - [x] fill-opacity
 - [x] stroke-opacity
 - [x] opacity
 - [x] fill-rule (nonzero, evenodd)
+- [x] display (none, inline, block)
 - [x] Style inheritance from parent groups
 
 ### Rendering
-- [x] Anti-aliasing (2x supersampling by default)
-- [x] Automatic bounding box computation for SVGs without dimensions
-- [x] ClipPath support (basic shapes: rect, circle, ellipse, polygon, path)
-- [x] Proper alpha compositing for semi-transparent fills and strokes
-- [x] Gap-free stroke rendering for curves (mask-based polygon fill for closed paths)
+- [x] Anti-aliasing (configurable supersampling, default 4x)
+- [x] Automatic bounding box computation
+- [x] ClipPath support
+- [x] Proper alpha compositing
+- [x] Nonzero winding rule with holes
+- [x] Evenodd fill rule
 
 ### Text
 - [x] Basic `<text>` rendering
 - [x] x, y positioning
 - [x] font-size
-- [x] font-family mapping (serif, sans-serif, monospace with DejaVu fallbacks)
+- [x] font-family mapping
 
 ### Gradients
 - [x] `<linearGradient>` with stops
 - [x] `<radialGradient>` with stops
 - [x] gradientUnits: objectBoundingBox
 - [x] gradientUnits: userSpaceOnUse
-- [x] Gradient href inheritance (xlink:href)
+- [x] gradientTransform
+- [x] Gradient href inheritance
 - [x] stop-color, stop-opacity
+- [x] Vectorized rendering (numpy)
 
 ### Document
 - [x] width/height attributes
 - [x] viewBox with proper scaling
-- [x] Namespace handling (svg, xlink)
-- [x] Root element style inheritance (stroke-width, etc.)
+- [x] preserveAspectRatio
+- [x] Namespace handling
+- [x] CSS class parsing
 
 ### Use Element
-- [x] Basic `<use>` element support (xlink:href references)
-- [x] x, y positioning on use elements
+- [x] `<use>` element support
+- [x] x, y positioning
 
----
-
-## Missing Features (Priority Order)
-
-### High Priority - Would Improve Accuracy
-
-1. ~~**Anti-aliasing**~~ ✅ DONE
-   - Implemented via 2x supersampling with Lanczos downscaling
-
-2. ~~**Fill Rule Implementation**~~ ✅ DONE
-   - Implemented scanline-based evenodd fill rule
-
-3. ~~**Stroke Properties**~~ ✅ DONE (partial)
-   - [x] stroke-linecap (butt, round, square)
-   - [x] stroke-linejoin (miter, round, bevel)
-   - [ ] stroke-dasharray, stroke-dashoffset (still missing)
-
-4. ~~**Unit Handling**~~ ✅ DONE
-   - Fixed by computing bounding box from content when dimensions missing
-
-### Medium Priority - Extended SVG Support
-
-5. ~~**Clipping Paths**~~ ✅ DONE
-   - Implemented basic clip path support for rect, circle, ellipse, polygon, path shapes
-
-6. **Masks**
-   - Current: Not implemented
-   - Needed: `<mask>` element support
-
-7. **Filters**
-   - Current: Filter elements ignored (gaussian blur works by accident)
-   - Needed: `<filter>`, `<feGaussianBlur>`, etc.
-
-8. **Use/Symbol**
-   - Current: `<use>` and `<symbol>` not implemented
-   - Needed: Reference and instantiate defined elements
-
-9. **Markers**
-   - Current: Not implemented
-   - Needed: `<marker>` for arrowheads, etc.
-
-### Low Priority - Edge Cases
-
-10. **Text Advanced**
-    - Missing: `<tspan>`, text-anchor, dominant-baseline
-    - Missing: textPath, text on path
-    - Missing: Font styling (bold, italic, weight)
-
-11. **CSS Parsing**
-    - Current: Inline style only
-    - Missing: `<style>` block CSS rules
-    - Missing: CSS selectors, classes
-
-12. **Image Element**
-    - Current: `<image>` not implemented
-    - Needed: Embed raster images
-
-13. **Pattern Fills**
-    - Current: Not implemented
-    - Needed: `<pattern>` element
+### Switch Element
+- [x] `<switch>` element support
+- [x] requiredExtensions fallback
 
 ---
 
 ## Known Issues
 
-### ~~circles1.svg (48% similarity)~~ ✅ FIXED (98.4%)
-- **Cause**: SVG has no width/height, uses cm units
-- **Fix**: Compute bounding box from content when dimensions missing
+### Previously Fixed Issues
+- **AS.svg**: Added `<switch>` element support - now renders correctly
+- **BR.svg**: Was CairoSVG bug with negative viewBox - our rendering was correct
+- **TW.svg**: Fixed with proper resvg reference generation (aspect ratio preserved)
 
-### ~~tiger.svg (49.8% similarity)~~ ✅ FIXED (98.9%)
-- **Cause**: Complex paths, thin strokes, anti-aliasing differences
-- **Fix**: Implemented anti-aliasing and proper stroke rendering
-
-### smile.svg (Error)
-- **Cause**: XML entity `&Smile;` not defined
-- **Fix**: Add XML entity handling or skip malformed files
-
----
-
-## Architecture
-
-```
-vectorstag/
-├── __init__.py          # Public API exports
-├── parser.py            # SVG DOM parsing
-│   ├── SVGParser        # Main parser class
-│   ├── Transform        # 2D affine transform
-│   ├── Style            # Style attributes
-│   ├── *Element         # Element dataclasses
-│   └── *Gradient        # Gradient definitions
-├── path_parser.py       # Path 'd' attribute parsing
-│   ├── parse_path()     # Convert d string to commands
-│   └── arc_to_bezier()  # Arc approximation
-└── renderer.py          # Pillow rendering
-    ├── SVGRenderer      # Main renderer class
-    ├── RenderContext    # Rendering state
-    └── _render_*()      # Element-specific renderers
-```
+### CairoSVG Bugs (verified with resvg)
+- clippath.svg: CairoSVG renders intersection wrong
+- lineargradient1/2.svg: CairoSVG fills gaps that don't exist
+- Gaussian blur: CairoSVG doesn't apply properly
+- Negative viewBox: CairoSVG stretches content incorrectly
 
 ---
 
-## Next Steps
+## Missing Features
 
-1. ~~**Implement anti-aliasing**~~ ✅ DONE - Biggest visual improvement
-2. ~~**Fix stroke rendering**~~ ✅ DONE - linecap, linejoin
-3. ~~**Implement fill-rule**~~ ✅ DONE - evenodd support
-4. **Add stroke-dasharray/dashoffset** - Dashed lines support
-5. **Add more test coverage** - Unit tests for parser/renderer
-6. **Performance optimization** - Gradient rendering is slow (per-pixel loop)
-7. **Implement clipping paths** - `<clipPath>` support
-8. **Handle XML entities** - Fix smile.svg error
+### Medium Priority
+- [ ] stroke-dashoffset
+- [ ] `<mask>` element
+- [ ] `<filter>` elements (feGaussianBlur, etc.)
+- [ ] `<marker>` for arrowheads
+
+### Low Priority
+- [ ] `<tspan>`, text-anchor, dominant-baseline
+- [ ] `<style>` block CSS rules
+- [ ] `<image>` element
+- [ ] `<pattern>` fills
+
+---
+
+## Scripts
+
+```bash
+# Pre-render references (run once)
+python prerender_references.py --emojis --flags
+
+# Fast comparison against pre-rendered references
+python compare_fast.py --emojis --flags -j 16
+
+# Benchmark VectorStag performance
+python benchmark_vectorstag.py --emojis --profile
+
+# Generate comparison images
+python compare_all.py --emojis --flags --limit 100
+```
 
 ---
 
@@ -222,21 +196,30 @@ renderer = SVGRenderer()
 image = renderer.render_file("input.svg")
 image.save("output.png")
 
-# With scaling
+# With scaling and antialiasing
+renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
 image = renderer.render_file("input.svg", width=800, height=600)
 
 # From string
-svg_content = '<svg>...</svg>'
 image = renderer.render(svg_content)
-
-# Custom background
-renderer = SVGRenderer(background=(0, 0, 0, 0))  # Transparent
 ```
 
-## Comparison Script
+---
 
-```bash
-poetry run python compare_render.py
+## Architecture
+
 ```
-
-Outputs comparison images to `samples/comparison/`.
+vectorstag/
+├── __init__.py          # Public API exports
+├── parser.py            # SVG DOM parsing
+│   ├── SVGParser        # Main parser class
+│   ├── Transform        # 2D affine transform
+│   ├── Style            # Style attributes (incl. display)
+│   └── *Element         # Element dataclasses
+├── path_parser.py       # Path 'd' attribute parsing
+└── renderer.py          # Pillow rendering
+    ├── SVGRenderer      # Main renderer class
+    ├── _fill_multi_polygon_nonzero()  # Winding rule with holes
+    ├── _create_*_gradient_image()     # Vectorized gradients
+    └── _render_*()      # Element-specific renderers
+```
