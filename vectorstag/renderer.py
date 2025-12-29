@@ -18,7 +18,7 @@ class SVGRenderer:
     """Render SVG documents to PIL Images."""
 
     def __init__(self, scale: float = 1.0, background: Optional[tuple[int, int, int, int]] = None,
-                 antialias: int = 2, preserve_aspect_ratio: bool = True):
+                 antialias: int = 2, preserve_aspect_ratio: bool = False):
         """
         Initialize renderer.
 
@@ -26,7 +26,8 @@ class SVGRenderer:
             scale: Scale factor for rendering
             background: Background color (RGBA). Default is white.
             antialias: Anti-aliasing factor (1=none, 2=2x supersampling, 4=4x). Default is 2.
-            preserve_aspect_ratio: If True (default), preserve aspect ratio. If False, stretch to fill.
+            preserve_aspect_ratio: If False (default), match CairoSVG behavior (stretch if viewBox).
+                                   If True, always preserve aspect ratio.
         """
         self.scale = scale
         self.background = background or (255, 255, 255, 255)
@@ -82,21 +83,25 @@ class SVGRenderer:
         scale_x = render_width / src_w if src_w else 1
         scale_y = render_height / src_h if src_h else 1
 
-        if self.preserve_aspect_ratio:
-            # Uniform scaling (preserves aspect ratio)
+        # Determine whether to stretch or preserve aspect ratio
+        # Only stretch if preserveAspectRatio="none"
+        should_stretch = (doc.preserve_aspect_ratio == "none")
+
+        if should_stretch:
+            # Non-uniform scaling (stretch to fill)
+            offset_x = -src_x * scale_x
+            offset_y = -src_y * scale_y
+            transform = Transform.translate(offset_x, offset_y).multiply(
+                Transform.scale(scale_x, scale_y)
+            )
+        else:
+            # Uniform scaling (preserve aspect ratio)
             scale = min(scale_x, scale_y)
             # Center the content
             offset_x = (render_width - src_w * scale) / 2 - src_x * scale
             offset_y = (render_height - src_h * scale) / 2 - src_y * scale
             transform = Transform.translate(offset_x, offset_y).multiply(
                 Transform.scale(scale)
-            )
-        else:
-            # Non-uniform scaling (stretch to fill)
-            offset_x = -src_x * scale_x
-            offset_y = -src_y * scale_y
-            transform = Transform.translate(offset_x, offset_y).multiply(
-                Transform.scale(scale_x, scale_y)
             )
 
         # Create render context

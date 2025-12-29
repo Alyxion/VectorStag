@@ -16,10 +16,13 @@ The SVG has a **real gap** (~3 units) between adjacent rectangles.
 Our rendering is **CORRECT** (verified: Chrome, Firefox, resvg).
 CairoSVG incorrectly fills this gap.
 
-### Known CairoSVG Bugs
+### Known CairoSVG Bugs/Quirks
 - CairoSVG clippath intersection rendering is buggy (renders black instead of red)
 - CairoSVG fills gaps between adjacent elements that don't exist in SVG
 - CairoSVG doesn't properly apply Gaussian blur filters
+- CairoSVG stretches content when viewBox has NEGATIVE origin coordinates (e.g., BR.svg)
+  - With positive viewBox origin: preserves aspect ratio
+  - With negative viewBox origin: stretches to fill output dimensions
 
 ## Completed Fixes
 - **paths-data-08/09-t**: Fixed evenodd multi-polygon fill (87% → 97%)

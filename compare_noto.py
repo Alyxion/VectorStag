@@ -54,7 +54,7 @@ def compute_similarity(img1: Image.Image, img2: Image.Image) -> float:
 
 def test_directory(svg_dir: Path, limit: int = None, save_failures: bool = True):
     """Test all SVGs in a directory."""
-    svg_files = sorted(svg_dir.glob("**/*.svg"))
+    svg_files = sorted(svg_dir.glob("*.svg"))  # Only direct children, not subdirs
     if limit:
         svg_files = svg_files[:limit]
 
@@ -154,13 +154,13 @@ def main():
         print("\n" + "=" * 60)
         print("TESTING FLAGS")
         print("=" * 60)
-        test_directory(base_dir / "flags", limit=args.limit)
+        test_directory(base_dir / "flags" / "svg", limit=args.limit)
 
     if args.emojis or args.all:
         print("\n" + "=" * 60)
         print("TESTING EMOJIS")
         print("=" * 60)
-        test_directory(base_dir / "emojis", limit=args.limit)
+        test_directory(base_dir / "emojis" / "svg", limit=args.limit)
 
     if not (args.flags or args.emojis or args.all):
         print("Usage: python compare_noto.py [--flags] [--emojis] [--all] [--limit N]")

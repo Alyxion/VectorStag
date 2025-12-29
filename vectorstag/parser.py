@@ -240,6 +240,7 @@ class SVGDocument:
     gradients: dict[str, Union[LinearGradient, RadialGradient]] = field(default_factory=dict)
     clip_paths: dict[str, ClipPath] = field(default_factory=dict)
     filters: dict[str, GaussianBlurFilter] = field(default_factory=dict)
+    preserve_aspect_ratio: str = "xMidYMid"  # SVG default
 
 
 class SVGParser:
@@ -436,6 +437,11 @@ class SVGParser:
             self.viewbox_width = width
             self.viewbox_height = height
 
+        # Parse preserveAspectRatio attribute
+        preserve_aspect_ratio = root.get("preserveAspectRatio", "xMidYMid")
+        # Strip optional "meet" or "slice" suffix
+        preserve_aspect_ratio = preserve_aspect_ratio.split()[0] if preserve_aspect_ratio else "xMidYMid"
+
         # Reset state
         self.gradients = {}
         self.clip_paths = {}
@@ -486,7 +492,8 @@ class SVGParser:
             elements=elements,
             gradients=self.gradients,
             clip_paths=self.clip_paths,
-            filters=self.filters
+            filters=self.filters,
+            preserve_aspect_ratio=preserve_aspect_ratio
         )
 
     def parse_file(self, filepath: str) -> SVGDocument:
