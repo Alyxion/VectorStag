@@ -95,6 +95,7 @@ class LinearGradient:
     units: str = "objectBoundingBox"
     transform: Optional[Transform] = None
     href: Optional[str] = None  # Reference to another gradient
+    spread_method: str = "pad"  # pad, reflect, repeat
 
 
 @dataclass
@@ -110,6 +111,7 @@ class RadialGradient:
     units: str = "objectBoundingBox"
     transform: Optional[Transform] = None
     href: Optional[str] = None
+    spread_method: str = "pad"  # pad, reflect, repeat
 
 
 # Sentinel value to distinguish "fill not set" from "fill=none"
@@ -230,6 +232,12 @@ class GaussianBlurFilter:
     """Gaussian blur filter definition."""
     id: str
     std_deviation: float = 2.0
+    # Filter region (in objectBoundingBox units by default: 0-1 range)
+    x: float = -0.1  # Default: -10% of element bbox
+    y: float = -0.1
+    width: float = 1.2  # Default: 120% of element bbox
+    height: float = 1.2
+    filter_units: str = "objectBoundingBox"  # or "userSpaceOnUse"
 
 
 @dataclass
@@ -415,11 +423,7 @@ class SVGParser:
         # Parse XML
         root = ET.fromstring(svg_content)
 
-        # Get dimensions
-        width = self._parse_length(root.get("width", str(self.default_width)))
-        height = self._parse_length(root.get("height", str(self.default_height)))
-
-        # Parse viewBox
+        # Parse viewBox first (needed for percentage dimensions)
         viewBox = None
         viewbox_str = root.get("viewBox")
         if viewbox_str:
@@ -429,13 +433,30 @@ class SVGParser:
                 # Store viewBox dimensions for percentage resolution
                 self.viewbox_width = viewBox[2]
                 self.viewbox_height = viewBox[3]
-                # If width/height not specified, use viewBox dimensions
-                if not root.get("width"):
-                    width = viewBox[2]
-                if not root.get("height"):
-                    height = viewBox[3]
+
+        # Get dimensions - use viewBox for percentage reference
+        width_str = root.get("width", str(self.default_width))
+        height_str = root.get("height", str(self.default_height))
+
+        # Handle percentage dimensions (e.g., "100%")
+        if "%" in width_str and viewBox:
+            width = self._parse_length(width_str, viewBox[2])
         else:
-            # No viewBox - use width/height for percentage resolution
+            width = self._parse_length(width_str)
+            # If width not specified but viewBox exists, use viewBox width
+            if not root.get("width") and viewBox:
+                width = viewBox[2]
+
+        if "%" in height_str and viewBox:
+            height = self._parse_length(height_str, viewBox[3])
+        else:
+            height = self._parse_length(height_str)
+            # If height not specified but viewBox exists, use viewBox height
+            if not root.get("height") and viewBox:
+                height = viewBox[3]
+
+        # Set viewbox dimensions for percentage resolution if not already set
+        if not viewBox:
             self.viewbox_width = width
             self.viewbox_height = height
 
@@ -469,23 +490,27 @@ class SVGParser:
         # Parse elements
         elements = self._parse_children(root, Transform.identity(), root_style)
 
-        # If no explicit dimensions and no viewBox, compute from content
+        # If no viewBox, compute dimensions from content bounding box
+        # This matches resvg behavior - explicit width/height without viewBox
+        # are treated as hints but actual dimensions come from content
         has_explicit_width = root.get("width") is not None
         has_explicit_height = root.get("height") is not None
 
-        if not has_explicit_width or not has_explicit_height or (width == 0 or height == 0):
-            if not viewBox:
-                # Compute bounding box from elements
-                bbox = self._compute_elements_bbox(elements)
-                if bbox:
-                    min_x, min_y, max_x, max_y = bbox
+        # If no viewBox and missing explicit dimensions, compute from content
+        # Match resvg behavior: size to max coordinates, keep content at original position
+        if not viewBox and (not has_explicit_width or not has_explicit_height):
+            # Compute bounding box from elements
+            bbox = self._compute_elements_bbox(elements)
+            if bbox:
+                min_x, min_y, max_x, max_y = bbox
 
-                    # Set dimensions to fit content (with small padding)
-                    padding = 5
-                    if not has_explicit_width or width == 0:
-                        width = max(max_x + padding, self.default_width)
-                    if not has_explicit_height or height == 0:
-                        height = max(max_y + padding, self.default_height)
+                # resvg ignores explicit dimensions when there's no viewBox
+                # Size document to max coordinates of content
+                width = max_x
+                height = max_y
+
+                # NO viewBox - keep coordinate system at (0,0)
+                # Content at (min_x, min_y) renders at those pixel coordinates
 
         return SVGDocument(
             width=width,
@@ -592,6 +617,21 @@ class SVGParser:
         if not filter_id:
             return
 
+        # Parse filter region attributes (can be percentages like "-10%")
+        def parse_filter_val(val: str, default: float) -> float:
+            if val is None:
+                return default
+            val = val.strip()
+            if val.endswith('%'):
+                return float(val[:-1]) / 100.0
+            return float(val)
+
+        filter_x = parse_filter_val(elem.get("x"), -0.1)
+        filter_y = parse_filter_val(elem.get("y"), -0.1)
+        filter_w = parse_filter_val(elem.get("width"), 1.2)
+        filter_h = parse_filter_val(elem.get("height"), 1.2)
+        filter_units = elem.get("filterUnits", "objectBoundingBox")
+
         # Look for feGaussianBlur child
         for child in elem:
             tag = self._strip_ns(child.tag)
@@ -605,7 +645,12 @@ class SVGParser:
 
                 self.filters[filter_id] = GaussianBlurFilter(
                     id=filter_id,
-                    std_deviation=std_dev_val
+                    std_deviation=std_dev_val,
+                    x=filter_x,
+                    y=filter_y,
+                    width=filter_w,
+                    height=filter_h,
+                    filter_units=filter_units
                 )
                 break  # Only handle the first blur for now
 
@@ -625,6 +670,11 @@ class SVGParser:
         if units not in ("objectBoundingBox", "userSpaceOnUse"):
             units = "objectBoundingBox"
 
+        # Parse spreadMethod - default is "pad"
+        spread_method = elem.get("spreadMethod", "pad")
+        if spread_method not in ("pad", "reflect", "repeat"):
+            spread_method = "pad"
+
         grad = LinearGradient(
             id=grad_id,
             x1=self._parse_gradient_coord(elem.get("x1", "0%")),
@@ -632,7 +682,8 @@ class SVGParser:
             x2=self._parse_gradient_coord(elem.get("x2", "100%")),
             y2=self._parse_gradient_coord(elem.get("y2", "0%")),
             units=units,
-            href=href
+            href=href,
+            spread_method=spread_method
         )
 
         # Parse transform
@@ -660,13 +711,19 @@ class SVGParser:
         if units not in ("objectBoundingBox", "userSpaceOnUse"):
             units = "objectBoundingBox"
 
+        # Parse spreadMethod - default is "pad"
+        spread_method = elem.get("spreadMethod", "pad")
+        if spread_method not in ("pad", "reflect", "repeat"):
+            spread_method = "pad"
+
         grad = RadialGradient(
             id=grad_id,
             cx=self._parse_gradient_coord(elem.get("cx", "50%")),
             cy=self._parse_gradient_coord(elem.get("cy", "50%")),
             r=self._parse_gradient_coord(elem.get("r", "50%")),
             units=units,
-            href=href
+            href=href,
+            spread_method=spread_method
         )
 
         fx = elem.get("fx")
@@ -979,6 +1036,10 @@ class SVGParser:
             return None
 
         color_str = color_str.strip().lower()
+
+        # currentColor keyword - defaults to black
+        if color_str == "currentcolor":
+            return (0, 0, 0)
 
         # Named color
         if color_str in self.COLORS:
@@ -1435,24 +1496,34 @@ class SVGParser:
                 max(xs) + stroke_expand, max(ys) + stroke_expand)
 
     def _compute_path_bbox(self, commands: list) -> Optional[tuple[float, float, float, float]]:
-        """Compute bounding box from path commands."""
+        """Compute bounding box from path commands using actual curve extrema."""
         if not commands:
             return None
 
         points = []
+        current = None
         for cmd in commands:
             if cmd[0] == 'M':
-                points.append((cmd[1], cmd[2]))
+                current = (cmd[1], cmd[2])
+                points.append(current)
             elif cmd[0] == 'L':
-                points.append((cmd[1], cmd[2]))
+                current = (cmd[1], cmd[2])
+                points.append(current)
             elif cmd[0] == 'C':
-                # Include control points for conservative bbox
-                points.append((cmd[1], cmd[2]))
-                points.append((cmd[3], cmd[4]))
-                points.append((cmd[5], cmd[6]))
+                # Compute actual cubic bezier extrema (not conservative control point hull)
+                p0 = current if current else (0, 0)
+                p1 = (cmd[1], cmd[2])
+                p2 = (cmd[3], cmd[4])
+                p3 = (cmd[5], cmd[6])
+                points.extend(self._cubic_bezier_extrema(p0, p1, p2, p3))
+                current = p3
             elif cmd[0] == 'Q':
-                points.append((cmd[1], cmd[2]))
-                points.append((cmd[3], cmd[4]))
+                # Compute actual quadratic bezier extrema
+                p0 = current if current else (0, 0)
+                p1 = (cmd[1], cmd[2])
+                p2 = (cmd[3], cmd[4])
+                points.extend(self._quadratic_bezier_extrema(p0, p1, p2))
+                current = p2
 
         if not points:
             return None
@@ -1460,3 +1531,64 @@ class SVGParser:
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
         return (min(xs), min(ys), max(xs), max(ys))
+
+    def _cubic_bezier_extrema(self, p0: tuple, p1: tuple, p2: tuple, p3: tuple) -> list:
+        """Compute actual extrema points of cubic bezier curve.
+
+        For a cubic bezier B(t) = (1-t)^3*P0 + 3*(1-t)^2*t*P1 + 3*(1-t)*t^2*P2 + t^3*P3
+        Extrema occur at t=0, t=1, or where derivative B'(t)=0.
+        """
+        import math
+        points = [p0, p3]  # Always include endpoints
+
+        # For each dimension, find t values where derivative is 0
+        for dim in [0, 1]:
+            v0, v1, v2, v3 = p0[dim], p1[dim], p2[dim], p3[dim]
+
+            # B'(t) = at^2 + bt + c where:
+            c = 3 * (v1 - v0)
+            b = -6 * (v1 - v0) + 6 * (v2 - v1)
+            a = 3 * (v1 - v0) - 6 * (v2 - v1) + 3 * (v3 - v2)
+
+            # Solve quadratic at^2 + bt + c = 0
+            if abs(a) < 1e-10:
+                if abs(b) > 1e-10:
+                    t = -c / b
+                    if 0 < t < 1:
+                        points.append(self._eval_cubic(t, p0, p1, p2, p3))
+            else:
+                disc = b*b - 4*a*c
+                if disc >= 0:
+                    sqrt_disc = math.sqrt(disc)
+                    for t in [(-b + sqrt_disc) / (2*a), (-b - sqrt_disc) / (2*a)]:
+                        if 0 < t < 1:
+                            points.append(self._eval_cubic(t, p0, p1, p2, p3))
+
+        return points
+
+    def _eval_cubic(self, t: float, p0: tuple, p1: tuple, p2: tuple, p3: tuple) -> tuple:
+        """Evaluate cubic bezier at parameter t."""
+        mt = 1 - t
+        x = mt**3 * p0[0] + 3 * mt**2 * t * p1[0] + 3 * mt * t**2 * p2[0] + t**3 * p3[0]
+        y = mt**3 * p0[1] + 3 * mt**2 * t * p1[1] + 3 * mt * t**2 * p2[1] + t**3 * p3[1]
+        return (x, y)
+
+    def _quadratic_bezier_extrema(self, p0: tuple, p1: tuple, p2: tuple) -> list:
+        """Compute actual extrema points of quadratic bezier curve."""
+        points = [p0, p2]  # Always include endpoints
+
+        # For quadratic B(t) = (1-t)^2*P0 + 2*(1-t)*t*P1 + t^2*P2
+        # B'(t) = 2*(1-t)*(P1-P0) + 2*t*(P2-P1) = 2*(P1-P0) + 2*t*(P2-2*P1+P0)
+        # Extremum at t = (P0-P1) / (P0 - 2*P1 + P2)
+        for dim in [0, 1]:
+            v0, v1, v2 = p0[dim], p1[dim], p2[dim]
+            denom = v0 - 2*v1 + v2
+            if abs(denom) > 1e-10:
+                t = (v0 - v1) / denom
+                if 0 < t < 1:
+                    mt = 1 - t
+                    x = mt**2 * p0[0] + 2 * mt * t * p1[0] + t**2 * p2[0]
+                    y = mt**2 * p0[1] + 2 * mt * t * p1[1] + t**2 * p2[1]
+                    points.append((x, y))
+
+        return points

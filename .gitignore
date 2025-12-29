@@ -210,3 +210,5 @@ samples/
 .credentials.json
 samples_ext/*
 advanced_svg
+comparisons/
+references/

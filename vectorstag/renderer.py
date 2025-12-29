@@ -176,11 +176,10 @@ class SVGRenderer:
             self._render_element_with_clip(ctx, element)
             return
 
-        # Note: Filter support disabled to match CairoSVG behavior
-        # CairoSVG doesn't properly apply Gaussian blur filters
-        # if element.style.filter_id and element.style.filter_id in ctx.filters:
-        #     self._render_element_with_filter(ctx, element)
-        #     return
+        # Apply Gaussian blur filter if present
+        if element.style.filter_id and element.style.filter_id in ctx.filters:
+            self._render_element_with_filter(ctx, element)
+            return
 
         if isinstance(element, GroupElement):
             for child in element.children:
@@ -245,9 +244,46 @@ class SVGRenderer:
         """Render an element with a filter (e.g., Gaussian blur) applied."""
         filter_def = ctx.filters[element.style.filter_id]
 
-        # Create a temporary image for the element
-        temp_image = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.filters)
+        # Calculate blur radius first to determine region padding
+        scale = math.sqrt(abs(ctx.base_transform.a * ctx.base_transform.d -
+                              ctx.base_transform.b * ctx.base_transform.c))
+        blur_radius = filter_def.std_deviation * scale
+
+        # Get element bounding box in screen coordinates
+        elem_bbox = self._get_element_bbox(element, ctx.base_transform)
+
+        # Determine render region - use element bbox + blur padding for efficiency
+        # Blur spreads beyond element, so we need padding of ~3x blur radius
+        blur_padding = int(blur_radius * 3) + 2
+
+        if elem_bbox:
+            ex, ey, ew, eh = elem_bbox
+            # Region in screen coordinates with padding
+            region_x = max(0, int(ex) - blur_padding)
+            region_y = max(0, int(ey) - blur_padding)
+            region_x2 = min(ctx.image.width, int(ex + ew) + blur_padding)
+            region_y2 = min(ctx.image.height, int(ey + eh) + blur_padding)
+            region_w = region_x2 - region_x
+            region_h = region_y2 - region_y
+
+            # Only use region optimization if region is significantly smaller than full image
+            use_region = region_w * region_h < ctx.image.width * ctx.image.height * 0.5
+        else:
+            use_region = False
+
+        if use_region and region_w > 0 and region_h > 0:
+            # Create smaller temp image for just the region
+            temp_image = Image.new("RGBA", (region_w, region_h), (0, 0, 0, 0))
+
+            # Create offset transform that shifts rendering to region coordinates
+            offset_transform = Transform(1, 0, 0, 1, -region_x, -region_y)
+            adjusted_base = offset_transform.multiply(ctx.base_transform)
+            temp_ctx = RenderContext(temp_image, ctx.gradients, adjusted_base, ctx.clip_paths, ctx.filters)
+        else:
+            # Fall back to full image rendering
+            region_x, region_y = 0, 0
+            temp_image = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+            temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.filters)
 
         # Render the element without filter to the temp image
         old_filter_id = element.style.filter_id
@@ -277,25 +313,108 @@ class SVGRenderer:
         element.style.filter_id = old_filter_id
 
         # Apply Gaussian blur filter
-        # The std_deviation is in SVG user units, convert to pixels
-        # Account for the base transform scale
-        scale = math.sqrt(abs(ctx.base_transform.a * ctx.base_transform.d -
-                              ctx.base_transform.b * ctx.base_transform.c))
-        blur_radius = filter_def.std_deviation * scale
-
         # PIL GaussianBlur radius - at least 1 pixel
         if blur_radius >= 0.5:
-            # Blur RGB and alpha channels separately for proper edge handling
-            r, g, b, a = temp_image.split()
-            blur = ImageFilter.GaussianBlur(radius=blur_radius)
-            r = r.filter(blur)
-            g = g.filter(blur)
-            b = b.filter(blur)
-            a = a.filter(blur)
-            temp_image = Image.merge("RGBA", (r, g, b, a))
+            # Use premultiplied alpha to avoid blending with black from transparent pixels
+            # When transparent pixels are (0,0,0,0), naive blur mixes color with black
+            # Premultiplied alpha ensures transparent pixels contribute no color
+            import numpy as np
+            arr = np.array(temp_image, dtype=np.float32)
+            r, g, b, a = arr[:,:,0], arr[:,:,1], arr[:,:,2], arr[:,:,3]
 
-        # Composite blurred image onto main image
-        ctx.image.alpha_composite(temp_image)
+            # Convert to premultiplied alpha (R' = R * A / 255)
+            alpha_norm = a / 255.0
+            r_pre = r * alpha_norm
+            g_pre = g * alpha_norm
+            b_pre = b * alpha_norm
+
+            # Create premultiplied image and blur all channels
+            blur = ImageFilter.GaussianBlur(radius=blur_radius)
+            r_img = Image.fromarray(r_pre.astype(np.uint8), mode='L').filter(blur)
+            g_img = Image.fromarray(g_pre.astype(np.uint8), mode='L').filter(blur)
+            b_img = Image.fromarray(b_pre.astype(np.uint8), mode='L').filter(blur)
+            a_img = Image.fromarray(a.astype(np.uint8), mode='L').filter(blur)
+
+            # Convert back from premultiplied
+            r_blur = np.array(r_img, dtype=np.float32)
+            g_blur = np.array(g_img, dtype=np.float32)
+            b_blur = np.array(b_img, dtype=np.float32)
+            a_blur = np.array(a_img, dtype=np.float32)
+
+            # Un-premultiply: R = R' * 255 / A (avoid division by zero)
+            alpha_blur_norm = np.maximum(a_blur, 1) / 255.0  # Avoid div by 0
+            r_final = np.clip(r_blur / alpha_blur_norm, 0, 255).astype(np.uint8)
+            g_final = np.clip(g_blur / alpha_blur_norm, 0, 255).astype(np.uint8)
+            b_final = np.clip(b_blur / alpha_blur_norm, 0, 255).astype(np.uint8)
+            a_final = a_blur.astype(np.uint8)
+
+            temp_image = Image.merge("RGBA", (
+                Image.fromarray(r_final, mode='L'),
+                Image.fromarray(g_final, mode='L'),
+                Image.fromarray(b_final, mode='L'),
+                Image.fromarray(a_final, mode='L')
+            ))
+
+        # Apply filter region clipping
+        if elem_bbox:
+            ex, ey, ew, eh = elem_bbox
+
+            if filter_def.filter_units == "objectBoundingBox":
+                # Filter region is relative to element bbox
+                fx = ex + filter_def.x * ew
+                fy = ey + filter_def.y * eh
+                fw = filter_def.width * ew
+                fh = filter_def.height * eh
+            else:
+                # userSpaceOnUse - filter region in user coordinates, transform to pixels
+                fx, fy = ctx.base_transform.apply(filter_def.x, filter_def.y)
+                fx2, fy2 = ctx.base_transform.apply(filter_def.x + filter_def.width,
+                                                     filter_def.y + filter_def.height)
+                fw, fh = fx2 - fx, fy2 - fy
+
+            # Create clip mask for filter region (in temp_image coordinates)
+            filter_mask = Image.new("L", temp_image.size, 0)
+            filter_draw = ImageDraw.Draw(filter_mask)
+            # Adjust coordinates for region offset
+            filter_draw.rectangle([int(fx - region_x), int(fy - region_y),
+                                   int(fx + fw - region_x), int(fy + fh - region_y)], fill=255)
+
+            # Apply mask to blurred image
+            temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], filter_mask))
+
+        # Composite blurred image onto main image at correct position
+        ctx.image.alpha_composite(temp_image, (region_x, region_y))
+
+    def _get_element_bbox(self, element: SVGElement, transform: Transform) -> Optional[tuple]:
+        """Get element bounding box in screen coordinates."""
+        if isinstance(element, RectElement):
+            corners = [
+                (element.x, element.y),
+                (element.x + element.width, element.y),
+                (element.x + element.width, element.y + element.height),
+                (element.x, element.y + element.height)
+            ]
+        elif isinstance(element, CircleElement):
+            corners = [
+                (element.cx - element.r, element.cy - element.r),
+                (element.cx + element.r, element.cy + element.r)
+            ]
+        elif isinstance(element, EllipseElement):
+            corners = [
+                (element.cx - element.rx, element.cy - element.ry),
+                (element.cx + element.rx, element.cy + element.ry)
+            ]
+        else:
+            # For other elements, return None (no clipping)
+            return None
+
+        # Transform corners
+        combined = transform.multiply(element.transform)
+        transformed = [combined.apply(x, y) for x, y in corners]
+        xs = [p[0] for p in transformed]
+        ys = [p[1] for p in transformed]
+
+        return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
 
     def _create_clip_mask(self, ctx: "RenderContext", clip_path: ClipPath,
                           element_transform: Transform) -> Image.Image:
@@ -838,7 +957,8 @@ class SVGRenderer:
         # - For open paths with many points (smooth curves) to avoid gaps
         if closed or len(points) >= 8:
             if closed:
-                self._stroke_closed_polygon(ctx, points, stroke, half_width, style.stroke_miterlimit)
+                self._stroke_closed_polygon(ctx, points, stroke, half_width,
+                                            style.stroke_miterlimit, style.stroke_linejoin)
             else:
                 self._stroke_open_polygon(ctx, points, stroke, half_width, style.stroke_linecap)
             return
@@ -1126,8 +1246,12 @@ class SVGRenderer:
 
     def _stroke_closed_polygon(self, ctx: "RenderContext", points: List[Tuple[float, float]],
                                stroke: Tuple[int, int, int, int], half_width: float,
-                               miterlimit: float = 4.0):
-        """Render a closed polygon stroke using mask-based approach (gap-free)."""
+                               miterlimit: float = 4.0, linejoin: str = "miter"):
+        """Render a closed polygon stroke.
+
+        Uses outer/inner polygon approach for convex shapes, and segment-based
+        approach for non-convex shapes (like NP flag) where stroke can self-intersect.
+        """
         n = len(points)
         if n < 3:
             return
@@ -1137,7 +1261,6 @@ class SVGRenderer:
         for p in points[1:]:
             if self._point_distance(clean_points[-1], p) > 0.01:
                 clean_points.append(p)
-        # Also check if last point equals first
         if len(clean_points) > 1 and self._point_distance(clean_points[-1], clean_points[0]) < 0.01:
             clean_points = clean_points[:-1]
 
@@ -1146,103 +1269,181 @@ class SVGRenderer:
         if n < 3:
             return
 
-        # Compute offset polygons in both directions using proper miter joins
-        plus_points = []
-        minus_points = []
+        # Check if shape has reflex angles (non-convex) - stroke may self-intersect
+        has_reflex = False
+        sign = None
+        for i in range(n):
+            p_prev = points[(i - 1) % n]
+            p_curr = points[i]
+            p_next = points[(i + 1) % n]
+            d1 = (p_curr[0] - p_prev[0], p_curr[1] - p_prev[1])
+            d2 = (p_next[0] - p_curr[0], p_next[1] - p_curr[1])
+            cross = d1[0] * d2[1] - d1[1] * d2[0]
+            if sign is None:
+                sign = cross > 0
+            elif (cross > 0) != sign and abs(cross) > 0.01:
+                has_reflex = True
+                break
+
+        if has_reflex:
+            self._stroke_closed_polygon_segmented(ctx, points, stroke, half_width, miterlimit, linejoin)
+        else:
+            self._stroke_closed_polygon_outline(ctx, points, stroke, half_width, miterlimit, linejoin)
+
+    def _stroke_closed_polygon_outline(self, ctx: "RenderContext", points: List[Tuple[float, float]],
+                                        stroke: Tuple[int, int, int, int], half_width: float,
+                                        miterlimit: float = 4.0, linejoin: str = "miter"):
+        """Render closed polygon stroke using outer/inner outline approach."""
+        n = len(points)
+
+        # Compute left and right edge points with miter joins
+        left_points = []
+        right_points = []
 
         for i in range(n):
             p_prev = points[(i - 1) % n]
             p_curr = points[i]
             p_next = points[(i + 1) % n]
 
-            # Compute edge directions
             d1 = self._normalize(self._subtract(p_curr, p_prev))
             d2 = self._normalize(self._subtract(p_next, p_curr))
 
-            # Perpendiculars for each edge
             perp1 = (-d1[1], d1[0])
             perp2 = (-d2[1], d2[0])
 
-            # Compute cross product to check if angle is sharp
             cross = d1[0] * d2[1] - d1[1] * d2[0]
-            dot = d1[0] * d2[0] + d1[1] * d2[1]
 
-            # For sharp angles, use miter join calculation
-            # Miter join: find intersection of offset lines
-            if abs(cross) > 0.01:  # Non-parallel edges
-                # Offset points on each edge
-                plus_p1 = (p_curr[0] + perp1[0] * half_width, p_curr[1] + perp1[1] * half_width)
-                plus_p2 = (p_curr[0] + perp2[0] * half_width, p_curr[1] + perp2[1] * half_width)
-                minus_p1 = (p_curr[0] - perp1[0] * half_width, p_curr[1] - perp1[1] * half_width)
-                minus_p2 = (p_curr[0] - perp2[0] * half_width, p_curr[1] - perp2[1] * half_width)
+            if abs(cross) > 0.001:
+                # Compute miter intersection
+                left_p1 = (p_curr[0] + perp1[0] * half_width, p_curr[1] + perp1[1] * half_width)
+                left_p2 = (p_curr[0] + perp2[0] * half_width, p_curr[1] + perp2[1] * half_width)
+                right_p1 = (p_curr[0] - perp1[0] * half_width, p_curr[1] - perp1[1] * half_width)
+                right_p2 = (p_curr[0] - perp2[0] * half_width, p_curr[1] - perp2[1] * half_width)
 
-                # Find intersection of the two offset lines
-                plus_pt = self._line_intersection(plus_p1, d1, plus_p2, d2)
-                minus_pt = self._line_intersection(minus_p1, d1, minus_p2, d2)
+                left_pt = self._line_intersection(left_p1, d1, left_p2, d2)
+                right_pt = self._line_intersection(right_p1, d1, right_p2, d2)
 
-                if plus_pt is None:
-                    plus_pt = plus_p1
-                if minus_pt is None:
-                    minus_pt = minus_p1
+                if left_pt is None:
+                    left_pt = left_p1
+                if right_pt is None:
+                    right_pt = right_p1
 
-                # Apply miterlimit - if miter too long, fall back to bevel
-                # SVG miterlimit is ratio of miter length to stroke width
-                miter_len_plus = math.sqrt((plus_pt[0] - p_curr[0])**2 + (plus_pt[1] - p_curr[1])**2)
-                miter_len_minus = math.sqrt((minus_pt[0] - p_curr[0])**2 + (minus_pt[1] - p_curr[1])**2)
-                miter_limit_distance = miterlimit * half_width
+                # Apply miterlimit
+                max_miter = miterlimit * half_width
+                left_dist = math.sqrt((left_pt[0] - p_curr[0])**2 + (left_pt[1] - p_curr[1])**2)
+                right_dist = math.sqrt((right_pt[0] - p_curr[0])**2 + (right_pt[1] - p_curr[1])**2)
 
-                if miter_len_plus > miter_limit_distance:
-                    # Use average for bevel fallback
-                    avg_dir = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
-                    perp = (-avg_dir[1], avg_dir[0])
-                    plus_pt = (p_curr[0] + perp[0] * half_width, p_curr[1] + perp[1] * half_width)
-
-                if miter_len_minus > miter_limit_distance:
-                    avg_dir = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
-                    perp = (-avg_dir[1], avg_dir[0])
-                    minus_pt = (p_curr[0] - perp[0] * half_width, p_curr[1] - perp[1] * half_width)
+                if left_dist > max_miter:
+                    avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
+                    left_pt = (p_curr[0] + avg_perp[0] * half_width, p_curr[1] + avg_perp[1] * half_width)
+                if right_dist > max_miter:
+                    avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
+                    right_pt = (p_curr[0] - avg_perp[0] * half_width, p_curr[1] - avg_perp[1] * half_width)
             else:
-                # Near-parallel edges: use average direction (smooth curves)
-                avg_dir = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
-                perp = (-avg_dir[1], avg_dir[0])
-                plus_pt = (p_curr[0] + perp[0] * half_width, p_curr[1] + perp[1] * half_width)
-                minus_pt = (p_curr[0] - perp[0] * half_width, p_curr[1] - perp[1] * half_width)
+                # Nearly collinear
+                avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
+                left_pt = (p_curr[0] + avg_perp[0] * half_width, p_curr[1] + avg_perp[1] * half_width)
+                right_pt = (p_curr[0] - avg_perp[0] * half_width, p_curr[1] - avg_perp[1] * half_width)
 
-            plus_points.append(plus_pt)
-            minus_points.append(minus_pt)
+            left_points.append(left_pt)
+            right_points.append(right_pt)
 
-        # Determine which is outer (larger area) vs inner (smaller area)
-        def polygon_area(pts):
-            area = 0.0
-            for i in range(len(pts)):
-                j = (i + 1) % len(pts)
-                area += pts[i][0] * pts[j][1]
-                area -= pts[j][0] * pts[i][1]
-            return abs(area) / 2.0
-
-        plus_area = polygon_area(plus_points)
-        minus_area = polygon_area(minus_points)
-
-        if plus_area > minus_area:
-            outer_points, inner_points = plus_points, minus_points
-        else:
-            outer_points, inner_points = minus_points, plus_points
-
-        # Use mask-based approach: draw outer filled, cut out inner
-        # This avoids the seam issue with annular polygons
+        # Render stroke as individual segments (quads) plus miter triangles
+        # This correctly handles the ring shape for closed polygon strokes
         temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(temp, "RGBA")
 
-        # Draw outer polygon filled with stroke color
-        draw.polygon(outer_points, fill=stroke)
+        # Draw each edge as a quadrilateral
+        for i in range(n):
+            j = (i + 1) % n
+            quad = [left_points[i], left_points[j], right_points[j], right_points[i]]
+            draw.polygon(quad, fill=stroke)
 
-        # Create mask for inner polygon and cut it out
-        mask = Image.new("L", ctx.image.size, 255)
-        mask_draw = ImageDraw.Draw(mask)
-        mask_draw.polygon(inner_points, fill=0)
+        # Draw round joins at corners if linejoin is "round"
+        if linejoin == "round":
+            for i in range(n):
+                x, y = points[i]
+                draw.ellipse([x - half_width, y - half_width,
+                              x + half_width, y + half_width], fill=stroke)
 
-        # Apply mask to temp image (keeps only the ring)
-        temp.putalpha(ImageChops.multiply(temp.getchannel("A"), mask))
+        ctx.image.alpha_composite(temp)
+
+    def _stroke_closed_polygon_segmented(self, ctx: "RenderContext", points: List[Tuple[float, float]],
+                                          stroke: Tuple[int, int, int, int], half_width: float,
+                                          miterlimit: float = 4.0, linejoin: str = "miter"):
+        """Render closed polygon stroke using segment-based approach.
+
+        Used for non-convex shapes where the outline approach would self-intersect.
+        """
+        n = len(points)
+
+        temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(temp, "RGBA")
+
+        # For each edge, draw a quadrilateral
+        for i in range(n):
+            j = (i + 1) % n
+            p1 = points[i]
+            p2 = points[j]
+
+            # Direction and perpendicular for this edge
+            d = self._normalize(self._subtract(p2, p1))
+            perp = (-d[1], d[0])
+
+            # Simple perpendicular offset for each edge
+            quad = [
+                (p1[0] + perp[0] * half_width, p1[1] + perp[1] * half_width),
+                (p2[0] + perp[0] * half_width, p2[1] + perp[1] * half_width),
+                (p2[0] - perp[0] * half_width, p2[1] - perp[1] * half_width),
+                (p1[0] - perp[0] * half_width, p1[1] - perp[1] * half_width),
+            ]
+            draw.polygon(quad, fill=stroke)
+
+        # Fill corners with miter triangles
+        for i in range(n):
+            p_prev = points[(i - 1) % n]
+            p_curr = points[i]
+            p_next = points[(i + 1) % n]
+
+            d1 = self._normalize(self._subtract(p_curr, p_prev))
+            d2 = self._normalize(self._subtract(p_next, p_curr))
+
+            perp1 = (-d1[1], d1[0])
+            perp2 = (-d2[1], d2[0])
+
+            cross = d1[0] * d2[1] - d1[1] * d2[0]
+            if abs(cross) < 0.001:
+                continue
+
+            # Compute miter point
+            left_p1 = (p_curr[0] + perp1[0] * half_width, p_curr[1] + perp1[1] * half_width)
+            left_p2 = (p_curr[0] + perp2[0] * half_width, p_curr[1] + perp2[1] * half_width)
+            right_p1 = (p_curr[0] - perp1[0] * half_width, p_curr[1] - perp1[1] * half_width)
+            right_p2 = (p_curr[0] - perp2[0] * half_width, p_curr[1] - perp2[1] * half_width)
+
+            if cross > 0:
+                # Left turn - miter on inside (right)
+                miter_pt = self._line_intersection(right_p1, d1, right_p2, d2)
+                if miter_pt:
+                    miter_dist = math.sqrt((miter_pt[0] - p_curr[0])**2 + (miter_pt[1] - p_curr[1])**2)
+                    if miter_dist <= miterlimit * half_width:
+                        tri = [right_p1, miter_pt, right_p2]
+                        draw.polygon(tri, fill=stroke)
+            else:
+                # Right turn - miter on inside (left)
+                miter_pt = self._line_intersection(left_p1, d1, left_p2, d2)
+                if miter_pt:
+                    miter_dist = math.sqrt((miter_pt[0] - p_curr[0])**2 + (miter_pt[1] - p_curr[1])**2)
+                    if miter_dist <= miterlimit * half_width:
+                        tri = [left_p1, miter_pt, left_p2]
+                        draw.polygon(tri, fill=stroke)
+
+        # Draw round joins at corners if linejoin is "round"
+        if linejoin == "round":
+            for i in range(n):
+                x, y = points[i]
+                draw.ellipse([x - half_width, y - half_width,
+                              x + half_width, y + half_width], fill=stroke)
 
         ctx.image.alpha_composite(temp)
 
@@ -1498,8 +1699,12 @@ class SVGRenderer:
                                           fill_ref: Optional[str]):
         """Fill a polygon, handling gradients if needed."""
         if fill_ref and fill_ref.startswith("url("):
-            # Extract gradient ID
-            match = fill_ref[4:-1]  # Remove "url(" and ")"
+            # Extract gradient ID - handle fallback colors like "url(#id) rgb(0,0,0)"
+            end_paren = fill_ref.find(")")
+            if end_paren != -1:
+                match = fill_ref[4:end_paren]  # Remove "url(" and extract up to ")"
+            else:
+                match = fill_ref[4:]
             if match.startswith("#"):
                 match = match[1:]
 
@@ -2164,7 +2369,19 @@ class SVGRenderer:
 
         # Project onto gradient line
         t = ((wx - x1) * dx + (wy - y1) * dy) / length
-        t = np.clip(t, 0, 1)
+
+        # Apply spreadMethod
+        spread_method = getattr(gradient, 'spread_method', 'pad')
+        if spread_method == "repeat":
+            # Wrap t to [0, 1) range
+            t = t % 1.0
+        elif spread_method == "reflect":
+            # Reflect: 0→1→0→1...
+            # Use modulo 2 then fold back
+            t = t % 2.0
+            t = np.where(t > 1.0, 2.0 - t, t)
+        else:  # pad (default)
+            t = np.clip(t, 0, 1)
 
         # Vectorized color interpolation
         pixels = self._interpolate_gradient_colors_vectorized(gradient.stops, t, opacity)
@@ -2224,7 +2441,18 @@ class SVGRenderer:
 
         # Distance from center, normalized to 0-1
         t = np.sqrt((gx - cx) ** 2 + (gy - cy) ** 2) / r
-        t = np.clip(t, 0, 1)
+
+        # Apply spreadMethod
+        spread_method = getattr(gradient, 'spread_method', 'pad')
+        if spread_method == "repeat":
+            # Wrap t to [0, 1) range
+            t = t % 1.0
+        elif spread_method == "reflect":
+            # Reflect: 0→1→0→1...
+            t = t % 2.0
+            t = np.where(t > 1.0, 2.0 - t, t)
+        else:  # pad (default)
+            t = np.clip(t, 0, 1)
 
         # Vectorized color interpolation
         pixels = self._interpolate_gradient_colors_vectorized(gradient.stops, t, opacity)
