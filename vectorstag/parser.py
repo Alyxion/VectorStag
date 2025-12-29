@@ -826,6 +826,8 @@ class SVGParser:
             result = self._parse_text(elem, style, transform, text_anchor, font_family, font_size)
         elif tag == "use":
             result = self._parse_use(elem, style, transform, parent_style)
+        elif tag == "svg":
+            result = self._parse_nested_svg(elem, style, transform, parent_style, text_anchor, font_family, font_size)
 
         # Set clip path on the parsed element
         if result and clip_path_id:
@@ -1194,6 +1196,53 @@ class SVGParser:
             style=style,
             transform=transform,
             children=self._parse_children(elem, transform, style, text_anchor, font_family, font_size)
+        )
+        return group
+
+    def _parse_nested_svg(self, elem: ET.Element, style: Style, transform: Transform,
+                          parent_style: Style, text_anchor: str = "start",
+                          font_family: str = "Arial", font_size: float = 16) -> GroupElement:
+        """Parse nested svg element - treated as a group with its own coordinate system."""
+        # Get position offset
+        x = self._parse_length(elem.get("x", "0"))
+        y = self._parse_length(elem.get("y", "0"))
+
+        # Get dimensions
+        width = self._parse_length(elem.get("width", "0"))
+        height = self._parse_length(elem.get("height", "0"))
+
+        # Get viewBox if present
+        viewbox_str = elem.get("viewBox", "")
+
+        # Build the transform for the nested SVG coordinate system
+        nested_transform = transform
+
+        # First apply position offset
+        if x != 0 or y != 0:
+            nested_transform = nested_transform.multiply(Transform.translate(x, y))
+
+        # If there's a viewBox, compute scaling to map viewBox to width/height
+        if viewbox_str and width > 0 and height > 0:
+            parts = viewbox_str.replace(",", " ").split()
+            if len(parts) >= 4:
+                vb_x, vb_y, vb_w, vb_h = map(float, parts[:4])
+                if vb_w > 0 and vb_h > 0:
+                    # Scale to fit viewBox into width/height
+                    scale_x = width / vb_w
+                    scale_y = height / vb_h
+                    # Apply scaling and viewBox offset
+                    nested_transform = nested_transform.multiply(
+                        Transform.scale(scale_x, scale_y)
+                    ).multiply(
+                        Transform.translate(-vb_x, -vb_y)
+                    )
+
+        # Parse children with the nested transform
+        group = GroupElement(
+            tag="svg",
+            style=style,
+            transform=nested_transform,
+            children=self._parse_children(elem, nested_transform, style, text_anchor, font_family, font_size)
         )
         return group
 

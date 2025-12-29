@@ -25,27 +25,36 @@ def render_cairo(svg_path: Path, output_path: Path, size: int = 400):
 
 
 def render_resvg(svg_path: Path, output_path: Path, size: int = 400):
-    """Render SVG with resvg, preserving aspect ratio like Cairo."""
+    """Render SVG with resvg, respecting preserveAspectRatio setting."""
     try:
         with open(svg_path, 'r') as f:
             svg_content = f.read()
+
+        # Check if SVG has preserveAspectRatio="none" - should stretch
+        import re
+        par_match = re.search(r'preserveAspectRatio\s*=\s*["\']([^"\']+)["\']', svg_content)
+        should_stretch = par_match and 'none' in par_match.group(1).lower()
+
         png_data = bytes(svg_to_png(svg_content))
         img = Image.open(io.BytesIO(png_data)).convert("RGBA")
 
-        # Preserve aspect ratio and center on white background (like Cairo)
         if img.size != (size, size):
-            # Calculate scale to fit within size x size while preserving aspect ratio
-            scale = min(size / img.width, size / img.height)
-            new_w = int(img.width * scale)
-            new_h = int(img.height * scale)
-            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            if should_stretch:
+                # Stretch to fill entire canvas (preserveAspectRatio="none")
+                img = img.resize((size, size), Image.Resampling.LANCZOS)
+            else:
+                # Preserve aspect ratio and center on transparent background
+                scale = min(size / img.width, size / img.height)
+                new_w = int(img.width * scale)
+                new_h = int(img.height * scale)
+                img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-            # Center on white canvas
-            canvas = Image.new("RGBA", (size, size), (255, 255, 255, 0))
-            offset_x = (size - new_w) // 2
-            offset_y = (size - new_h) // 2
-            canvas.paste(img, (offset_x, offset_y))
-            img = canvas
+                # Center on transparent canvas
+                canvas = Image.new("RGBA", (size, size), (255, 255, 255, 0))
+                offset_x = (size - new_w) // 2
+                offset_y = (size - new_h) // 2
+                canvas.paste(img, (offset_x, offset_y))
+                img = canvas
 
         img.save(output_path)
         return True

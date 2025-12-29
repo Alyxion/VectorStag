@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Fast comparison using pre-rendered references."""
 
-import os
 from pathlib import Path
 from PIL import Image
 import numpy as np
@@ -11,39 +10,57 @@ import argparse
 from collections import defaultdict
 
 from vectorstag import SVGRenderer
-
-
-def compute_similarity(img1: Image.Image, img2: Image.Image) -> float:
-    """Compute similarity between two images."""
-    if img1 is None or img2 is None:
-        return 0.0
-
-    size = (max(img1.width, img2.width), max(img1.height, img2.height))
-    if img1.size != size:
-        img1 = img1.resize(size, Image.Resampling.LANCZOS)
-    if img2.size != size:
-        img2 = img2.resize(size, Image.Resampling.LANCZOS)
-
-    white = Image.new("RGBA", size, (255, 255, 255, 255))
-    img1_comp = Image.alpha_composite(white, img1)
-    img2_comp = Image.alpha_composite(white, img2)
-
-    arr1 = np.array(img1_comp, dtype=np.float32)[:, :, :3] / 255.0
-    arr2 = np.array(img2_comp, dtype=np.float32)[:, :, :3] / 255.0
-
-    mse = np.mean((arr1 - arr2) ** 2)
-    return max(0.0, 1.0 - min(1.0, mse * 4))
+from comparison_utils import compute_similarity, create_comparison_grid
 
 
 def process_svg(args):
     """Process a single SVG - compare VectorStag with pre-rendered references."""
-    svg_path, cairo_ref_dir, resvg_ref_dir, size = args
+    svg_path, cairo_ref_dir, resvg_ref_dir, size, save_dir = args
     name = svg_path.stem
 
     try:
-        # Render with VectorStag
+        # Read SVG to get dimensions and check preserveAspectRatio
+        import re
+        import xml.etree.ElementTree as ET
+        with open(svg_path, 'r') as f:
+            svg_content = f.read()
+
+        par_match = re.search(r'preserveAspectRatio\s*=\s*["\']([^"\']+)["\']', svg_content)
+        should_stretch = par_match and 'none' in par_match.group(1).lower()
+
+        # Parse SVG dimensions
+        root = ET.fromstring(svg_content)
+        svg_w = root.get('width', '100')
+        svg_h = root.get('height', '100')
+        # Strip units
+        svg_w = float(re.sub(r'[^0-9.]', '', svg_w) or '100')
+        svg_h = float(re.sub(r'[^0-9.]', '', svg_h) or '100')
+
         renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
-        vs_img = renderer.render_file(str(svg_path), size, size)
+
+        if should_stretch:
+            # Render directly at target size
+            vs_img = renderer.render_file(str(svg_path), size, size)
+        else:
+            # Calculate optimal render size to match resvg workflow
+            # Render at size that preserves aspect ratio, then center
+            aspect = svg_w / svg_h if svg_h > 0 else 1
+            if aspect >= 1:
+                render_w = size
+                render_h = int(size / aspect)
+            else:
+                render_h = size
+                render_w = int(size * aspect)
+
+            vs_img = renderer.render_file(str(svg_path), render_w, render_h)
+
+            if vs_img is not None and vs_img.size != (size, size):
+                # Center on canvas
+                canvas = Image.new("RGBA", (size, size), (255, 255, 255, 0))
+                offset_x = (size - vs_img.width) // 2
+                offset_y = (size - vs_img.height) // 2
+                canvas.paste(vs_img, (offset_x, offset_y))
+                vs_img = canvas
 
         if vs_img is None:
             return {"name": name, "error": "VectorStag render failed"}
@@ -60,6 +77,11 @@ def process_svg(args):
         sim_resvg = compute_similarity(resvg_img, vs_img) if resvg_img else 0.0
         sim = max(sim_cairo, sim_resvg)
 
+        # Save comparison image if requested
+        if save_dir is not None:
+            grid = create_comparison_grid(vs_img, resvg_img, cairo_img, size)
+            grid.save(save_dir / f"{name}_comparison.png")
+
         return {
             "name": name,
             "sim": sim,
@@ -71,7 +93,7 @@ def process_svg(args):
 
 
 def test_directory(svg_dir: Path, ref_dir: Path, limit: int = None,
-                   size: int = 400, num_workers: int = None):
+                   size: int = 400, num_workers: int = None, save_dir: Path = None):
     """Test all SVGs against pre-rendered references."""
     svg_files = sorted(svg_dir.glob("*.svg"))
     if limit:
@@ -89,6 +111,10 @@ def test_directory(svg_dir: Path, ref_dir: Path, limit: int = None,
         print("Run: python prerender_references.py --emojis first")
         return [], [], {}
 
+    if save_dir is not None:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Saving comparison images to: {save_dir}")
+
     if num_workers is None:
         num_workers = min(cpu_count(), 16)
 
@@ -96,7 +122,7 @@ def test_directory(svg_dir: Path, ref_dir: Path, limit: int = None,
     print(f"Resolution: {size}x{size}")
     print(f"Workers: {num_workers}\n")
 
-    tasks = [(svg_path, cairo_ref_dir, resvg_ref_dir, size) for svg_path in svg_files]
+    tasks = [(svg_path, cairo_ref_dir, resvg_ref_dir, size, save_dir) for svg_path in svg_files]
 
     results = []
     errors = []
@@ -172,21 +198,25 @@ def main():
     parser.add_argument("--limit", type=int, help="Limit files")
     parser.add_argument("--size", type=int, default=400, help="Render size")
     parser.add_argument("-j", "--workers", type=int, help="Workers")
+    parser.add_argument("--save", action="store_true", help="Save comparison images (VectorStag | resvg | diff)")
     args = parser.parse_args()
 
     noto_dir = Path("SciStagEssentialData/images/noto")
     ref_base = Path("samples/references_400")
+    comparison_base = Path("samples/comparison_400")
 
     if args.emojis:
         print("=" * 70)
         print("COMPARING EMOJIS")
         print("=" * 70)
+        save_dir = comparison_base / "emojis" if args.save else None
         results, errors, buckets = test_directory(
             noto_dir / "emojis" / "svg",
             ref_base / "emojis",
             limit=args.limit,
             size=args.size,
-            num_workers=args.workers
+            num_workers=args.workers,
+            save_dir=save_dir
         )
         print_summary(results, errors, buckets, "EMOJIS")
 
@@ -194,17 +224,19 @@ def main():
         print("=" * 70)
         print("COMPARING FLAGS")
         print("=" * 70)
+        save_dir = comparison_base / "flags" if args.save else None
         results, errors, buckets = test_directory(
             noto_dir / "flags" / "svg",
             ref_base / "flags",
             limit=args.limit,
             size=args.size,
-            num_workers=args.workers
+            num_workers=args.workers,
+            save_dir=save_dir
         )
         print_summary(results, errors, buckets, "FLAGS")
 
     if not (args.emojis or args.flags):
-        print("Usage: python compare_fast.py [--emojis] [--flags] [--limit N] [-j WORKERS]")
+        print("Usage: python compare_fast.py [--emojis] [--flags] [--limit N] [-j WORKERS] [--save]")
 
 
 if __name__ == "__main__":

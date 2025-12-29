@@ -111,6 +111,54 @@ class SVGRenderer:
         for element in doc.elements:
             self._render_element(ctx, element)
 
+        # Apply viewBox clipping - hide content outside viewBox bounds
+        if doc.viewBox:
+            vb_x, vb_y, vb_w, vb_h = doc.viewBox
+
+            # The viewBox defines what region of the SVG coordinate space is visible.
+            # Our transform maps viewBox content to screen. The viewBox origin (vb_x, vb_y)
+            # maps to screen position: offset + vb_x * scale (for uniform) or offset + vb_x * scale_x (stretched)
+            #
+            # Since offset already accounts for centering: offset = (render - src_w * scale)/2 - src_x * scale
+            # And src_x = vb_x, the viewBox origin maps to: (render - src_w * scale)/2
+
+            if should_stretch:
+                # In stretched mode, viewBox maps exactly to render dimensions
+                clip_x1 = 0
+                clip_y1 = 0
+                clip_x2 = render_width
+                clip_y2 = render_height
+            else:
+                # Uniform scaling - viewBox is centered with possible letterboxing
+                # The viewBox content occupies: src_w * scale width, src_h * scale height
+                # Centered at (render_width/2, render_height/2)
+                content_w = src_w * scale
+                content_h = src_h * scale
+                # Use floor for lower bounds and ceil for upper bounds to avoid cutting off content
+                clip_x1 = math.floor((render_width - content_w) / 2)
+                clip_y1 = math.floor((render_height - content_h) / 2)
+                clip_x2 = math.ceil((render_width + content_w) / 2)
+                clip_y2 = math.ceil((render_height + content_h) / 2)
+
+            # Clamp to image bounds
+            clip_x1 = max(0, clip_x1)
+            clip_y1 = max(0, clip_y1)
+            clip_x2 = min(render_width, clip_x2)
+            clip_y2 = min(render_height, clip_y2)
+
+            # Only apply clipping if we have a valid rectangle
+            if clip_x2 > clip_x1 and clip_y2 > clip_y1:
+                # Create mask and apply clipping
+                mask = Image.new("L", (render_width, render_height), 0)
+                from PIL import ImageDraw
+                draw = ImageDraw.Draw(mask)
+                draw.rectangle([clip_x1, clip_y1, clip_x2, clip_y2], fill=255)
+
+                # Apply mask to alpha channel
+                r, g, b, a = image.split()
+                a = ImageChops.multiply(a, mask)
+                image = Image.merge("RGBA", (r, g, b, a))
+
         # Downscale for anti-aliasing effect
         if aa > 1:
             image = image.resize((out_width, out_height), Image.LANCZOS)
@@ -255,18 +303,27 @@ class SVGRenderer:
         mask = Image.new("L", ctx.image.size, 0)
 
         for clip_elem in clip_path.elements:
-            # Get points from the clip element
-            points = self._get_element_points(clip_elem)
-            if not points:
-                continue
-
-            # Transform points
             full_transform = ctx.base_transform.multiply(element_transform).multiply(clip_elem.transform)
-            transformed = [full_transform.apply(x, y) for x, y in points]
 
-            # Fill polygon with nonzero winding rule (SVG default for clip-path)
-            if len(transformed) >= 3:
-                self._fill_polygon_nonzero(mask, transformed)
+            # PathElement may have multiple subpaths - handle each separately
+            if isinstance(clip_elem, PathElement):
+                polygons = self._path_to_polygons(clip_elem.commands)
+                for poly in polygons:
+                    if len(poly) >= 3:
+                        transformed = [full_transform.apply(x, y) for x, y in poly]
+                        self._fill_polygon_nonzero(mask, transformed)
+            else:
+                # Get points from the clip element
+                points = self._get_element_points(clip_elem)
+                if not points:
+                    continue
+
+                # Transform points
+                transformed = [full_transform.apply(x, y) for x, y in points]
+
+                # Fill polygon with nonzero winding rule (SVG default for clip-path)
+                if len(transformed) >= 3:
+                    self._fill_polygon_nonzero(mask, transformed)
 
         # Handle nested clip path (for intersection)
         if clip_path.clip_path_id and clip_path.clip_path_id in ctx.clip_paths:
@@ -660,6 +717,7 @@ class SVGRenderer:
         polygons = []
         current_polygon = []
         current_x, current_y = 0.0, 0.0
+        subpath_start_x, subpath_start_y = 0.0, 0.0
 
         for cmd in commands:
             cmd_type = cmd[0]
@@ -669,13 +727,19 @@ class SVGRenderer:
                     polygons.append(current_polygon)
                 current_polygon = [(cmd[1], cmd[2])]
                 current_x, current_y = cmd[1], cmd[2]
+                subpath_start_x, subpath_start_y = current_x, current_y
 
             elif cmd_type == 'L':
+                # If polygon is empty (after Z), start from subpath start
+                if not current_polygon:
+                    current_polygon = [(subpath_start_x, subpath_start_y)]
                 current_polygon.append((cmd[1], cmd[2]))
                 current_x, current_y = cmd[1], cmd[2]
 
             elif cmd_type == 'C':
                 # Cubic bezier - sample it
+                if not current_polygon:
+                    current_polygon = [(subpath_start_x, subpath_start_y)]
                 x1, y1, x2, y2, x, y = cmd[1:]
                 bezier_points = self._sample_cubic_bezier(
                     current_x, current_y, x1, y1, x2, y2, x, y
@@ -685,6 +749,8 @@ class SVGRenderer:
 
             elif cmd_type == 'Q':
                 # Quadratic bezier - sample it
+                if not current_polygon:
+                    current_polygon = [(subpath_start_x, subpath_start_y)]
                 x1, y1, x, y = cmd[1:]
                 bezier_points = self._sample_quadratic_bezier(
                     current_x, current_y, x1, y1, x, y
@@ -698,7 +764,7 @@ class SVGRenderer:
                     if current_polygon[0] != current_polygon[-1]:
                         current_polygon.append(current_polygon[0])
                     polygons.append(current_polygon)
-                    current_x, current_y = current_polygon[0]
+                    current_x, current_y = subpath_start_x, subpath_start_y
                     current_polygon = []
 
         if current_polygon:
@@ -767,11 +833,12 @@ class SVGRenderer:
 
         half_width = width / 2.0
 
-        # For paths with many points (smooth curves), use polygon-based rendering
-        # This avoids gaps and artifacts from line-segment approach
-        if len(points) >= 8:
+        # Use polygon-based rendering for proper stroke geometry:
+        # - Always for closed paths (to handle miter/bevel joins correctly at corners)
+        # - For open paths with many points (smooth curves) to avoid gaps
+        if closed or len(points) >= 8:
             if closed:
-                self._stroke_closed_polygon(ctx, points, stroke, half_width)
+                self._stroke_closed_polygon(ctx, points, stroke, half_width, style.stroke_miterlimit)
             else:
                 self._stroke_open_polygon(ctx, points, stroke, half_width, style.stroke_linecap)
             return
@@ -1058,7 +1125,8 @@ class SVGRenderer:
             draw.polygon(stroke_polygon, fill=stroke)
 
     def _stroke_closed_polygon(self, ctx: "RenderContext", points: List[Tuple[float, float]],
-                               stroke: Tuple[int, int, int, int], half_width: float):
+                               stroke: Tuple[int, int, int, int], half_width: float,
+                               miterlimit: float = 4.0):
         """Render a closed polygon stroke using mask-based approach (gap-free)."""
         n = len(points)
         if n < 3:
@@ -1117,18 +1185,19 @@ class SVGRenderer:
                 if minus_pt is None:
                     minus_pt = minus_p1
 
-                # Apply miterlimit (default 4) - if miter too long, fall back to bevel
+                # Apply miterlimit - if miter too long, fall back to bevel
+                # SVG miterlimit is ratio of miter length to stroke width
                 miter_len_plus = math.sqrt((plus_pt[0] - p_curr[0])**2 + (plus_pt[1] - p_curr[1])**2)
                 miter_len_minus = math.sqrt((minus_pt[0] - p_curr[0])**2 + (minus_pt[1] - p_curr[1])**2)
-                miter_limit = 4.0 * half_width
+                miter_limit_distance = miterlimit * half_width
 
-                if miter_len_plus > miter_limit:
+                if miter_len_plus > miter_limit_distance:
                     # Use average for bevel fallback
                     avg_dir = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
                     perp = (-avg_dir[1], avg_dir[0])
                     plus_pt = (p_curr[0] + perp[0] * half_width, p_curr[1] + perp[1] * half_width)
 
-                if miter_len_minus > miter_limit:
+                if miter_len_minus > miter_limit_distance:
                     avg_dir = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
                     perp = (-avg_dir[1], avg_dir[0])
                     minus_pt = (p_curr[0] - perp[0] * half_width, p_curr[1] - perp[1] * half_width)
@@ -1436,8 +1505,10 @@ class SVGRenderer:
 
             if match in ctx.gradients:
                 gradient = ctx.gradients[match]
-                self._fill_polygon_with_gradient(ctx, points, gradient, bbox, style.opacity,
-                                                 style.fill_rule)
+                self._fill_polygon_with_gradient(ctx, points, gradient, bbox,
+                                                 style.fill_opacity * style.opacity,
+                                                 style.fill_rule,
+                                                 element_transform)
                 return
 
         # Simple fill with fill-rule support
@@ -1707,9 +1778,14 @@ class SVGRenderer:
             if match in ctx.gradients:
                 gradient = ctx.gradients[match]
                 grad_img = self._create_gradient_for_mask(
-                    ctx, gradient, width, height, bbox, min_x, min_y, style.opacity
+                    ctx, gradient, width, height, bbox, min_x, min_y,
+                    style.fill_opacity * style.opacity,
+                    element_transform
                 )
-                ctx.image.paste(grad_img, (min_x, min_y), mask_img)
+                # Use alpha_composite for proper blending
+                temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+                temp.paste(grad_img, (min_x, min_y), mask_img)
+                ctx.image.alpha_composite(temp)
         elif fill:
             # Solid fill
             fill_img = Image.new("RGBA", (width, height), fill)
@@ -1817,7 +1893,9 @@ class SVGRenderer:
             if match in ctx.gradients:
                 gradient = ctx.gradients[match]
                 grad_img = self._create_gradient_for_mask(
-                    ctx, gradient, width, height, bbox, min_x, min_y, style.opacity
+                    ctx, gradient, width, height, bbox, min_x, min_y,
+                    style.fill_opacity * style.opacity,
+                    element_transform
                 )
                 # Use proper alpha compositing for gradients
                 temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
@@ -1840,15 +1918,18 @@ class SVGRenderer:
                                    gradient, width: int, height: int,
                                    bbox: tuple[float, float, float, float],
                                    offset_x: int, offset_y: int,
-                                   opacity: float) -> Image.Image:
+                                   opacity: float,
+                                   element_transform: Transform = None) -> Image.Image:
         """Create gradient image for use with mask."""
         if isinstance(gradient, LinearGradient):
             return self._create_linear_gradient_image(
-                ctx, gradient, width, height, bbox, offset_x, offset_y, opacity
+                ctx, gradient, width, height, bbox, offset_x, offset_y, opacity,
+                element_transform
             )
         else:
             return self._create_radial_gradient_image(
-                ctx, gradient, width, height, bbox, offset_x, offset_y, opacity
+                ctx, gradient, width, height, bbox, offset_x, offset_y, opacity,
+                element_transform
             )
 
     def _fill_polygon_evenodd(self, ctx: "RenderContext",
@@ -1931,7 +2012,8 @@ class SVGRenderer:
                                     gradient: Union[LinearGradient, RadialGradient],
                                     bbox: tuple[float, float, float, float],
                                     opacity: float,
-                                    fill_rule: str = "nonzero"):
+                                    fill_rule: str = "nonzero",
+                                    element_transform: Transform = None):
         """Fill a polygon with a gradient."""
         if not points or len(points) < 3:
             return
@@ -1960,11 +2042,13 @@ class SVGRenderer:
 
         if isinstance(gradient, LinearGradient):
             grad_img = self._create_linear_gradient_image(
-                ctx, gradient, grad_width, grad_height, bbox, min_x, min_y, opacity
+                ctx, gradient, grad_width, grad_height, bbox, min_x, min_y, opacity,
+                element_transform
             )
         else:
             grad_img = self._create_radial_gradient_image(
-                ctx, gradient, grad_width, grad_height, bbox, min_x, min_y, opacity
+                ctx, gradient, grad_width, grad_height, bbox, min_x, min_y, opacity,
+                element_transform
             )
 
         # Create mask from polygon with fill-rule support
@@ -2027,7 +2111,8 @@ class SVGRenderer:
                                       width: int, height: int,
                                       bbox: tuple[float, float, float, float],
                                       offset_x: int, offset_y: int,
-                                      opacity: float) -> Image.Image:
+                                      opacity: float,
+                                      element_transform: Transform = None) -> Image.Image:
         """Create an image filled with a linear gradient (vectorized)."""
         if not gradient.stops:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -2048,9 +2133,18 @@ class SVGRenderer:
             x1, y1 = gradient.transform.apply(x1, y1)
             x2, y2 = gradient.transform.apply(x2, y2)
 
-        # Apply base transform to get screen coords
-        x1, y1 = ctx.base_transform.apply(x1, y1)
-        x2, y2 = ctx.base_transform.apply(x2, y2)
+        # For userSpaceOnUse, apply element transform then base transform
+        # The gradient coords are in user space, which needs to be transformed
+        # through the element's coordinate system to screen space
+        if gradient.units == "userSpaceOnUse" and element_transform:
+            x1, y1 = element_transform.apply(x1, y1)
+            x2, y2 = element_transform.apply(x2, y2)
+            x1, y1 = ctx.base_transform.apply(x1, y1)
+            x2, y2 = ctx.base_transform.apply(x2, y2)
+        else:
+            # Apply base transform to get screen coords
+            x1, y1 = ctx.base_transform.apply(x1, y1)
+            x2, y2 = ctx.base_transform.apply(x2, y2)
 
         # Direction vector
         dx = x2 - x1
@@ -2081,7 +2175,8 @@ class SVGRenderer:
                                       width: int, height: int,
                                       bbox: tuple[float, float, float, float],
                                       offset_x: int, offset_y: int,
-                                      opacity: float) -> Image.Image:
+                                      opacity: float,
+                                      element_transform: Transform = None) -> Image.Image:
         """Create an image filled with a radial gradient (vectorized)."""
         if not gradient.stops:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -2100,9 +2195,12 @@ class SVGRenderer:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
         # Build combined transform and compute inverse
+        # For userSpaceOnUse, include element transform
         combined_transform = ctx.base_transform
+        if gradient.units == "userSpaceOnUse" and element_transform:
+            combined_transform = ctx.base_transform.multiply(element_transform)
         if gradient.transform:
-            combined_transform = ctx.base_transform.multiply(gradient.transform)
+            combined_transform = combined_transform.multiply(gradient.transform)
 
         det = combined_transform.a * combined_transform.d - combined_transform.b * combined_transform.c
         if abs(det) < 1e-10:

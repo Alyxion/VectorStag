@@ -209,3 +209,4 @@ samples/
 .DS_Store
 .credentials.json
 samples_ext/*
+advanced_svg

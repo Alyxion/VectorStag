@@ -12,14 +12,16 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - **99%+ Accuracy**: 99.8% (3421 files)
 - **95-99%**: 0.2% (6 files)
 - **<80%**: 0.0% (0 files)
-- **Throughput**: ~82 files/sec
+- **Throughput**: ~65 files/sec
 
 ### Flag Test Results (358 Noto flags)
 - **Average Accuracy**: 99.8%
-- **99%+ Accuracy**: 97.8% (350 files)
-- **95-99%**: 1.7% (6 files)
-- **90-95%**: 0.6% (2 files)
+- **99%+ Accuracy**: 99.4% (356 files)
+- **95-99%**: 0.6% (2 files)
+- **90-95%**: 0.0% (0 files)
 - **<80%**: 0.0% (0 files)
+
+**Reference Renderer**: resvg (Rust-based)
 
 ### W3C SVG Samples (30 files)
 - **True Accuracy**: 99.4% (excluding CairoSVG bugs)
@@ -45,6 +47,9 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 7. **Stroke miterlimit** - Apply miterlimit to prevent infinitely long miters
 8. **stroke-dasharray** - Added dashed/dotted stroke support
 9. **Switch element** - Added `<switch>` element support for fallback rendering
+10. **Nested SVG support** - Added `<svg>` element parsing inside other SVGs (SI flag)
+11. **userSpaceOnUse gradient transforms** - Fixed element transform propagation for gradients
+12. **Comparison workflow** - Render at aspect-ratio-preserving size to match resvg output
 
 ---
 
