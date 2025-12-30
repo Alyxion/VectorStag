@@ -3,7 +3,7 @@
 ## Project Goal
 Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG and resvg.
 
-## Current Status: 99.8% Emoji / 99.6% Flag Accuracy
+## Current Status: 100% FontAwesome / 99.8% Emoji / 99.7% Flag Accuracy
 
 **Date**: 2025-12-30
 
@@ -11,7 +11,12 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - **VectorStag**: ~32 files/sec at 400x400 with 4x antialiasing (single-thread)
 - **CairoSVG**: ~41 files/sec (VectorStag is ~0.79x)
 - **Resvg**: ~75 files/sec (VectorStag is ~0.43x)
-- **Multiprocessing**: ~435 files/sec with 14 workers
+- **Multiprocessing**: ~520 files/sec with 14 workers
+
+### FontAwesome Icons (2028 files)
+- **Average Accuracy**: 100.0%
+- **99%+ Accuracy**: 100.0% (2028 files)
+- **<99%**: 0.0% (0 files)
 
 ### Emoji Test Results (3427 Noto emojis)
 - **Average Accuracy**: 99.8%
@@ -19,12 +24,12 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - **95-99%**: 0.1% (4 files)
 - **<80%**: 0.0% (0 files)
 
-### Flag Test Results (305 Noto flags rendered)
-- **Average Accuracy**: 99.6%
-- **99%+ Accuracy**: 97.4% (297 files)
-- **95-99%**: 2.3% (7 files)
+### Flag Test Results (295 Noto flags rendered)
+- **Average Accuracy**: 99.7%
+- **99%+ Accuracy**: 99.3% (293 files)
+- **95-99%**: 0.3% (1 file)
 - **<80%**: 0.3% (1 file - QA.svg edge case at 13.1%)
-- **Errors**: 53 files (complex flags with memory issues)
+- **Errors**: 63 files (complex flags with memory issues)
 
 **Reference Renderer**: resvg (Rust-based)
 
@@ -34,26 +39,17 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - **95-99%**: 42.0% (141 files)
 - **<95%**: 0.0% (0 files)
 
-### FontAwesome Icons (2028 files)
-- **Average Accuracy**: 97.3%
-- **99%+ Accuracy**: 82.3% (1669 files)
-- **95-99%**: 8.6% (174 files)
-- **90-95%**: 2.5% (51 files)
-- **<80%**: 6.5% (132 files - mostly circle/dot icons)
-
 ### Lucide Icons (200 files)
-- **Average Accuracy**: 98.2%
-- **99%+ Accuracy**: 29.5% (59 files)
-- **95-99%**: 67.0% (134 files)
-- **90-95%**: 2.5% (5 files)
-- **80-90%**: 1.0% (2 files)
+- **Average Accuracy**: 98.6%
+- **99%+ Accuracy**: 39.5% (79 files)
+- **95-99%**: 60.5% (121 files)
+- **<95%**: 0.0% (0 files)
 
 ### W3C SVG Samples (30 files)
-- **Average Accuracy**: 98.9% (vs resvg)
-- **99%+ Accuracy**: 83.3% (25 files)
+- **Average Accuracy**: 99.6% (vs resvg)
+- **99%+ Accuracy**: 90.0% (27 files)
 - **95-99%**: 10.0% (3 files)
-- **90-95%**: 3.3% (1 file)
-- **80-90%**: 3.3% (1 file)
+- **<95%**: 0.0% (0 files)
 
 ### Comparison Images
 Comparison grids (VectorStag | resvg | diff) saved to:
@@ -89,6 +85,7 @@ Comparison grids (VectorStag | resvg | diff) saved to:
 ### Bug Fixes (2025-12-30)
 1. **Recursion protection** - Added MAX_PARSE_DEPTH and MAX_RENDER_DEPTH limits to prevent stack overflow
 2. **Circular `<use>` detection** - Track `_use_stack` to prevent infinite loops on circular references
+3. **Arc-to-bezier control point fix** - Fixed Rust `arc_to_bezier` using `half_d.sin()` instead of `d_theta.sin()` for control point calculation. This was causing ~21 pixel errors for large arcs (FontAwesome 97.3% → 100%)
 
 ### Bug Fixes (2025-12-29)
 1. **Gradient alpha compositing** - Fixed `paste` → `alpha_composite` for proper transparency

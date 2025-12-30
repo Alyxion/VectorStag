@@ -1419,7 +1419,7 @@ fn arc_to_bezier(x1: f64, y1: f64, rx: f64, ry: f64,
         // Control point distance
         let half_d = d_theta / 2.0;
         let tan_half = half_d.tan();
-        let alpha = half_d.sin() * ((4.0 + 3.0 * tan_half * tan_half).sqrt() - 1.0) / 3.0;
+        let alpha = d_theta.sin() * ((4.0 + 3.0 * tan_half * tan_half).sqrt() - 1.0) / 3.0;
 
         // Start point
         let cos_t = t.cos();
@@ -1689,7 +1689,7 @@ fn fill_multi_polygon_to_array<'py>(
     let src_a = a as u32;
     let inv_src_a = 255 - src_a;
 
-    // Scanline fill
+    // Scanline fill - use same algorithm as fill_multi_polygon_nonzero
     for y in global_min_y..global_max_y {
         let screen_y = y as f64 + 0.5;
         let mut intersections: Vec<(f64, i32)> = Vec::with_capacity(all_edges.len());
@@ -1705,45 +1705,49 @@ fn fill_multi_polygon_to_array<'py>(
         if intersections.is_empty() { continue; }
         intersections.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-        let mut winding = 0i32;
-        let mut i = 0;
+        // Fill using winding count (same as fill_multi_polygon_nonzero)
+        let mut winding: i32 = 0;
+        let mut prev_x: Option<f64> = None;
 
-        while i < intersections.len() {
-            let x_start = intersections[i].0;
-            winding += intersections[i].1;
+        for (x_int, direction) in intersections {
+            // Check if we should fill from prev_x to current x
+            let should_fill = if fill_rule == 1 {
+                // Even-odd rule: fill when winding is odd
+                winding % 2 != 0
+            } else {
+                // Nonzero rule: fill when winding is not zero
+                winding != 0
+            };
 
-            while i + 1 < intersections.len() {
-                let inside = if fill_rule == 1 { winding % 2 != 0 } else { winding != 0 };
-                if !inside { break; }
-                i += 1;
-                winding += intersections[i].1;
-            }
+            if should_fill {
+                if let Some(px) = prev_x {
+                    let px_start = (px.floor() as usize).max(global_min_x);
+                    let px_end = (x_int.ceil() as usize).min(global_max_x);
 
-            let x_end = if i < intersections.len() { intersections[i].0 } else { x_start };
-            let px_start = (x_start.floor() as usize).max(global_min_x);
-            let px_end = (x_end.ceil() as usize).min(global_max_x);
-
-            for x in px_start..px_end {
-                if src_a == 255 {
-                    dst_arr[[y, x, 0]] = r;
-                    dst_arr[[y, x, 1]] = g;
-                    dst_arr[[y, x, 2]] = b;
-                    dst_arr[[y, x, 3]] = 255;
-                } else {
-                    let dst_a = dst_arr[[y, x, 3]] as u32;
-                    let out_a = src_a + (dst_a * inv_src_a / 255);
-                    if out_a > 0 {
-                        let dst_r = dst_arr[[y, x, 0]] as u32;
-                        let dst_g = dst_arr[[y, x, 1]] as u32;
-                        let dst_b = dst_arr[[y, x, 2]] as u32;
-                        dst_arr[[y, x, 0]] = ((r as u32 * src_a + dst_r * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
-                        dst_arr[[y, x, 1]] = ((g as u32 * src_a + dst_g * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
-                        dst_arr[[y, x, 2]] = ((b as u32 * src_a + dst_b * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
-                        dst_arr[[y, x, 3]] = out_a.min(255) as u8;
+                    for x in px_start..px_end {
+                        if src_a == 255 {
+                            dst_arr[[y, x, 0]] = r;
+                            dst_arr[[y, x, 1]] = g;
+                            dst_arr[[y, x, 2]] = b;
+                            dst_arr[[y, x, 3]] = 255;
+                        } else {
+                            let dst_a = dst_arr[[y, x, 3]] as u32;
+                            let out_a = src_a + (dst_a * inv_src_a / 255);
+                            if out_a > 0 {
+                                let dst_r = dst_arr[[y, x, 0]] as u32;
+                                let dst_g = dst_arr[[y, x, 1]] as u32;
+                                let dst_b = dst_arr[[y, x, 2]] as u32;
+                                dst_arr[[y, x, 0]] = ((r as u32 * src_a + dst_r * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
+                                dst_arr[[y, x, 1]] = ((g as u32 * src_a + dst_g * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
+                                dst_arr[[y, x, 2]] = ((b as u32 * src_a + dst_b * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
+                                dst_arr[[y, x, 3]] = out_a.min(255) as u8;
+                            }
+                        }
                     }
                 }
             }
-            i += 1;
+            winding += direction;
+            prev_x = Some(x_int);
         }
     }
 }
