@@ -1906,6 +1906,1363 @@ fn resize_rgba<'py>(
     dst.into_pyarray(py)
 }
 
+// ============================================================================
+// SVG Filter Primitives
+// ============================================================================
+
+/// feFlood - fill entire region with solid color
+#[pyfunction]
+fn fe_flood<'py>(
+    py: Python<'py>,
+    width: usize,
+    height: usize,
+    r: u8, g: u8, b: u8, a: u8,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let mut pixels = Array3::<u8>::zeros((height, width, 4));
+    for y in 0..height {
+        for x in 0..width {
+            pixels[[y, x, 0]] = r;
+            pixels[[y, x, 1]] = g;
+            pixels[[y, x, 2]] = b;
+            pixels[[y, x, 3]] = a;
+        }
+    }
+    pixels.into_pyarray(py)
+}
+
+/// feOffset - offset image by dx, dy
+#[pyfunction]
+fn fe_offset<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+    dx: i32,
+    dy: i32,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let src_arr = src.as_array();
+    let (h, w, _) = (src_arr.shape()[0], src_arr.shape()[1], src_arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    for y in 0..h {
+        let src_y = y as i32 - dy;
+        if src_y < 0 || src_y >= h as i32 { continue; }
+        for x in 0..w {
+            let src_x = x as i32 - dx;
+            if src_x < 0 || src_x >= w as i32 { continue; }
+            for c in 0..4 {
+                dst[[y, x, c]] = src_arr[[src_y as usize, src_x as usize, c]];
+            }
+        }
+    }
+    dst.into_pyarray(py)
+}
+
+// Helper functions for HSL blend modes
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+
+    if (max - min).abs() < 1e-6 {
+        return (0.0, 0.0, l);
+    }
+
+    let d = max - min;
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+
+    let h = if (max - r).abs() < 1e-6 {
+        let mut h = (g - b) / d;
+        if g < b { h += 6.0; }
+        h
+    } else if (max - g).abs() < 1e-6 {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+
+    (h / 6.0, s, l)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    if s.abs() < 1e-6 {
+        return (l, l, l);
+    }
+
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+
+    fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
+        if t < 0.0 { t += 1.0; }
+        if t > 1.0 { t -= 1.0; }
+        if t < 1.0/6.0 { return p + (q - p) * 6.0 * t; }
+        if t < 1.0/2.0 { return q; }
+        if t < 2.0/3.0 { return p + (q - p) * (2.0/3.0 - t) * 6.0; }
+        p
+    }
+
+    (hue_to_rgb(p, q, h + 1.0/3.0),
+     hue_to_rgb(p, q, h),
+     hue_to_rgb(p, q, h - 1.0/3.0))
+}
+
+fn luminosity(r: f32, g: f32, b: f32) -> f32 {
+    0.3 * r + 0.59 * g + 0.11 * b
+}
+
+fn set_lum(r: f32, g: f32, b: f32, l: f32) -> (f32, f32, f32) {
+    let d = l - luminosity(r, g, b);
+    clip_color(r + d, g + d, b + d)
+}
+
+fn clip_color(mut r: f32, mut g: f32, mut b: f32) -> (f32, f32, f32) {
+    let l = luminosity(r, g, b);
+    let n = r.min(g).min(b);
+    let x = r.max(g).max(b);
+
+    if n < 0.0 {
+        let d = l - n;
+        if d.abs() > 1e-6 {
+            r = l + (r - l) * l / d;
+            g = l + (g - l) * l / d;
+            b = l + (b - l) * l / d;
+        }
+    }
+    if x > 1.0 {
+        let d = x - l;
+        if d.abs() > 1e-6 {
+            r = l + (r - l) * (1.0 - l) / d;
+            g = l + (g - l) * (1.0 - l) / d;
+            b = l + (b - l) * (1.0 - l) / d;
+        }
+    }
+    (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0))
+}
+
+fn saturation(r: f32, g: f32, b: f32) -> f32 {
+    r.max(g).max(b) - r.min(g).min(b)
+}
+
+fn set_sat(r: f32, g: f32, b: f32, s: f32) -> (f32, f32, f32) {
+    // Sort channels by value
+    let mut vals = [(r, 0), (g, 1), (b, 2)];
+    vals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    let (min_v, _) = vals[0];
+    let (mid_v, _) = vals[1];
+    let (max_v, _) = vals[2];
+
+    let mut result = [0.0f32; 3];
+
+    if (max_v - min_v).abs() > 1e-6 {
+        result[vals[1].1] = (mid_v - min_v) * s / (max_v - min_v);
+        result[vals[2].1] = s;
+    }
+    result[vals[0].1] = 0.0;
+
+    (result[0], result[1], result[2])
+}
+
+/// feBlend - blend two images using blend mode
+/// mode: 0=normal, 1=multiply, 2=screen, 3=darken, 4=lighten, 5=overlay,
+///       6=color-dodge, 7=color-burn, 8=hard-light, 9=soft-light, 10=difference, 11=exclusion,
+///       12=hue, 13=saturation, 14=color, 15=luminosity
+#[pyfunction]
+fn fe_blend<'py>(
+    py: Python<'py>,
+    in1: numpy::PyReadonlyArray3<'py, u8>,
+    in2: numpy::PyReadonlyArray3<'py, u8>,
+    mode: u8,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr1 = in1.as_array();
+    let arr2 = in2.as_array();
+    let (h, w, _) = (arr1.shape()[0], arr1.shape()[1], arr1.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    for y in 0..h {
+        for x in 0..w {
+            let a1 = arr1[[y, x, 3]] as f32 / 255.0;
+            let a2 = arr2[[y, x, 3]] as f32 / 255.0;
+
+            let r1 = arr1[[y, x, 0]] as f32 / 255.0;
+            let g1 = arr1[[y, x, 1]] as f32 / 255.0;
+            let b1 = arr1[[y, x, 2]] as f32 / 255.0;
+            let r2 = arr2[[y, x, 0]] as f32 / 255.0;
+            let g2 = arr2[[y, x, 1]] as f32 / 255.0;
+            let b2 = arr2[[y, x, 2]] as f32 / 255.0;
+
+            // HSL-based blend modes (12-15)
+            let (br, bg, bb) = match mode {
+                12 => {  // hue: hue from in1, saturation and luminosity from in2
+                    let (h1, _, _) = rgb_to_hsl(r1, g1, b1);
+                    let (_, s2, _) = rgb_to_hsl(r2, g2, b2);
+                    let l2 = luminosity(r2, g2, b2);
+                    let (r, g, b) = hsl_to_rgb(h1, s2, 0.5);
+                    set_lum(r, g, b, l2)
+                }
+                13 => {  // saturation: saturation from in1, hue and luminosity from in2
+                    let s1 = saturation(r1, g1, b1);
+                    let (h2, _, _) = rgb_to_hsl(r2, g2, b2);
+                    let l2 = luminosity(r2, g2, b2);
+                    let (r, g, b) = set_sat(r2, g2, b2, s1);
+                    set_lum(r, g, b, l2)
+                }
+                14 => {  // color: hue and saturation from in1, luminosity from in2
+                    let l2 = luminosity(r2, g2, b2);
+                    set_lum(r1, g1, b1, l2)
+                }
+                15 => {  // luminosity: luminosity from in1, hue and saturation from in2
+                    let l1 = luminosity(r1, g1, b1);
+                    set_lum(r2, g2, b2, l1)
+                }
+                _ => (0.0, 0.0, 0.0),  // handled per-channel below
+            };
+
+            if mode >= 12 && mode <= 15 {
+                // HSL modes - apply compositing
+                let out_r = br * a1 + r2 * a2 * (1.0 - a1);
+                let out_g = bg * a1 + g2 * a2 * (1.0 - a1);
+                let out_b = bb * a1 + b2 * a2 * (1.0 - a1);
+                dst[[y, x, 0]] = (out_r * 255.0).clamp(0.0, 255.0) as u8;
+                dst[[y, x, 1]] = (out_g * 255.0).clamp(0.0, 255.0) as u8;
+                dst[[y, x, 2]] = (out_b * 255.0).clamp(0.0, 255.0) as u8;
+            } else {
+                // Per-channel modes
+                for c in 0..3 {
+                    let c1 = arr1[[y, x, c]] as f32 / 255.0;
+                    let c2 = arr2[[y, x, c]] as f32 / 255.0;
+
+                    let blended = match mode {
+                        1 => c1 * c2,  // multiply
+                        2 => 1.0 - (1.0 - c1) * (1.0 - c2),  // screen
+                        3 => c1.min(c2),  // darken
+                        4 => c1.max(c2),  // lighten
+                        5 => {  // overlay
+                            if c2 < 0.5 { 2.0 * c1 * c2 }
+                            else { 1.0 - 2.0 * (1.0 - c1) * (1.0 - c2) }
+                        }
+                        6 => {  // color-dodge
+                            if c1 >= 1.0 { 1.0 }
+                            else { (c2 / (1.0 - c1)).min(1.0) }
+                        }
+                        7 => {  // color-burn
+                            if c1 <= 0.0 { 0.0 }
+                            else { 1.0 - ((1.0 - c2) / c1).min(1.0) }
+                        }
+                        8 => {  // hard-light
+                            if c1 < 0.5 { 2.0 * c1 * c2 }
+                            else { 1.0 - 2.0 * (1.0 - c1) * (1.0 - c2) }
+                        }
+                        9 => {  // soft-light
+                            if c1 < 0.5 { c2 - (1.0 - 2.0 * c1) * c2 * (1.0 - c2) }
+                            else {
+                                let d = if c2 <= 0.25 { ((16.0 * c2 - 12.0) * c2 + 4.0) * c2 }
+                                        else { c2.sqrt() };
+                                c2 + (2.0 * c1 - 1.0) * (d - c2)
+                            }
+                        }
+                        10 => (c1 - c2).abs(),  // difference
+                        11 => c1 + c2 - 2.0 * c1 * c2,  // exclusion
+                        _ => c1,  // normal - just use c1
+                    };
+
+                    // Alpha composite the blended result
+                    let out = blended * a1 + c2 * a2 * (1.0 - a1);
+                    dst[[y, x, c]] = (out * 255.0).clamp(0.0, 255.0) as u8;
+                }
+            }
+
+            // Alpha: standard over
+            let out_a = a1 + a2 * (1.0 - a1);
+            dst[[y, x, 3]] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
+        }
+    }
+    dst.into_pyarray(py)
+}
+
+/// feComposite - Porter-Duff compositing
+/// operator: 0=over, 1=in, 2=out, 3=atop, 4=xor, 5=arithmetic
+#[pyfunction]
+fn fe_composite<'py>(
+    py: Python<'py>,
+    in1: numpy::PyReadonlyArray3<'py, u8>,
+    in2: numpy::PyReadonlyArray3<'py, u8>,
+    operator: u8,
+    k1: f32, k2: f32, k3: f32, k4: f32,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr1 = in1.as_array();
+    let arr2 = in2.as_array();
+    let (h, w, _) = (arr1.shape()[0], arr1.shape()[1], arr1.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    for y in 0..h {
+        for x in 0..w {
+            let a1 = arr1[[y, x, 3]] as f32 / 255.0;
+            let a2 = arr2[[y, x, 3]] as f32 / 255.0;
+
+            let (fa, fb) = match operator {
+                0 => (1.0, 1.0 - a1),  // over
+                1 => (a2, 0.0),  // in
+                2 => (1.0 - a2, 0.0),  // out
+                3 => (a2, 1.0 - a1),  // atop
+                4 => (1.0 - a2, 1.0 - a1),  // xor
+                5 => (0.0, 0.0),  // arithmetic (handled separately)
+                _ => (1.0, 1.0 - a1),  // default: over
+            };
+
+            for c in 0..4 {
+                let c1 = arr1[[y, x, c]] as f32 / 255.0;
+                let c2 = arr2[[y, x, c]] as f32 / 255.0;
+
+                let out = if operator == 5 {
+                    // arithmetic: result = k1*i1*i2 + k2*i1 + k3*i2 + k4
+                    k1 * c1 * c2 + k2 * c1 + k3 * c2 + k4
+                } else {
+                    c1 * fa + c2 * fb
+                };
+
+                dst[[y, x, c]] = (out * 255.0).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    dst.into_pyarray(py)
+}
+
+/// feMerge - merge multiple layers (simple alpha composite stack)
+#[pyfunction]
+fn fe_merge<'py>(
+    py: Python<'py>,
+    layers: Vec<numpy::PyReadonlyArray3<'py, u8>>,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+
+    if layers.is_empty() {
+        return Array3::<u8>::zeros((1, 1, 4)).into_pyarray(py);
+    }
+
+    let first = layers[0].as_array();
+    let (h, w, _) = (first.shape()[0], first.shape()[1], first.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    // Copy first layer
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..4 {
+                dst[[y, x, c]] = first[[y, x, c]];
+            }
+        }
+    }
+
+    // Composite remaining layers on top
+    for layer in layers.iter().skip(1) {
+        let src = layer.as_array();
+        for y in 0..h {
+            for x in 0..w {
+                let src_a = src[[y, x, 3]] as f32 / 255.0;
+                if src_a == 0.0 { continue; }
+
+                let dst_a = dst[[y, x, 3]] as f32 / 255.0;
+                let out_a = src_a + dst_a * (1.0 - src_a);
+
+                if out_a > 0.0 {
+                    for c in 0..3 {
+                        let src_c = src[[y, x, c]] as f32 / 255.0;
+                        let dst_c = dst[[y, x, c]] as f32 / 255.0;
+                        let out_c = (src_c * src_a + dst_c * dst_a * (1.0 - src_a)) / out_a;
+                        dst[[y, x, c]] = (out_c * 255.0).clamp(0.0, 255.0) as u8;
+                    }
+                    dst[[y, x, 3]] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// feColorMatrix - apply color transformation matrix
+/// type: 0=matrix, 1=saturate, 2=hueRotate, 3=luminanceToAlpha
+#[pyfunction]
+fn fe_color_matrix<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+    matrix_type: u8,
+    values: Vec<f32>,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr = src.as_array();
+    let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    // Build 5x4 matrix based on type
+    let mut m = [[0.0f32; 5]; 4];
+
+    match matrix_type {
+        0 => {
+            // matrix: values is 20 floats for 5x4 matrix (row-major, rows are RGBA output)
+            // Default to identity if values is empty or incomplete
+            if values.is_empty() {
+                m[0] = [1.0, 0.0, 0.0, 0.0, 0.0];
+                m[1] = [0.0, 1.0, 0.0, 0.0, 0.0];
+                m[2] = [0.0, 0.0, 1.0, 0.0, 0.0];
+                m[3] = [0.0, 0.0, 0.0, 1.0, 0.0];
+            } else {
+                for i in 0..4 {
+                    for j in 0..5 {
+                        let idx = i * 5 + j;
+                        // Default to identity matrix values for missing entries
+                        let default = if i == j { 1.0 } else { 0.0 };
+                        m[i][j] = if idx < values.len() { values[idx] } else { default };
+                    }
+                }
+            }
+        }
+        1 => {
+            // saturate: single value 0-1
+            let s = if !values.is_empty() { values[0] } else { 1.0 };
+            // Saturate matrix
+            m[0] = [0.213 + 0.787 * s, 0.715 - 0.715 * s, 0.072 - 0.072 * s, 0.0, 0.0];
+            m[1] = [0.213 - 0.213 * s, 0.715 + 0.285 * s, 0.072 - 0.072 * s, 0.0, 0.0];
+            m[2] = [0.213 - 0.213 * s, 0.715 - 0.715 * s, 0.072 + 0.928 * s, 0.0, 0.0];
+            m[3] = [0.0, 0.0, 0.0, 1.0, 0.0];
+        }
+        2 => {
+            // hueRotate: angle in degrees
+            let angle = if !values.is_empty() { values[0].to_radians() } else { 0.0 };
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+
+            m[0] = [0.213 + cos_a * 0.787 - sin_a * 0.213,
+                    0.715 - cos_a * 0.715 - sin_a * 0.715,
+                    0.072 - cos_a * 0.072 + sin_a * 0.928, 0.0, 0.0];
+            m[1] = [0.213 - cos_a * 0.213 + sin_a * 0.143,
+                    0.715 + cos_a * 0.285 + sin_a * 0.140,
+                    0.072 - cos_a * 0.072 - sin_a * 0.283, 0.0, 0.0];
+            m[2] = [0.213 - cos_a * 0.213 - sin_a * 0.787,
+                    0.715 - cos_a * 0.715 + sin_a * 0.715,
+                    0.072 + cos_a * 0.928 + sin_a * 0.072, 0.0, 0.0];
+            m[3] = [0.0, 0.0, 0.0, 1.0, 0.0];
+        }
+        3 => {
+            // luminanceToAlpha
+            m[0] = [0.0, 0.0, 0.0, 0.0, 0.0];
+            m[1] = [0.0, 0.0, 0.0, 0.0, 0.0];
+            m[2] = [0.0, 0.0, 0.0, 0.0, 0.0];
+            m[3] = [0.2126, 0.7152, 0.0722, 0.0, 0.0];
+        }
+        _ => {
+            // Identity matrix
+            m[0] = [1.0, 0.0, 0.0, 0.0, 0.0];
+            m[1] = [0.0, 1.0, 0.0, 0.0, 0.0];
+            m[2] = [0.0, 0.0, 1.0, 0.0, 0.0];
+            m[3] = [0.0, 0.0, 0.0, 1.0, 0.0];
+        }
+    }
+
+    for y in 0..h {
+        for x in 0..w {
+            let r = arr[[y, x, 0]] as f32 / 255.0;
+            let g = arr[[y, x, 1]] as f32 / 255.0;
+            let b = arr[[y, x, 2]] as f32 / 255.0;
+            let a = arr[[y, x, 3]] as f32 / 255.0;
+
+            for c in 0..4 {
+                let out = m[c][0] * r + m[c][1] * g + m[c][2] * b + m[c][3] * a + m[c][4];
+                dst[[y, x, c]] = (out * 255.0).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// feComponentTransfer - apply transfer function to each channel
+/// func_type per channel: 0=identity, 1=table, 2=discrete, 3=linear, 4=gamma
+#[pyfunction]
+fn fe_component_transfer<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+    func_r: (u8, Vec<f32>, f32, f32, f32, f32, f32),  // (type, table, slope, intercept, amplitude, exponent, offset)
+    func_g: (u8, Vec<f32>, f32, f32, f32, f32, f32),
+    func_b: (u8, Vec<f32>, f32, f32, f32, f32, f32),
+    func_a: (u8, Vec<f32>, f32, f32, f32, f32, f32),
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr = src.as_array();
+    let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    fn apply_transfer(val: f32, func: &(u8, Vec<f32>, f32, f32, f32, f32, f32)) -> f32 {
+        let (func_type, table, slope, intercept, amplitude, exponent, offset) = func;
+        match func_type {
+            0 => val,  // identity
+            1 => {  // table
+                if table.len() < 2 { return val; }
+                let n = table.len() - 1;
+                let k = (val * n as f32).floor() as usize;
+                let k = k.min(n - 1);
+                let frac = val * n as f32 - k as f32;
+                table[k] * (1.0 - frac) + table[k + 1] * frac
+            }
+            2 => {  // discrete
+                if table.is_empty() { return val; }
+                let n = table.len();
+                let k = (val * n as f32).floor() as usize;
+                let k = k.min(n - 1);
+                table[k]
+            }
+            3 => slope * val + intercept,  // linear
+            4 => amplitude * val.powf(*exponent) + offset,  // gamma
+            _ => val,
+        }
+    }
+
+    let funcs = [&func_r, &func_g, &func_b, &func_a];
+
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..4 {
+                let val = arr[[y, x, c]] as f32 / 255.0;
+                let out = apply_transfer(val, funcs[c]);
+                dst[[y, x, c]] = (out * 255.0).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// feMorphology - erode or dilate
+/// operator: 0=erode, 1=dilate
+#[pyfunction]
+fn fe_morphology<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+    operator: u8,
+    radius_x: f32,
+    radius_y: f32,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr = src.as_array();
+    let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    // Clamp radius to prevent extremely slow operations (max 20 for reasonable speed)
+    let rx = (radius_x.round() as i32).min(20);
+    let ry = (radius_y.round() as i32).min(20);
+
+    if rx <= 0 && ry <= 0 {
+        // No morphology - just copy
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..4 {
+                    dst[[y, x, c]] = arr[[y, x, c]];
+                }
+            }
+        }
+        return dst.into_pyarray(py);
+    }
+
+    for y in 0..h {
+        for x in 0..w {
+            let mut best = if operator == 0 { [255u8; 4] } else { [0u8; 4] };
+
+            for dy in -ry..=ry {
+                let ny = y as i32 + dy;
+                if ny < 0 || ny >= h as i32 { continue; }
+
+                for dx in -rx..=rx {
+                    let nx = x as i32 + dx;
+                    if nx < 0 || nx >= w as i32 { continue; }
+
+                    for c in 0..4 {
+                        let val = arr[[ny as usize, nx as usize, c]];
+                        if operator == 0 {
+                            best[c] = best[c].min(val);
+                        } else {
+                            best[c] = best[c].max(val);
+                        }
+                    }
+                }
+            }
+
+            for c in 0..4 {
+                dst[[y, x, c]] = best[c];
+            }
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// feConvolveMatrix - apply convolution kernel
+#[pyfunction]
+fn fe_convolve_matrix<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+    order_x: usize,
+    order_y: usize,
+    kernel: Vec<f32>,
+    divisor: f32,
+    bias: f32,
+    target_x: usize,
+    target_y: usize,
+    edge_mode: u8,  // 0=duplicate, 1=wrap, 2=none
+    preserve_alpha: bool,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr = src.as_array();
+    let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    let div = if divisor.abs() < 1e-10 { 1.0 } else { divisor };
+
+    for y in 0..h {
+        for x in 0..w {
+            let channels = if preserve_alpha { 3 } else { 4 };
+
+            for c in 0..channels {
+                let mut sum = 0.0f32;
+
+                for ky in 0..order_y {
+                    for kx in 0..order_x {
+                        let sy = y as i32 + ky as i32 - target_y as i32;
+                        let sx = x as i32 + kx as i32 - target_x as i32;
+
+                        let (sy, sx) = match edge_mode {
+                            0 => (sy.clamp(0, h as i32 - 1), sx.clamp(0, w as i32 - 1)),  // duplicate
+                            1 => (sy.rem_euclid(h as i32), sx.rem_euclid(w as i32)),  // wrap
+                            _ => {
+                                if sy < 0 || sy >= h as i32 || sx < 0 || sx >= w as i32 {
+                                    continue;
+                                }
+                                (sy, sx)
+                            }
+                        };
+
+                        let kernel_idx = ky * order_x + kx;
+                        if kernel_idx < kernel.len() {
+                            let val = arr[[sy as usize, sx as usize, c]] as f32 / 255.0;
+                            sum += val * kernel[kernel_idx];
+                        }
+                    }
+                }
+
+                let out = sum / div + bias;
+                dst[[y, x, c]] = (out * 255.0).clamp(0.0, 255.0) as u8;
+            }
+
+            if preserve_alpha {
+                dst[[y, x, 3]] = arr[[y, x, 3]];
+            }
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// feTurbulence - generate Perlin noise
+/// type: 0=turbulence, 1=fractalNoise
+#[pyfunction]
+fn fe_turbulence<'py>(
+    py: Python<'py>,
+    width: usize,
+    height: usize,
+    base_freq_x: f64,
+    base_freq_y: f64,
+    num_octaves: usize,
+    seed: i32,
+    noise_type: u8,  // 0=turbulence, 1=fractalNoise
+    stitch_tiles: bool,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let mut pixels = Array3::<u8>::zeros((height, width, 4));
+
+    // Simple Perlin noise implementation
+    // Use seed for deterministic random gradients
+    let gradients = generate_gradients(seed);
+
+    for y in 0..height {
+        for x in 0..width {
+            for c in 0..4 {
+                let mut noise = 0.0f64;
+                let mut amplitude = 1.0f64;
+                let mut freq_x = base_freq_x;
+                let mut freq_y = base_freq_y;
+
+                for _ in 0..num_octaves {
+                    let nx = x as f64 * freq_x;
+                    let ny = y as f64 * freq_y;
+
+                    let n = perlin_noise(nx, ny, c, &gradients);
+
+                    if noise_type == 0 {
+                        noise += n.abs() * amplitude;  // turbulence
+                    } else {
+                        noise += n * amplitude;  // fractalNoise
+                    }
+
+                    amplitude *= 0.5;
+                    freq_x *= 2.0;
+                    freq_y *= 2.0;
+                }
+
+                // Map to 0-255
+                let val = if noise_type == 0 {
+                    noise  // already 0-1 for turbulence
+                } else {
+                    (noise + 1.0) * 0.5  // -1 to 1 -> 0 to 1 for fractalNoise
+                };
+
+                pixels[[y, x, c]] = (val * 255.0).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    pixels.into_pyarray(py)
+}
+
+fn generate_gradients(seed: i32) -> [[f64; 2]; 256] {
+    let mut gradients = [[0.0f64; 2]; 256];
+    let mut rng = seed as u32;
+
+    for i in 0..256 {
+        // Simple LCG random number generator
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        let angle = (rng as f64 / u32::MAX as f64) * std::f64::consts::PI * 2.0;
+        gradients[i] = [angle.cos(), angle.sin()];
+    }
+
+    gradients
+}
+
+fn perlin_noise(x: f64, y: f64, channel: usize, gradients: &[[f64; 2]; 256]) -> f64 {
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+
+    let fx = x - x0 as f64;
+    let fy = y - y0 as f64;
+
+    // Fade curves
+    let u = fx * fx * (3.0 - 2.0 * fx);
+    let v = fy * fy * (3.0 - 2.0 * fy);
+
+    // Hash coordinates
+    let hash = |x: i32, y: i32, c: usize| -> usize {
+        (((x.wrapping_mul(1619) ^ y.wrapping_mul(31337) ^ (c as i32 * 6971)) & 0xFF) as usize)
+    };
+
+    let g00 = &gradients[hash(x0, y0, channel)];
+    let g10 = &gradients[hash(x1, y0, channel)];
+    let g01 = &gradients[hash(x0, y1, channel)];
+    let g11 = &gradients[hash(x1, y1, channel)];
+
+    // Dot products
+    let n00 = g00[0] * fx + g00[1] * fy;
+    let n10 = g10[0] * (fx - 1.0) + g10[1] * fy;
+    let n01 = g01[0] * fx + g01[1] * (fy - 1.0);
+    let n11 = g11[0] * (fx - 1.0) + g11[1] * (fy - 1.0);
+
+    // Interpolate
+    let nx0 = n00 + u * (n10 - n00);
+    let nx1 = n01 + u * (n11 - n01);
+
+    nx0 + v * (nx1 - nx0)
+}
+
+/// feDisplacementMap - displace pixels using map
+/// x_channel/y_channel: 0=R, 1=G, 2=B, 3=A
+#[pyfunction]
+fn fe_displacement_map<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+    map: numpy::PyReadonlyArray3<'py, u8>,
+    scale: f32,
+    x_channel: u8,
+    y_channel: u8,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let src_arr = src.as_array();
+    let map_arr = map.as_array();
+    let (h, w, _) = (src_arr.shape()[0], src_arr.shape()[1], src_arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    for y in 0..h {
+        for x in 0..w {
+            // Get displacement values from map
+            let dx_val = map_arr[[y, x, x_channel as usize]] as f32 / 255.0 - 0.5;
+            let dy_val = map_arr[[y, x, y_channel as usize]] as f32 / 255.0 - 0.5;
+
+            let src_x = x as f32 + dx_val * scale;
+            let src_y = y as f32 + dy_val * scale;
+
+            // Bilinear interpolation
+            let x0 = src_x.floor() as i32;
+            let y0 = src_y.floor() as i32;
+            let x1 = x0 + 1;
+            let y1 = y0 + 1;
+
+            let fx = src_x - x0 as f32;
+            let fy = src_y - y0 as f32;
+
+            for c in 0..4 {
+                let get_pixel = |px: i32, py: i32| -> f32 {
+                    if px < 0 || px >= w as i32 || py < 0 || py >= h as i32 {
+                        0.0
+                    } else {
+                        src_arr[[py as usize, px as usize, c]] as f32
+                    }
+                };
+
+                let v00 = get_pixel(x0, y0);
+                let v10 = get_pixel(x1, y0);
+                let v01 = get_pixel(x0, y1);
+                let v11 = get_pixel(x1, y1);
+
+                let v0 = v00 + fx * (v10 - v00);
+                let v1 = v01 + fx * (v11 - v01);
+                let v = v0 + fy * (v1 - v0);
+
+                dst[[y, x, c]] = v.clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// feTile - tile input image to fill region
+#[pyfunction]
+fn fe_tile<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+    out_width: usize,
+    out_height: usize,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let src_arr = src.as_array();
+    let (src_h, src_w, _) = (src_arr.shape()[0], src_arr.shape()[1], src_arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((out_height, out_width, 4));
+
+    if src_h == 0 || src_w == 0 {
+        return dst.into_pyarray(py);
+    }
+
+    for y in 0..out_height {
+        let src_y = y % src_h;
+        for x in 0..out_width {
+            let src_x = x % src_w;
+            for c in 0..4 {
+                dst[[y, x, c]] = src_arr[[src_y, src_x, c]];
+            }
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// feDiffuseLighting - diffuse lighting effect
+#[pyfunction]
+fn fe_diffuse_lighting<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,  // bump map (uses alpha channel)
+    surface_scale: f32,
+    diffuse_constant: f32,
+    light_color: (u8, u8, u8),
+    // Light source parameters
+    light_type: u8,  // 0=distant, 1=point, 2=spot
+    azimuth: f32, elevation: f32,  // for distant
+    light_x: f32, light_y: f32, light_z: f32,  // for point/spot
+    points_at_x: f32, points_at_y: f32, points_at_z: f32,  // for spot
+    specular_exponent: f32, limiting_cone_angle: f32,  // for spot
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr = src.as_array();
+    let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    // Compute light vector for distant light
+    let (lx, ly, lz) = if light_type == 0 {
+        let az = azimuth.to_radians();
+        let el = elevation.to_radians();
+        (az.cos() * el.cos(), az.sin() * el.cos(), el.sin())
+    } else {
+        (0.0, 0.0, 0.0)  // Will be computed per-pixel for point/spot
+    };
+
+    for y in 0..h {
+        for x in 0..w {
+            // Compute normal from bump map (using Sobel-like filter)
+            let get_height = |px: i32, py: i32| -> f32 {
+                if px < 0 || px >= w as i32 || py < 0 || py >= h as i32 {
+                    return 0.0;
+                }
+                arr[[py as usize, px as usize, 3]] as f32 / 255.0 * surface_scale
+            };
+
+            let ix = x as i32;
+            let iy = y as i32;
+
+            // Sobel gradients
+            let dx = get_height(ix + 1, iy) - get_height(ix - 1, iy);
+            let dy = get_height(ix, iy + 1) - get_height(ix, iy - 1);
+
+            // Normal vector (pointing up)
+            let nx = -dx;
+            let ny = -dy;
+            let nz = 1.0f32;
+            let n_len = (nx * nx + ny * ny + nz * nz).sqrt();
+            let (nx, ny, nz) = (nx / n_len, ny / n_len, nz / n_len);
+
+            // Light vector
+            let (lx, ly, lz) = if light_type == 1 || light_type == 2 {
+                // Point or spot light
+                let dx = light_x - x as f32;
+                let dy = light_y - y as f32;
+                let dz = light_z - get_height(ix, iy);
+                let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
+                (dx / len, dy / len, dz / len)
+            } else {
+                (lx, ly, lz)
+            };
+
+            // N dot L
+            let n_dot_l = (nx * lx + ny * ly + nz * lz).max(0.0);
+
+            // Apply spot light cone
+            let intensity = if light_type == 2 {
+                // Spot direction
+                let sx = points_at_x - light_x;
+                let sy = points_at_y - light_y;
+                let sz = points_at_z - light_z;
+                let s_len = (sx * sx + sy * sy + sz * sz).sqrt().max(1e-6);
+                let (sx, sy, sz) = (sx / s_len, sy / s_len, sz / s_len);
+
+                // -L dot S
+                let l_dot_s = -(lx * sx + ly * sy + lz * sz);
+                let cone_cos = limiting_cone_angle.to_radians().cos();
+
+                if l_dot_s < cone_cos {
+                    0.0
+                } else {
+                    l_dot_s.powf(specular_exponent)
+                }
+            } else {
+                1.0
+            };
+
+            let diffuse = n_dot_l * diffuse_constant * intensity;
+
+            dst[[y, x, 0]] = (light_color.0 as f32 * diffuse).clamp(0.0, 255.0) as u8;
+            dst[[y, x, 1]] = (light_color.1 as f32 * diffuse).clamp(0.0, 255.0) as u8;
+            dst[[y, x, 2]] = (light_color.2 as f32 * diffuse).clamp(0.0, 255.0) as u8;
+            dst[[y, x, 3]] = 255;
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// feSpecularLighting - specular lighting effect
+#[pyfunction]
+fn fe_specular_lighting<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,  // bump map
+    surface_scale: f32,
+    specular_constant: f32,
+    specular_exponent_param: f32,
+    light_color: (u8, u8, u8),
+    light_type: u8,
+    azimuth: f32, elevation: f32,
+    light_x: f32, light_y: f32, light_z: f32,
+    points_at_x: f32, points_at_y: f32, points_at_z: f32,
+    spot_exponent: f32, limiting_cone_angle: f32,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr = src.as_array();
+    let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    // Eye vector (looking down Z axis)
+    let (ex, ey, ez) = (0.0f32, 0.0, 1.0);
+
+    let (lx, ly, lz) = if light_type == 0 {
+        let az = azimuth.to_radians();
+        let el = elevation.to_radians();
+        (az.cos() * el.cos(), az.sin() * el.cos(), el.sin())
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+
+    for y in 0..h {
+        for x in 0..w {
+            let get_height = |px: i32, py: i32| -> f32 {
+                if px < 0 || px >= w as i32 || py < 0 || py >= h as i32 {
+                    return 0.0;
+                }
+                arr[[py as usize, px as usize, 3]] as f32 / 255.0 * surface_scale
+            };
+
+            let ix = x as i32;
+            let iy = y as i32;
+
+            let dx = get_height(ix + 1, iy) - get_height(ix - 1, iy);
+            let dy = get_height(ix, iy + 1) - get_height(ix, iy - 1);
+
+            let nx = -dx;
+            let ny = -dy;
+            let nz = 1.0f32;
+            let n_len = (nx * nx + ny * ny + nz * nz).sqrt();
+            let (nx, ny, nz) = (nx / n_len, ny / n_len, nz / n_len);
+
+            let (lx, ly, lz) = if light_type == 1 || light_type == 2 {
+                let dx = light_x - x as f32;
+                let dy = light_y - y as f32;
+                let dz = light_z - get_height(ix, iy);
+                let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
+                (dx / len, dy / len, dz / len)
+            } else {
+                (lx, ly, lz)
+            };
+
+            // Half vector
+            let hx = lx + ex;
+            let hy = ly + ey;
+            let hz = lz + ez;
+            let h_len = (hx * hx + hy * hy + hz * hz).sqrt().max(1e-6);
+            let (hx, hy, hz) = (hx / h_len, hy / h_len, hz / h_len);
+
+            // N dot H
+            let n_dot_h = (nx * hx + ny * hy + nz * hz).max(0.0);
+
+            let intensity = if light_type == 2 {
+                let sx = points_at_x - light_x;
+                let sy = points_at_y - light_y;
+                let sz = points_at_z - light_z;
+                let s_len = (sx * sx + sy * sy + sz * sz).sqrt().max(1e-6);
+                let (sx, sy, sz) = (sx / s_len, sy / s_len, sz / s_len);
+                let l_dot_s = -(lx * sx + ly * sy + lz * sz);
+                let cone_cos = limiting_cone_angle.to_radians().cos();
+                if l_dot_s < cone_cos { 0.0 } else { l_dot_s.powf(spot_exponent) }
+            } else {
+                1.0
+            };
+
+            let specular = n_dot_h.powf(specular_exponent_param) * specular_constant * intensity;
+
+            dst[[y, x, 0]] = (light_color.0 as f32 * specular).clamp(0.0, 255.0) as u8;
+            dst[[y, x, 1]] = (light_color.1 as f32 * specular).clamp(0.0, 255.0) as u8;
+            dst[[y, x, 2]] = (light_color.2 as f32 * specular).clamp(0.0, 255.0) as u8;
+            // Alpha = max(R, G, B) for specular
+            let max_rgb = dst[[y, x, 0]].max(dst[[y, x, 1]]).max(dst[[y, x, 2]]);
+            dst[[y, x, 3]] = max_rgb;
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// feGaussianBlur - optimized Gaussian blur using box blur approximation
+#[pyfunction]
+fn fe_gaussian_blur<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+    std_dev_x: f32,
+    std_dev_y: f32,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr = src.as_array();
+    let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+
+    if std_dev_x < 0.5 && std_dev_y < 0.5 {
+        // No blur needed - just copy
+        let mut dst = Array3::<u8>::zeros((h, w, 4));
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..4 {
+                    dst[[y, x, c]] = arr[[y, x, c]];
+                }
+            }
+        }
+        return dst.into_pyarray(py);
+    }
+
+    // Clamp stdDev to reasonable range to prevent huge blur radii
+    let std_dev_x = std_dev_x.min(100.0);
+    let std_dev_y = std_dev_y.min(100.0);
+
+    // Box blur radius approximation for Gaussian (3 passes)
+    let box_radius_x = ((12.0 * std_dev_x * std_dev_x / 3.0).sqrt() + 0.5).floor() as usize;
+    let box_radius_y = ((12.0 * std_dev_y * std_dev_y / 3.0).sqrt() + 0.5).floor() as usize;
+
+    // Premultiply alpha for correct blending
+    let mut data = vec![0.0f32; h * w * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) * 4;
+            let a = arr[[y, x, 3]] as f32 / 255.0;
+            data[idx] = arr[[y, x, 0]] as f32 * a;
+            data[idx + 1] = arr[[y, x, 1]] as f32 * a;
+            data[idx + 2] = arr[[y, x, 2]] as f32 * a;
+            data[idx + 3] = arr[[y, x, 3]] as f32;
+        }
+    }
+
+    // Apply 3 passes of box blur using O(1) sliding window
+    for _ in 0..3 {
+        // Horizontal pass with sliding window
+        if box_radius_x > 0 {
+            let mut next = vec![0.0f32; h * w * 4];
+            for y in 0..h {
+                let mut sum = [0.0f32; 4];
+                // Initialize window
+                let window_size = (box_radius_x * 2 + 1).min(w);
+                for i in 0..window_size.min(box_radius_x + 1) {
+                    let idx = (y * w + i) * 4;
+                    for c in 0..4 { sum[c] += data[idx + c]; }
+                }
+                let mut left = 0i32 - box_radius_x as i32;
+                let mut right = box_radius_x as i32;
+
+                for x in 0..w {
+                    // Add right pixel
+                    if right < w as i32 && right > x as i32 {
+                        let idx = (y * w + right as usize) * 4;
+                        for c in 0..4 { sum[c] += data[idx + c]; }
+                    }
+
+                    // Compute count (pixels in window)
+                    let count = (right.min(w as i32 - 1) - left.max(0) + 1) as f32;
+
+                    let idx = (y * w + x) * 4;
+                    for c in 0..4 {
+                        next[idx + c] = sum[c] / count;
+                    }
+
+                    // Remove left pixel
+                    if left >= 0 {
+                        let idx = (y * w + left as usize) * 4;
+                        for c in 0..4 { sum[c] -= data[idx + c]; }
+                    }
+
+                    left += 1;
+                    right += 1;
+                }
+            }
+            data = next;
+        }
+
+        // Vertical pass with sliding window
+        if box_radius_y > 0 {
+            let mut next = vec![0.0f32; h * w * 4];
+            for x in 0..w {
+                let mut sum = [0.0f32; 4];
+                // Initialize window
+                for i in 0..box_radius_y.min(h) + 1 {
+                    let idx = (i * w + x) * 4;
+                    for c in 0..4 { sum[c] += data[idx + c]; }
+                }
+                let mut top = 0i32 - box_radius_y as i32;
+                let mut bottom = box_radius_y as i32;
+
+                for y in 0..h {
+                    // Add bottom pixel
+                    if bottom < h as i32 && bottom > y as i32 {
+                        let idx = (bottom as usize * w + x) * 4;
+                        for c in 0..4 { sum[c] += data[idx + c]; }
+                    }
+
+                    // Compute count
+                    let count = (bottom.min(h as i32 - 1) - top.max(0) + 1) as f32;
+
+                    let idx = (y * w + x) * 4;
+                    for c in 0..4 {
+                        next[idx + c] = sum[c] / count;
+                    }
+
+                    // Remove top pixel
+                    if top >= 0 {
+                        let idx = (top as usize * w + x) * 4;
+                        for c in 0..4 { sum[c] -= data[idx + c]; }
+                    }
+
+                    top += 1;
+                    bottom += 1;
+                }
+            }
+            data = next;
+        }
+    }
+
+    // Un-premultiply alpha
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) * 4;
+            let a = data[idx + 3];
+
+            if a > 0.0 {
+                dst[[y, x, 0]] = (data[idx] * 255.0 / a).clamp(0.0, 255.0) as u8;
+                dst[[y, x, 1]] = (data[idx + 1] * 255.0 / a).clamp(0.0, 255.0) as u8;
+                dst[[y, x, 2]] = (data[idx + 2] * 255.0 / a).clamp(0.0, 255.0) as u8;
+                dst[[y, x, 3]] = a.clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// feDropShadow - create drop shadow effect (SVG2 shorthand)
+#[pyfunction]
+fn fe_drop_shadow<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+    dx: f32,
+    dy: f32,
+    std_dev_x: f32,
+    std_dev_y: f32,
+    flood_r: u8, flood_g: u8, flood_b: u8, flood_a: u8,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr = src.as_array();
+    let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+
+    // Create shadow: offset the alpha channel, blur it, colorize, then composite original on top
+    let dx_i = dx.round() as i32;
+    let dy_i = dy.round() as i32;
+
+    // Clamp stdDev
+    let std_dev_x = std_dev_x.min(100.0);
+    let std_dev_y = std_dev_y.min(100.0);
+
+    // Step 1: Create offset alpha as float for blur
+    let mut alpha = vec![0.0f32; h * w];
+    for y in 0..h {
+        let src_y = y as i32 - dy_i;
+        if src_y < 0 || src_y >= h as i32 { continue; }
+        for x in 0..w {
+            let src_x = x as i32 - dx_i;
+            if src_x < 0 || src_x >= w as i32 { continue; }
+            let a = arr[[src_y as usize, src_x as usize, 3]] as f32;
+            alpha[y * w + x] = a * (flood_a as f32 / 255.0);
+        }
+    }
+
+    // Step 2: Blur alpha with O(1) sliding window
+    if std_dev_x >= 0.5 || std_dev_y >= 0.5 {
+        let box_radius_x = ((12.0 * std_dev_x * std_dev_x / 3.0).sqrt() + 0.5).floor() as usize;
+        let box_radius_y = ((12.0 * std_dev_y * std_dev_y / 3.0).sqrt() + 0.5).floor() as usize;
+
+        for _ in 0..3 {
+            // Horizontal pass
+            if box_radius_x > 0 {
+                let mut next = vec![0.0f32; h * w];
+                for y in 0..h {
+                    let mut sum = 0.0f32;
+                    for i in 0..box_radius_x.min(w) + 1 {
+                        sum += alpha[y * w + i];
+                    }
+                    let mut left = 0i32 - box_radius_x as i32;
+                    let mut right = box_radius_x as i32;
+
+                    for x in 0..w {
+                        if right < w as i32 && right > x as i32 {
+                            sum += alpha[y * w + right as usize];
+                        }
+                        let count = (right.min(w as i32 - 1) - left.max(0) + 1) as f32;
+                        next[y * w + x] = sum / count;
+                        if left >= 0 {
+                            sum -= alpha[y * w + left as usize];
+                        }
+                        left += 1;
+                        right += 1;
+                    }
+                }
+                alpha = next;
+            }
+
+            // Vertical pass
+            if box_radius_y > 0 {
+                let mut next = vec![0.0f32; h * w];
+                for x in 0..w {
+                    let mut sum = 0.0f32;
+                    for i in 0..box_radius_y.min(h) + 1 {
+                        sum += alpha[i * w + x];
+                    }
+                    let mut top = 0i32 - box_radius_y as i32;
+                    let mut bottom = box_radius_y as i32;
+
+                    for y in 0..h {
+                        if bottom < h as i32 && bottom > y as i32 {
+                            sum += alpha[bottom as usize * w + x];
+                        }
+                        let count = (bottom.min(h as i32 - 1) - top.max(0) + 1) as f32;
+                        next[y * w + x] = sum / count;
+                        if top >= 0 {
+                            sum -= alpha[top as usize * w + x];
+                        }
+                        top += 1;
+                        bottom += 1;
+                    }
+                }
+                alpha = next;
+            }
+        }
+    }
+
+    // Step 3: Composite original on top of shadow
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+    for y in 0..h {
+        for x in 0..w {
+            let shadow_a = alpha[y * w + x] / 255.0;
+            let src_a = arr[[y, x, 3]] as f32 / 255.0;
+
+            let out_a = src_a + shadow_a * (1.0 - src_a);
+
+            if out_a > 0.0 {
+                for c in 0..3 {
+                    let src_c = arr[[y, x, c]] as f32 / 255.0;
+                    let shadow_c = match c { 0 => flood_r, 1 => flood_g, _ => flood_b } as f32 / 255.0;
+                    let out_c = (src_c * src_a + shadow_c * shadow_a * (1.0 - src_a)) / out_a;
+                    dst[[y, x, c]] = (out_c * 255.0).clamp(0.0, 255.0) as u8;
+                }
+                dst[[y, x, 3]] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// Get SourceAlpha from input image (just the alpha channel as grayscale)
+#[pyfunction]
+fn get_source_alpha<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr = src.as_array();
+    let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    for y in 0..h {
+        for x in 0..w {
+            let a = arr[[y, x, 3]];
+            dst[[y, x, 0]] = 0;
+            dst[[y, x, 1]] = 0;
+            dst[[y, x, 2]] = 0;
+            dst[[y, x, 3]] = a;
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
 /// A Python module implemented in Rust for fast SVG rendering operations.
 #[pymodule]
 fn vectorstag_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1927,5 +3284,23 @@ fn vectorstag_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resize_rgba, m)?)?;
     m.add_function(wrap_pyfunction!(fill_polygon_to_array, m)?)?;
     m.add_function(wrap_pyfunction!(fill_multi_polygon_to_array, m)?)?;
+    // Filter primitives
+    m.add_function(wrap_pyfunction!(fe_flood, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_offset, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_blend, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_composite, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_merge, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_color_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_component_transfer, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_morphology, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_convolve_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_turbulence, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_displacement_map, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_tile, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_diffuse_lighting, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_specular_lighting, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_gaussian_blur, m)?)?;
+    m.add_function(wrap_pyfunction!(fe_drop_shadow, m)?)?;
+    m.add_function(wrap_pyfunction!(get_source_alpha, m)?)?;
     Ok(())
 }

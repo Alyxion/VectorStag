@@ -17,7 +17,12 @@ from .parser import (
     RectElement, CircleElement, EllipseElement, LineElement,
     PolylineElement, PolygonElement, PathElement, GroupElement,
     TextElement, ImageElement, LinearGradient, RadialGradient, GradientStop,
-    ClipPath, Mask, FILL_NOT_SET
+    ClipPath, Mask, FILL_NOT_SET, Filter, FilterPrimitive,
+    FeGaussianBlur, FeOffset, FeFlood, FeBlend, FeComposite, FeMerge, FeMergeNode,
+    FeColorMatrix, FeComponentTransfer, FeMorphology, FeConvolveMatrix,
+    FeTurbulence, FeDisplacementMap, FeImage, FeTile,
+    FeDiffuseLighting, FeSpecularLighting, FeDropShadow,
+    FeDistantLight, FePointLight, FeSpotLight
 )
 
 
@@ -353,54 +358,53 @@ class SVGRenderer:
         self._alpha_composite(ctx, temp_image, 0, 0)
 
     def _render_element_with_filter(self, ctx: "RenderContext", element: SVGElement, depth: int = 0):
-        """Render an element with a filter (e.g., Gaussian blur) applied."""
+        """Render an element with SVG filter primitives applied."""
         filter_def = ctx.filters[element.style.filter_id]
-
-        # Calculate blur radius - stdDeviation is in user space
-        # Scale by combined transform (base + element) to convert to screen pixels
-        combined = ctx.base_transform.multiply(element.transform)
-        scale = math.sqrt(abs(combined.a * combined.d - combined.b * combined.c))
-        blur_radius = filter_def.std_deviation * scale
 
         # Get element bounding box in screen coordinates
         elem_bbox = self._get_element_bbox(element, ctx.base_transform)
 
-        # Determine render region - use element bbox + blur padding for efficiency
-        # Blur spreads beyond element, so we need padding of ~3x blur radius
-        blur_padding = int(blur_radius * 3) + 2
+        # Calculate filter region
+        combined = ctx.base_transform.multiply(element.transform)
+        scale = math.sqrt(abs(combined.a * combined.d - combined.b * combined.c))
 
+        # Calculate padding for filters that expand (blur, morphology, etc.)
+        max_padding = 50  # Default padding
+        for prim in filter_def.primitives:
+            if isinstance(prim, FeGaussianBlur):
+                max_padding = max(max_padding, int((prim.std_deviation_x + prim.std_deviation_y) * scale * 3) + 5)
+            elif isinstance(prim, FeMorphology):
+                max_padding = max(max_padding, int((prim.radius_x + prim.radius_y) * scale) + 5)
+            elif isinstance(prim, FeDropShadow):
+                max_padding = max(max_padding, int((prim.std_deviation_x + prim.std_deviation_y) * scale * 3 + abs(prim.dx) + abs(prim.dy)) + 5)
+
+        # Determine filter region
         if elem_bbox:
             ex, ey, ew, eh = elem_bbox
-            # Region in screen coordinates with padding
-            region_x = max(0, int(ex) - blur_padding)
-            region_y = max(0, int(ey) - blur_padding)
-            region_x2 = min(ctx.image_width, int(ex + ew) + blur_padding)
-            region_y2 = min(ctx.image_height, int(ey + eh) + blur_padding)
+            region_x = max(0, int(ex) - max_padding)
+            region_y = max(0, int(ey) - max_padding)
+            region_x2 = min(ctx.image_width, int(ex + ew) + max_padding)
+            region_y2 = min(ctx.image_height, int(ey + eh) + max_padding)
             region_w = region_x2 - region_x
             region_h = region_y2 - region_y
-
-            # Only use region optimization if region is significantly smaller than full image
             use_region = region_w * region_h < ctx.image_width * ctx.image_height * 0.5
         else:
             use_region = False
 
         if use_region and region_w > 0 and region_h > 0:
-            # Create smaller temp image for just the region
             temp_image = Image.new("RGBA", (region_w, region_h), (0, 0, 0, 0))
-
-            # Create offset transform that shifts rendering to region coordinates
             offset_transform = Transform(1, 0, 0, 1, -region_x, -region_y)
             adjusted_base = offset_transform.multiply(ctx.base_transform)
             temp_ctx = RenderContext(temp_image, ctx.gradients, adjusted_base, ctx.clip_paths, ctx.masks, ctx.filters)
         else:
-            # Fall back to full image rendering
             region_x, region_y = 0, 0
+            region_w, region_h = ctx.image_width, ctx.image_height
             temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
             temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters)
 
-        # Render the element without filter to the temp image
+        # Render the element without filter to get SourceGraphic
         old_filter_id = element.style.filter_id
-        element.style.filter_id = None  # Temporarily remove filter
+        element.style.filter_id = None
 
         if isinstance(element, GroupElement):
             for child in element.children:
@@ -422,94 +426,302 @@ class SVGRenderer:
         elif isinstance(element, TextElement):
             self._render_text(temp_ctx, element)
 
-        # Restore filter_id
         element.style.filter_id = old_filter_id
 
-        # Apply Gaussian blur filter per SVG spec
-        # SVG spec: use three box-blurs to approximate Gaussian
-        # d = floor(s * 3 * sqrt(2*pi) / 4 + 0.5) where s is stdDeviation
-        if blur_radius >= 0.5:
-            # Calculate box blur size per SVG spec
-            # d = floor(s * 3 * sqrt(2*pi) / 4 + 0.5)
-            # 3 * sqrt(2*pi) / 4 ≈ 1.8799
-            d = int(blur_radius * 1.8799 + 0.5)
-            if d < 1:
-                d = 1
+        # Execute filter chain
+        source_graphic = np.array(temp_image, dtype=np.uint8)
+        result = self._execute_filter_chain_with_merge(filter_def, source_graphic, region_w, region_h, scale)
 
-            # PIL BoxBlur uses radius, where kernel size = 2*radius + 1
-            # For kernel size d, we need radius = (d - 1) / 2
-            # But for even d, we need to handle it differently
-            box_radius = max(0.5, (d - 1) / 2.0)
+        temp_image = Image.fromarray(result, mode='RGBA')
 
-            # Use premultiplied alpha to avoid blending with black from transparent pixels
-            arr = np.array(temp_image, dtype=np.uint8)
-            alpha = arr[:, :, 3].astype(np.float32)
-
-            # Apply three box-blurs to approximate Gaussian (per SVG spec)
-            box_blur = ImageFilter.BoxBlur(radius=box_radius)
-
-            blurred_channels = []
-
-            # Premultiply and apply triple box-blur to RGB channels
-            for c in range(3):
-                channel = arr[:, :, c].astype(np.float32)
-                premult = (channel * alpha / 255.0).astype(np.uint8)
-                img = Image.fromarray(premult, mode='L')
-                # Apply three passes of box blur (SVG spec approximation)
-                img = img.filter(box_blur)
-                img = img.filter(box_blur)
-                img = img.filter(box_blur)
-                blurred_channels.append(np.array(img, dtype=np.float32))
-                del channel, premult, img
-
-            # Apply triple box-blur to alpha channel
-            alpha_img = Image.fromarray(arr[:, :, 3], mode='L')
-            alpha_img = alpha_img.filter(box_blur)
-            alpha_img = alpha_img.filter(box_blur)
-            alpha_img = alpha_img.filter(box_blur)
-            alpha_blurred = np.array(alpha_img, dtype=np.float32)
-            del arr, alpha, alpha_img
-
-            # Un-premultiply: R = R' * 255 / A (avoid division by zero)
-            alpha_safe = np.maximum(alpha_blurred, 1.0)
-            result = np.empty((temp_image.height, temp_image.width, 4), dtype=np.uint8)
-            for c in range(3):
-                result[:, :, c] = np.clip(blurred_channels[c] * 255.0 / alpha_safe, 0, 255).astype(np.uint8)
-            result[:, :, 3] = alpha_blurred.astype(np.uint8)
-            del blurred_channels, alpha_blurred, alpha_safe
-
-            temp_image = Image.fromarray(result, mode='RGBA')
-            del result
-
-        # Apply filter region clipping
+        # Apply filter region clipping if needed
         if elem_bbox:
             ex, ey, ew, eh = elem_bbox
-
             if filter_def.filter_units == "objectBoundingBox":
-                # Filter region is relative to element bbox
                 fx = ex + filter_def.x * ew
                 fy = ey + filter_def.y * eh
                 fw = filter_def.width * ew
                 fh = filter_def.height * eh
             else:
-                # userSpaceOnUse - filter region in user coordinates, transform to pixels
                 fx, fy = ctx.base_transform.apply(filter_def.x, filter_def.y)
                 fx2, fy2 = ctx.base_transform.apply(filter_def.x + filter_def.width,
                                                      filter_def.y + filter_def.height)
                 fw, fh = fx2 - fx, fy2 - fy
 
-            # Create clip mask for filter region (in temp_image coordinates)
             filter_mask = Image.new("L", temp_image.size, 0)
             filter_draw = ImageDraw.Draw(filter_mask)
-            # Adjust coordinates for region offset
             filter_draw.rectangle([int(fx - region_x), int(fy - region_y),
                                    int(fx + fw - region_x), int(fy + fh - region_y)], fill=255)
-
-            # Apply mask to blurred image
             temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], filter_mask))
 
-        # Composite blurred image onto main image at correct position
         self._alpha_composite(ctx, temp_image, region_x, region_y)
+
+    def _execute_filter_chain(self, filter_def: Filter, source_graphic: np.ndarray,
+                               width: int, height: int, scale: float) -> np.ndarray:
+        """Execute the filter primitive chain using Rust acceleration."""
+        # Named buffers for filter chain
+        buffers = {
+            "SourceGraphic": source_graphic,
+            "SourceAlpha": self._get_source_alpha(source_graphic),
+        }
+        last_result = source_graphic
+
+        for prim in filter_def.primitives:
+            # If input1 is None, use last_result; otherwise look up in buffers
+            if prim.input1 is None:
+                in1 = last_result
+            else:
+                in1 = buffers.get(prim.input1, last_result)
+
+            in2_name = getattr(prim, 'input2', None)
+            in2 = buffers.get(in2_name, source_graphic) if in2_name else None
+
+            # Execute the primitive
+            result = self._execute_filter_primitive(prim, in1, in2, width, height, scale)
+
+            # Store result
+            if prim.result:
+                buffers[prim.result] = result
+            last_result = result
+
+        return last_result
+
+    def _get_source_alpha(self, src: np.ndarray) -> np.ndarray:
+        """Get SourceAlpha - just the alpha channel as grayscale."""
+        if HAS_RUST:
+            return vectorstag_rust.get_source_alpha(src)
+        # Fallback
+        result = np.zeros_like(src)
+        result[:, :, 3] = src[:, :, 3]
+        return result
+
+    def _execute_filter_primitive(self, prim: FilterPrimitive, in1: np.ndarray,
+                                    in2: Optional[np.ndarray], width: int, height: int,
+                                    scale: float) -> np.ndarray:
+        """Execute a single filter primitive."""
+        if isinstance(prim, FeGaussianBlur):
+            std_x = prim.std_deviation_x * scale
+            std_y = prim.std_deviation_y * scale
+            if HAS_RUST and std_x >= 0.5 or std_y >= 0.5:
+                return vectorstag_rust.fe_gaussian_blur(in1, std_x, std_y)
+            return in1
+
+        elif isinstance(prim, FeOffset):
+            dx = int(prim.dx * scale)
+            dy = int(prim.dy * scale)
+            if HAS_RUST:
+                return vectorstag_rust.fe_offset(in1, dx, dy)
+            # Fallback
+            result = np.zeros_like(in1)
+            h, w = in1.shape[:2]
+            for y in range(h):
+                sy = y - dy
+                if sy < 0 or sy >= h: continue
+                for x in range(w):
+                    sx = x - dx
+                    if sx < 0 or sx >= w: continue
+                    result[y, x] = in1[sy, sx]
+            return result
+
+        elif isinstance(prim, FeFlood):
+            if HAS_RUST:
+                return vectorstag_rust.fe_flood(width, height, *prim.flood_color)
+            result = np.zeros((height, width, 4), dtype=np.uint8)
+            result[:, :] = prim.flood_color
+            return result
+
+        elif isinstance(prim, FeBlend):
+            if in2 is None:
+                in2 = in1
+            mode_map = {"normal": 0, "multiply": 1, "screen": 2, "darken": 3, "lighten": 4,
+                       "overlay": 5, "color-dodge": 6, "color-burn": 7, "hard-light": 8,
+                       "soft-light": 9, "difference": 10, "exclusion": 11,
+                       "hue": 12, "saturation": 13, "color": 14, "luminosity": 15}
+            mode = mode_map.get(prim.mode, 0)
+            if HAS_RUST:
+                return vectorstag_rust.fe_blend(in1, in2, mode)
+            return in1  # Fallback - just return in1
+
+        elif isinstance(prim, FeComposite):
+            if in2 is None:
+                in2 = in1
+            op_map = {"over": 0, "in": 1, "out": 2, "atop": 3, "xor": 4, "arithmetic": 5}
+            op = op_map.get(prim.operator, 0)
+            if HAS_RUST:
+                return vectorstag_rust.fe_composite(in1, in2, op, prim.k1, prim.k2, prim.k3, prim.k4)
+            return in1
+
+        elif isinstance(prim, FeMerge):
+            if not prim.nodes:
+                return in1
+            # Collect layer arrays
+            layers = []
+            # We need access to the buffers dict which we don't have here
+            # For now, just return in1 - this will be handled in the chain executor
+            return in1
+
+        elif isinstance(prim, FeColorMatrix):
+            type_map = {"matrix": 0, "saturate": 1, "hueRotate": 2, "luminanceToAlpha": 3}
+            mt = type_map.get(prim.type, 0)
+            if HAS_RUST:
+                return vectorstag_rust.fe_color_matrix(in1, mt, prim.values)
+            return in1
+
+        elif isinstance(prim, FeComponentTransfer):
+            if HAS_RUST:
+                def make_func_tuple(f):
+                    type_map = {"identity": 0, "table": 1, "discrete": 2, "linear": 3, "gamma": 4}
+                    return (type_map.get(f.type, 0), f.table_values, f.slope, f.intercept,
+                            f.amplitude, f.exponent, f.offset)
+                return vectorstag_rust.fe_component_transfer(
+                    in1, make_func_tuple(prim.func_r), make_func_tuple(prim.func_g),
+                    make_func_tuple(prim.func_b), make_func_tuple(prim.func_a))
+            return in1
+
+        elif isinstance(prim, FeMorphology):
+            rx = prim.radius_x * scale
+            ry = prim.radius_y * scale
+            op = 0 if prim.operator == "erode" else 1
+            if HAS_RUST:
+                return vectorstag_rust.fe_morphology(in1, op, rx, ry)
+            return in1
+
+        elif isinstance(prim, FeConvolveMatrix):
+            if HAS_RUST:
+                divisor = prim.divisor if prim.divisor is not None else sum(prim.kernel_matrix) or 1.0
+                target_x = prim.target_x if prim.target_x is not None else prim.order_x // 2
+                target_y = prim.target_y if prim.target_y is not None else prim.order_y // 2
+                edge_map = {"duplicate": 0, "wrap": 1, "none": 2}
+                edge_mode = edge_map.get(prim.edge_mode, 0)
+                return vectorstag_rust.fe_convolve_matrix(
+                    in1, prim.order_x, prim.order_y, prim.kernel_matrix, divisor,
+                    prim.bias, target_x, target_y, edge_mode, prim.preserve_alpha)
+            return in1
+
+        elif isinstance(prim, FeTurbulence):
+            noise_type = 0 if prim.type == "turbulence" else 1
+            stitch = prim.stitch_tiles == "stitch"
+            if HAS_RUST:
+                return vectorstag_rust.fe_turbulence(
+                    width, height, prim.base_frequency_x, prim.base_frequency_y,
+                    prim.num_octaves, prim.seed, noise_type, stitch)
+            # Fallback - return gray noise
+            return np.random.randint(0, 256, (height, width, 4), dtype=np.uint8)
+
+        elif isinstance(prim, FeDisplacementMap):
+            if in2 is None:
+                in2 = in1
+            ch_map = {"R": 0, "G": 1, "B": 2, "A": 3}
+            x_ch = ch_map.get(prim.x_channel_selector, 3)
+            y_ch = ch_map.get(prim.y_channel_selector, 3)
+            if HAS_RUST:
+                return vectorstag_rust.fe_displacement_map(in1, in2, prim.scale * scale, x_ch, y_ch)
+            return in1
+
+        elif isinstance(prim, FeTile):
+            if HAS_RUST:
+                return vectorstag_rust.fe_tile(in1, width, height)
+            return in1
+
+        elif isinstance(prim, FeDiffuseLighting):
+            if HAS_RUST:
+                light = prim.light_source
+                if isinstance(light, FeDistantLight):
+                    lt, az, el = 0, light.azimuth, light.elevation
+                    lx, ly, lz, px, py, pz, se, lca = 0, 0, 0, 0, 0, 0, 1, 180
+                elif isinstance(light, FePointLight):
+                    lt, az, el = 1, 0, 0
+                    lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
+                    px, py, pz, se, lca = 0, 0, 0, 1, 180
+                elif isinstance(light, FeSpotLight):
+                    lt, az, el = 2, 0, 0
+                    lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
+                    px, py, pz = light.points_at_x * scale, light.points_at_y * scale, light.points_at_z * scale
+                    se = light.specular_exponent
+                    lca = light.limiting_cone_angle if light.limiting_cone_angle else 180
+                else:
+                    lt, az, el, lx, ly, lz, px, py, pz, se, lca = 0, 225, 45, 0, 0, 0, 0, 0, 0, 1, 180
+                return vectorstag_rust.fe_diffuse_lighting(
+                    in1, prim.surface_scale * scale, prim.diffuse_constant, prim.lighting_color,
+                    lt, az, el, lx, ly, lz, px, py, pz, se, lca)
+            return in1
+
+        elif isinstance(prim, FeSpecularLighting):
+            if HAS_RUST:
+                light = prim.light_source
+                if isinstance(light, FeDistantLight):
+                    lt, az, el = 0, light.azimuth, light.elevation
+                    lx, ly, lz, px, py, pz, se, lca = 0, 0, 0, 0, 0, 0, 1, 180
+                elif isinstance(light, FePointLight):
+                    lt, az, el = 1, 0, 0
+                    lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
+                    px, py, pz, se, lca = 0, 0, 0, 1, 180
+                elif isinstance(light, FeSpotLight):
+                    lt, az, el = 2, 0, 0
+                    lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
+                    px, py, pz = light.points_at_x * scale, light.points_at_y * scale, light.points_at_z * scale
+                    se = light.specular_exponent
+                    lca = light.limiting_cone_angle if light.limiting_cone_angle else 180
+                else:
+                    lt, az, el, lx, ly, lz, px, py, pz, se, lca = 0, 225, 45, 0, 0, 0, 0, 0, 0, 1, 180
+                return vectorstag_rust.fe_specular_lighting(
+                    in1, prim.surface_scale * scale, prim.specular_constant, prim.specular_exponent,
+                    prim.lighting_color, lt, az, el, lx, ly, lz, px, py, pz, se, lca)
+            return in1
+
+        elif isinstance(prim, FeDropShadow):
+            if HAS_RUST:
+                return vectorstag_rust.fe_drop_shadow(
+                    in1, prim.dx * scale, prim.dy * scale,
+                    prim.std_deviation_x * scale, prim.std_deviation_y * scale,
+                    *prim.flood_color)
+            return in1
+
+        elif isinstance(prim, FeImage):
+            # TODO: Load external image
+            return in1
+
+        return in1
+
+    def _execute_filter_chain_with_merge(self, filter_def: Filter, source_graphic: np.ndarray,
+                                          width: int, height: int, scale: float) -> np.ndarray:
+        """Execute filter chain with proper feMerge support."""
+        buffers = {
+            "SourceGraphic": source_graphic,
+            "SourceAlpha": self._get_source_alpha(source_graphic),
+        }
+        last_result = source_graphic
+
+        for prim in filter_def.primitives:
+            # If input1 is None, use last_result; otherwise look up in buffers
+            if prim.input1 is None:
+                in1 = last_result
+            else:
+                in1 = buffers.get(prim.input1, last_result)
+
+            if isinstance(prim, FeMerge):
+                # Handle merge specially - collect all node inputs
+                if HAS_RUST and prim.nodes:
+                    layers = []
+                    for node in prim.nodes:
+                        node_in = buffers.get(node.input1, last_result)
+                        layers.append(node_in)
+                    if layers:
+                        result = vectorstag_rust.fe_merge(layers)
+                    else:
+                        result = in1
+                else:
+                    result = in1
+            else:
+                in2_name = getattr(prim, 'input2', None)
+                in2 = buffers.get(in2_name, source_graphic) if in2_name else None
+                result = self._execute_filter_primitive(prim, in1, in2, width, height, scale)
+
+            if prim.result:
+                buffers[prim.result] = result
+            last_result = result
+
+        return last_result
 
     def _get_element_bbox(self, element: SVGElement, transform: Transform) -> Optional[tuple]:
         """Get element bounding box in screen coordinates."""

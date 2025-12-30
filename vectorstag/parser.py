@@ -7,6 +7,24 @@ from typing import Optional, Union
 import math
 
 
+def _safe_float(val: str, default: float = 0.0) -> float:
+    """Parse a float value, handling percentages and units."""
+    if not val:
+        return default
+    val = val.strip()
+    try:
+        if val.endswith('%'):
+            return float(val[:-1]) / 100.0
+        # Strip px or other units
+        for unit in ['px', 'em', 'pt', 'mm', 'cm', 'in']:
+            if val.endswith(unit):
+                val = val[:-len(unit)]
+                break
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 @dataclass
 class Transform:
     """Represents a 2D affine transformation matrix."""
@@ -255,16 +273,226 @@ class Mask:
 
 
 @dataclass
-class GaussianBlurFilter:
-    """Gaussian blur filter definition."""
+class FilterPrimitive:
+    """Base class for filter primitives."""
+    input1: Optional[str] = None  # 'in' attribute
+    input2: Optional[str] = None  # 'in2' attribute
+    result: Optional[str] = None  # 'result' attribute
+    # Subregion (x, y, width, height can be set per-primitive)
+    x: Optional[float] = None
+    y: Optional[float] = None
+    width: Optional[float] = None
+    height: Optional[float] = None
+
+
+@dataclass
+class FeGaussianBlur(FilterPrimitive):
+    """Gaussian blur filter primitive."""
+    std_deviation_x: float = 0.0
+    std_deviation_y: float = 0.0
+
+
+@dataclass
+class FeOffset(FilterPrimitive):
+    """Offset filter primitive."""
+    dx: float = 0.0
+    dy: float = 0.0
+
+
+@dataclass
+class FeFlood(FilterPrimitive):
+    """Flood fill filter primitive."""
+    flood_color: tuple[int, int, int, int] = (0, 0, 0, 255)  # RGBA
+    flood_opacity: float = 1.0
+
+
+@dataclass
+class FeBlend(FilterPrimitive):
+    """Blend filter primitive."""
+    mode: str = "normal"  # normal, multiply, screen, darken, lighten, etc.
+
+
+@dataclass
+class FeComposite(FilterPrimitive):
+    """Composite filter primitive."""
+    operator: str = "over"  # over, in, out, atop, xor, arithmetic
+    k1: float = 0.0
+    k2: float = 0.0
+    k3: float = 0.0
+    k4: float = 0.0
+
+
+@dataclass
+class FeMergeNode:
+    """A node in a merge operation."""
+    input1: str = "SourceGraphic"
+
+
+@dataclass
+class FeMerge(FilterPrimitive):
+    """Merge filter primitive."""
+    nodes: list[FeMergeNode] = field(default_factory=list)
+
+
+@dataclass
+class FeColorMatrix(FilterPrimitive):
+    """Color matrix filter primitive."""
+    type: str = "matrix"  # matrix, saturate, hueRotate, luminanceToAlpha
+    values: list[float] = field(default_factory=list)
+
+
+@dataclass
+class FeComponentTransferFunc:
+    """Transfer function for a single channel."""
+    type: str = "identity"  # identity, table, discrete, linear, gamma
+    table_values: list[float] = field(default_factory=list)
+    slope: float = 1.0
+    intercept: float = 0.0
+    amplitude: float = 1.0
+    exponent: float = 1.0
+    offset: float = 0.0
+
+
+@dataclass
+class FeComponentTransfer(FilterPrimitive):
+    """Component transfer filter primitive."""
+    func_r: FeComponentTransferFunc = field(default_factory=FeComponentTransferFunc)
+    func_g: FeComponentTransferFunc = field(default_factory=FeComponentTransferFunc)
+    func_b: FeComponentTransferFunc = field(default_factory=FeComponentTransferFunc)
+    func_a: FeComponentTransferFunc = field(default_factory=FeComponentTransferFunc)
+
+
+@dataclass
+class FeMorphology(FilterPrimitive):
+    """Morphology filter primitive (erode/dilate)."""
+    operator: str = "erode"  # erode, dilate
+    radius_x: float = 0.0
+    radius_y: float = 0.0
+
+
+@dataclass
+class FeConvolveMatrix(FilterPrimitive):
+    """Convolution matrix filter primitive."""
+    order_x: int = 3
+    order_y: int = 3
+    kernel_matrix: list[float] = field(default_factory=list)
+    divisor: Optional[float] = None  # Auto-calculated if not specified
+    bias: float = 0.0
+    target_x: Optional[int] = None  # Default: floor(orderX / 2)
+    target_y: Optional[int] = None  # Default: floor(orderY / 2)
+    edge_mode: str = "duplicate"  # duplicate, wrap, none
+    preserve_alpha: bool = False
+
+
+@dataclass
+class FeTurbulence(FilterPrimitive):
+    """Turbulence filter primitive (Perlin noise)."""
+    type: str = "turbulence"  # turbulence, fractalNoise
+    base_frequency_x: float = 0.0
+    base_frequency_y: float = 0.0
+    num_octaves: int = 1
+    seed: int = 0
+    stitch_tiles: str = "noStitch"  # noStitch, stitch
+
+
+@dataclass
+class FeDisplacementMap(FilterPrimitive):
+    """Displacement map filter primitive."""
+    scale: float = 0.0
+    x_channel_selector: str = "A"  # R, G, B, A
+    y_channel_selector: str = "A"  # R, G, B, A
+
+
+@dataclass
+class FeImage(FilterPrimitive):
+    """Image filter primitive."""
+    href: str = ""
+    preserveAspectRatio: str = "xMidYMid meet"
+
+
+@dataclass
+class FeTile(FilterPrimitive):
+    """Tile filter primitive."""
+    pass  # Uses inherited attributes
+
+
+@dataclass
+class LightSource:
+    """Base class for light sources."""
+    pass
+
+
+@dataclass
+class FeDistantLight(LightSource):
+    """Distant light source."""
+    azimuth: float = 0.0
+    elevation: float = 0.0
+
+
+@dataclass
+class FePointLight(LightSource):
+    """Point light source."""
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+
+
+@dataclass
+class FeSpotLight(LightSource):
+    """Spotlight source."""
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+    points_at_x: float = 0.0
+    points_at_y: float = 0.0
+    points_at_z: float = 0.0
+    specular_exponent: float = 1.0
+    limiting_cone_angle: Optional[float] = None
+
+
+@dataclass
+class FeDiffuseLighting(FilterPrimitive):
+    """Diffuse lighting filter primitive."""
+    surface_scale: float = 1.0
+    diffuse_constant: float = 1.0
+    lighting_color: tuple[int, int, int] = (255, 255, 255)
+    light_source: Optional[LightSource] = None
+
+
+@dataclass
+class FeSpecularLighting(FilterPrimitive):
+    """Specular lighting filter primitive."""
+    surface_scale: float = 1.0
+    specular_constant: float = 1.0
+    specular_exponent: float = 1.0
+    lighting_color: tuple[int, int, int] = (255, 255, 255)
+    light_source: Optional[LightSource] = None
+
+
+@dataclass
+class FeDropShadow(FilterPrimitive):
+    """Drop shadow filter primitive (SVG2)."""
+    dx: float = 2.0
+    dy: float = 2.0
+    std_deviation_x: float = 0.0
+    std_deviation_y: float = 0.0
+    flood_color: tuple[int, int, int, int] = (0, 0, 0, 255)
+    flood_opacity: float = 1.0
+
+
+@dataclass
+class Filter:
+    """Complete filter definition with chain of primitives."""
     id: str
-    std_deviation: float = 2.0
-    # Filter region (in objectBoundingBox units by default: 0-1 range)
+    primitives: list[FilterPrimitive] = field(default_factory=list)
+    # Filter region
     x: float = -0.1  # Default: -10% of element bbox
     y: float = -0.1
     width: float = 1.2  # Default: 120% of element bbox
     height: float = 1.2
     filter_units: str = "objectBoundingBox"  # or "userSpaceOnUse"
+    primitive_units: str = "userSpaceOnUse"  # or "objectBoundingBox"
+    color_interpolation_filters: str = "linearRGB"  # linearRGB or sRGB
 
 
 @dataclass
@@ -277,7 +505,7 @@ class SVGDocument:
     gradients: dict[str, Union[LinearGradient, RadialGradient]] = field(default_factory=dict)
     clip_paths: dict[str, ClipPath] = field(default_factory=dict)
     masks: dict[str, Mask] = field(default_factory=dict)
-    filters: dict[str, GaussianBlurFilter] = field(default_factory=dict)
+    filters: dict[str, Filter] = field(default_factory=dict)
     preserve_aspect_ratio: str = "xMidYMid"  # SVG default
 
 
@@ -689,10 +917,17 @@ class SVGParser:
                     )
 
     def _parse_filter(self, elem: ET.Element):
-        """Parse a filter element (basic support for Gaussian blur)."""
+        """Parse a filter element with all filter primitives."""
         filter_id = elem.get("id")
         if not filter_id:
             return
+
+        # Check for xlink:href to inherit from another filter
+        href = elem.get(f"{self.XLINK_NS}href") or elem.get("href")
+        base_filter = None
+        if href and href.startswith("#"):
+            base_id = href[1:]
+            base_filter = self.filters.get(base_id)
 
         # Parse filter region attributes (can be percentages like "-10%")
         def parse_filter_val(val: str, default: float) -> float:
@@ -701,35 +936,320 @@ class SVGParser:
             val = val.strip()
             if val.endswith('%'):
                 return float(val[:-1]) / 100.0
-            return float(val)
+            try:
+                return float(val)
+            except ValueError:
+                return default
 
-        filter_x = parse_filter_val(elem.get("x"), -0.1)
-        filter_y = parse_filter_val(elem.get("y"), -0.1)
-        filter_w = parse_filter_val(elem.get("width"), 1.2)
-        filter_h = parse_filter_val(elem.get("height"), 1.2)
-        filter_units = elem.get("filterUnits", "objectBoundingBox")
+        # Use base filter defaults if inheriting
+        default_x = base_filter.x if base_filter else -0.1
+        default_y = base_filter.y if base_filter else -0.1
+        default_w = base_filter.width if base_filter else 1.2
+        default_h = base_filter.height if base_filter else 1.2
 
-        # Look for feGaussianBlur child
+        filter_x = parse_filter_val(elem.get("x"), default_x)
+        filter_y = parse_filter_val(elem.get("y"), default_y)
+        filter_w = parse_filter_val(elem.get("width"), default_w)
+        filter_h = parse_filter_val(elem.get("height"), default_h)
+        filter_units = elem.get("filterUnits") or (base_filter.filter_units if base_filter else "objectBoundingBox")
+        primitive_units = elem.get("primitiveUnits") or (base_filter.primitive_units if base_filter else "userSpaceOnUse")
+        color_interp = elem.get("color-interpolation-filters") or (base_filter.color_interpolation_filters if base_filter else "linearRGB")
+
+        primitives = []
+
+        # Parse all filter primitives
         for child in elem:
             tag = self._strip_ns(child.tag)
-            if tag == "feGaussianBlur":
-                std_dev = child.get("stdDeviation", "2")
-                try:
-                    # stdDeviation can be "x y" for separate x/y, we'll use the first
-                    std_dev_val = float(std_dev.split()[0])
-                except (ValueError, IndexError):
-                    std_dev_val = 2.0
+            prim = self._parse_filter_primitive(child, tag)
+            if prim:
+                primitives.append(prim)
 
-                self.filters[filter_id] = GaussianBlurFilter(
-                    id=filter_id,
-                    std_deviation=std_dev_val,
-                    x=filter_x,
-                    y=filter_y,
-                    width=filter_w,
-                    height=filter_h,
-                    filter_units=filter_units
-                )
-                break  # Only handle the first blur for now
+        # If no primitives and we have a base filter, inherit its primitives
+        if not primitives and base_filter:
+            primitives = base_filter.primitives[:]
+
+        self.filters[filter_id] = Filter(
+            id=filter_id,
+            primitives=primitives,
+            x=filter_x,
+            y=filter_y,
+            width=filter_w,
+            height=filter_h,
+            filter_units=filter_units,
+            primitive_units=primitive_units,
+            color_interpolation_filters=color_interp
+        )
+
+    def _parse_filter_primitive(self, elem: ET.Element, tag: str) -> Optional[FilterPrimitive]:
+        """Parse a single filter primitive element."""
+        # Common attributes
+        input1 = elem.get("in")
+        input2 = elem.get("in2")
+        result = elem.get("result")
+
+        # Subregion
+        def parse_opt_float(val: str) -> Optional[float]:
+            if val is None:
+                return None
+            try:
+                if val.endswith('%'):
+                    return float(val[:-1]) / 100.0
+                return float(val)
+            except ValueError:
+                return None
+
+        x = parse_opt_float(elem.get("x"))
+        y = parse_opt_float(elem.get("y"))
+        width = parse_opt_float(elem.get("width"))
+        height = parse_opt_float(elem.get("height"))
+
+        if tag == "feGaussianBlur":
+            std_dev = elem.get("stdDeviation", "0")
+            parts = std_dev.split()
+            try:
+                std_x = float(parts[0]) if parts else 0.0
+                std_y = float(parts[1]) if len(parts) > 1 else std_x
+            except ValueError:
+                std_x = std_y = 0.0
+            return FeGaussianBlur(input1=input1, result=result, x=x, y=y, width=width, height=height,
+                                   std_deviation_x=std_x, std_deviation_y=std_y)
+
+        elif tag == "feOffset":
+            dx = _safe_float(elem.get("dx", "0"))
+            dy = _safe_float(elem.get("dy", "0"))
+            return FeOffset(input1=input1, result=result, x=x, y=y, width=width, height=height,
+                           dx=dx, dy=dy)
+
+        elif tag == "feFlood":
+            flood_color = elem.get("flood-color", "black")
+            flood_opacity = _safe_float(elem.get("flood-opacity", "1"), 1.0)
+            color = self._parse_color(flood_color)
+            if color is None:
+                color = (0, 0, 0)
+            rgba = (color[0], color[1], color[2], int(flood_opacity * 255))
+            return FeFlood(input1=input1, result=result, x=x, y=y, width=width, height=height,
+                          flood_color=rgba, flood_opacity=flood_opacity)
+
+        elif tag == "feBlend":
+            mode = elem.get("mode", "normal")
+            return FeBlend(input1=input1, input2=input2, result=result, x=x, y=y, width=width, height=height,
+                          mode=mode)
+
+        elif tag == "feComposite":
+            operator = elem.get("operator", "over")
+            k1 = float(elem.get("k1", "0"))
+            k2 = float(elem.get("k2", "0"))
+            k3 = float(elem.get("k3", "0"))
+            k4 = float(elem.get("k4", "0"))
+            return FeComposite(input1=input1, input2=input2, result=result, x=x, y=y, width=width, height=height,
+                              operator=operator, k1=k1, k2=k2, k3=k3, k4=k4)
+
+        elif tag == "feMerge":
+            nodes = []
+            for node_elem in elem:
+                node_tag = self._strip_ns(node_elem.tag)
+                if node_tag == "feMergeNode":
+                    node_in = node_elem.get("in", "SourceGraphic")
+                    nodes.append(FeMergeNode(input1=node_in))
+            return FeMerge(result=result, x=x, y=y, width=width, height=height, nodes=nodes)
+
+        elif tag == "feColorMatrix":
+            matrix_type = elem.get("type", "matrix")
+            values_str = elem.get("values", "")
+            try:
+                values = [float(v) for v in values_str.split()]
+            except ValueError:
+                values = []
+            return FeColorMatrix(input1=input1, result=result, x=x, y=y, width=width, height=height,
+                                type=matrix_type, values=values)
+
+        elif tag == "feComponentTransfer":
+            func_r = self._parse_transfer_func(elem, "feFuncR")
+            func_g = self._parse_transfer_func(elem, "feFuncG")
+            func_b = self._parse_transfer_func(elem, "feFuncB")
+            func_a = self._parse_transfer_func(elem, "feFuncA")
+            return FeComponentTransfer(input1=input1, result=result, x=x, y=y, width=width, height=height,
+                                       func_r=func_r, func_g=func_g, func_b=func_b, func_a=func_a)
+
+        elif tag == "feMorphology":
+            operator = elem.get("operator", "erode")
+            radius = elem.get("radius", "0")
+            parts = radius.split()
+            try:
+                rx = float(parts[0]) if parts else 0.0
+                ry = float(parts[1]) if len(parts) > 1 else rx
+            except ValueError:
+                rx = ry = 0.0
+            return FeMorphology(input1=input1, result=result, x=x, y=y, width=width, height=height,
+                               operator=operator, radius_x=rx, radius_y=ry)
+
+        elif tag == "feConvolveMatrix":
+            order = elem.get("order", "3")
+            parts = order.split()
+            try:
+                ox = max(1, int(parts[0])) if parts else 3
+                oy = max(1, int(parts[1])) if len(parts) > 1 else ox
+            except ValueError:
+                ox = oy = 3
+            kernel_str = elem.get("kernelMatrix", "")
+            try:
+                kernel = [float(v) for v in kernel_str.split()]
+            except ValueError:
+                kernel = []
+            divisor_str = elem.get("divisor")
+            divisor = float(divisor_str) if divisor_str else None
+            bias = float(elem.get("bias", "0"))
+            target_x_str = elem.get("targetX")
+            target_y_str = elem.get("targetY")
+            target_x = int(target_x_str) if target_x_str else None
+            target_y = int(target_y_str) if target_y_str else None
+            edge_mode = elem.get("edgeMode", "duplicate")
+            preserve_alpha = elem.get("preserveAlpha", "false").lower() == "true"
+            return FeConvolveMatrix(input1=input1, result=result, x=x, y=y, width=width, height=height,
+                                    order_x=ox, order_y=oy, kernel_matrix=kernel, divisor=divisor,
+                                    bias=bias, target_x=target_x, target_y=target_y,
+                                    edge_mode=edge_mode, preserve_alpha=preserve_alpha)
+
+        elif tag == "feTurbulence":
+            turb_type = elem.get("type", "turbulence")
+            base_freq = elem.get("baseFrequency", "0")
+            parts = base_freq.split()
+            try:
+                bfx = float(parts[0]) if parts else 0.0
+                bfy = float(parts[1]) if len(parts) > 1 else bfx
+            except ValueError:
+                bfx = bfy = 0.0
+            num_octaves = max(1, int(elem.get("numOctaves", "1")))
+            seed = int(float(elem.get("seed", "0")))
+            stitch = elem.get("stitchTiles", "noStitch")
+            return FeTurbulence(result=result, x=x, y=y, width=width, height=height,
+                               type=turb_type, base_frequency_x=bfx, base_frequency_y=bfy,
+                               num_octaves=num_octaves, seed=seed, stitch_tiles=stitch)
+
+        elif tag == "feDisplacementMap":
+            scale = float(elem.get("scale", "0"))
+            x_channel = elem.get("xChannelSelector", "A")
+            y_channel = elem.get("yChannelSelector", "A")
+            return FeDisplacementMap(input1=input1, input2=input2, result=result, x=x, y=y, width=width, height=height,
+                                     scale=scale, x_channel_selector=x_channel, y_channel_selector=y_channel)
+
+        elif tag == "feImage":
+            href = elem.get(f"{self.XLINK_NS}href") or elem.get("href", "")
+            par = elem.get("preserveAspectRatio", "xMidYMid meet")
+            return FeImage(result=result, x=x, y=y, width=width, height=height,
+                          href=href, preserveAspectRatio=par)
+
+        elif tag == "feTile":
+            return FeTile(input1=input1, result=result, x=x, y=y, width=width, height=height)
+
+        elif tag == "feDiffuseLighting":
+            surface_scale = float(elem.get("surfaceScale", "1"))
+            diffuse_const = float(elem.get("diffuseConstant", "1"))
+            light_color = self._parse_color(elem.get("lighting-color", "white"))
+            if light_color is None:
+                light_color = (255, 255, 255)
+            light_source = self._parse_light_source(elem)
+            return FeDiffuseLighting(input1=input1, result=result, x=x, y=y, width=width, height=height,
+                                     surface_scale=surface_scale, diffuse_constant=diffuse_const,
+                                     lighting_color=light_color, light_source=light_source)
+
+        elif tag == "feSpecularLighting":
+            surface_scale = float(elem.get("surfaceScale", "1"))
+            spec_const = float(elem.get("specularConstant", "1"))
+            spec_exp = float(elem.get("specularExponent", "1"))
+            light_color = self._parse_color(elem.get("lighting-color", "white"))
+            if light_color is None:
+                light_color = (255, 255, 255)
+            light_source = self._parse_light_source(elem)
+            return FeSpecularLighting(input1=input1, result=result, x=x, y=y, width=width, height=height,
+                                      surface_scale=surface_scale, specular_constant=spec_const,
+                                      specular_exponent=spec_exp, lighting_color=light_color,
+                                      light_source=light_source)
+
+        elif tag == "feDropShadow":
+            dx = _safe_float(elem.get("dx", "2"), 2.0)
+            dy = _safe_float(elem.get("dy", "2"), 2.0)
+            std_dev = elem.get("stdDeviation", "0")
+            parts = std_dev.split()
+            try:
+                std_x = _safe_float(parts[0], 0.0) if parts else 0.0
+                std_y = _safe_float(parts[1], std_x) if len(parts) > 1 else std_x
+            except (ValueError, IndexError):
+                std_x = std_y = 0.0
+            flood_color = elem.get("flood-color", "black")
+            flood_opacity = _safe_float(elem.get("flood-opacity", "1"), 1.0)
+            color = self._parse_color(flood_color)
+            if color is None:
+                color = (0, 0, 0)
+            rgba = (color[0], color[1], color[2], int(flood_opacity * 255))
+            return FeDropShadow(input1=input1, result=result, x=x, y=y, width=width, height=height,
+                               dx=dx, dy=dy, std_deviation_x=std_x, std_deviation_y=std_y,
+                               flood_color=rgba, flood_opacity=flood_opacity)
+
+        return None
+
+    def _parse_transfer_func(self, parent: ET.Element, func_tag: str) -> FeComponentTransferFunc:
+        """Parse a transfer function element (feFuncR, feFuncG, etc.)."""
+        def safe_float(val: str, default: float) -> float:
+            if not val:
+                return default
+            val = val.strip()
+            try:
+                if val.endswith('%'):
+                    return float(val[:-1]) / 100.0
+                # Strip px or other units
+                for unit in ['px', 'em', 'pt']:
+                    if val.endswith(unit):
+                        val = val[:-len(unit)]
+                        break
+                return float(val)
+            except ValueError:
+                return default
+
+        for child in parent:
+            if self._strip_ns(child.tag) == func_tag:
+                func_type = child.get("type", "identity")
+                table_str = child.get("tableValues", "")
+                try:
+                    table = [float(v) for v in table_str.split()] if table_str else []
+                except ValueError:
+                    table = []
+                slope = safe_float(child.get("slope", "1"), 1.0)
+                intercept = safe_float(child.get("intercept", "0"), 0.0)
+                amplitude = safe_float(child.get("amplitude", "1"), 1.0)
+                exponent = safe_float(child.get("exponent", "1"), 1.0)
+                offset = safe_float(child.get("offset", "0"), 0.0)
+                return FeComponentTransferFunc(type=func_type, table_values=table,
+                                               slope=slope, intercept=intercept,
+                                               amplitude=amplitude, exponent=exponent, offset=offset)
+        return FeComponentTransferFunc()
+
+    def _parse_light_source(self, parent: ET.Element) -> Optional[LightSource]:
+        """Parse light source child element."""
+        for child in parent:
+            tag = self._strip_ns(child.tag)
+            if tag == "feDistantLight":
+                azimuth = float(child.get("azimuth", "0"))
+                elevation = float(child.get("elevation", "0"))
+                return FeDistantLight(azimuth=azimuth, elevation=elevation)
+            elif tag == "fePointLight":
+                x = float(child.get("x", "0"))
+                y = float(child.get("y", "0"))
+                z = float(child.get("z", "0"))
+                return FePointLight(x=x, y=y, z=z)
+            elif tag == "feSpotLight":
+                x = float(child.get("x", "0"))
+                y = float(child.get("y", "0"))
+                z = float(child.get("z", "0"))
+                px = float(child.get("pointsAtX", "0"))
+                py = float(child.get("pointsAtY", "0"))
+                pz = float(child.get("pointsAtZ", "0"))
+                spec_exp = float(child.get("specularExponent", "1"))
+                cone_str = child.get("limitingConeAngle")
+                cone = float(cone_str) if cone_str else None
+                return FeSpotLight(x=x, y=y, z=z, points_at_x=px, points_at_y=py, points_at_z=pz,
+                                  specular_exponent=spec_exp, limiting_cone_angle=cone)
+        return None
 
     def _parse_linear_gradient(self, elem: ET.Element):
         """Parse a linearGradient element."""
