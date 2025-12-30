@@ -334,6 +334,601 @@ fn fill_multi_polygon_evenodd<'py>(
     mask.into_pyarray(py)
 }
 
+/// Fill multiple polygons using nonzero winding rule
+#[pyfunction]
+fn fill_multi_polygon_nonzero<'py>(
+    py: Python<'py>,
+    polygons: Vec<Vec<(f64, f64)>>,
+    width: usize,
+    height: usize,
+    min_x: i32,
+    min_y: i32,
+) -> Bound<'py, PyArray2<u8>> {
+    if polygons.is_empty() {
+        return Array2::<u8>::zeros((height, width)).into_pyarray(py);
+    }
+
+    // Collect all edges from all polygons with direction
+    let mut edges: Vec<(f64, f64, f64, f64, i32)> = Vec::new();
+
+    for points in &polygons {
+        let n = points.len();
+        if n < 3 {
+            continue;
+        }
+
+        let mut pts = points.clone();
+        if (pts[0].0 - pts[n - 1].0).abs() > 1e-10 || (pts[0].1 - pts[n - 1].1).abs() > 1e-10 {
+            pts.push(pts[0]);
+        }
+
+        for i in 0..pts.len() - 1 {
+            let (mut x1, mut y1) = pts[i];
+            let (mut x2, mut y2) = pts[i + 1];
+
+            if (y1 - y2).abs() < 1e-10 {
+                continue;
+            }
+
+            // Track direction: +1 if going down, -1 if going up
+            let direction = if y1 > y2 {
+                std::mem::swap(&mut x1, &mut x2);
+                std::mem::swap(&mut y1, &mut y2);
+                -1
+            } else {
+                1
+            };
+
+            edges.push((x1, y1, x2, y2, direction));
+        }
+    }
+
+    let mut mask = Array2::<u8>::zeros((height, width));
+
+    for y in 0..height {
+        let screen_y = (y as i32 + min_y) as f64 + 0.5;
+
+        let mut intersections: Vec<(f64, i32)> = Vec::with_capacity(edges.len());
+
+        for &(x1, y1, x2, y2, direction) in &edges {
+            if y1 <= screen_y && screen_y < y2 {
+                let t = (screen_y - y1) / (y2 - y1);
+                let x_int = x1 + t * (x2 - x1);
+                intersections.push((x_int, direction));
+            }
+        }
+
+        if intersections.is_empty() {
+            continue;
+        }
+
+        intersections.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Fill using winding count
+        let mut winding: i32 = 0;
+        let mut prev_x: Option<f64> = None;
+
+        for (x_int, direction) in intersections {
+            if winding != 0 {
+                if let Some(px) = prev_x {
+                    let x_start = (px - min_x as f64).max(0.0) as usize;
+                    let x_end = ((x_int - min_x as f64) as usize).min(width);
+                    if x_start < x_end {
+                        for x in x_start..x_end {
+                            mask[[y, x]] = 255;
+                        }
+                    }
+                }
+            }
+            winding += direction;
+            prev_x = Some(x_int);
+        }
+    }
+
+    mask.into_pyarray(py)
+}
+
+/// Fill multiple polygons using union (any pixel inside any polygon is filled)
+/// Used for stroke rendering where quads may overlap
+#[pyfunction]
+fn fill_polygons_union<'py>(
+    py: Python<'py>,
+    polygons: Vec<Vec<(f64, f64)>>,
+    width: usize,
+    height: usize,
+    min_x: i32,
+    min_y: i32,
+) -> Bound<'py, PyArray2<u8>> {
+    if polygons.is_empty() {
+        return Array2::<u8>::zeros((height, width)).into_pyarray(py);
+    }
+
+    let mut mask = Array2::<u8>::zeros((height, width));
+
+    // For each polygon, fill it using even-odd (simple convex polygon fill)
+    for points in &polygons {
+        let n = points.len();
+        if n < 3 {
+            continue;
+        }
+
+        // Get bounding box for this polygon
+        let poly_min_x = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        let poly_max_x = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+        let poly_min_y = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let poly_max_y = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+
+        let y_start = ((poly_min_y - min_y as f64).max(0.0) as usize).min(height);
+        let y_end = ((poly_max_y - min_y as f64 + 1.0).max(0.0) as usize).min(height);
+
+        // Close the polygon if needed
+        let mut pts = points.clone();
+        if (pts[0].0 - pts[n - 1].0).abs() > 1e-10 || (pts[0].1 - pts[n - 1].1).abs() > 1e-10 {
+            pts.push(pts[0]);
+        }
+
+        // Build edges for this polygon
+        let mut edges: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for i in 0..pts.len() - 1 {
+            let (mut x1, mut y1) = pts[i];
+            let (mut x2, mut y2) = pts[i + 1];
+
+            if (y1 - y2).abs() < 1e-10 {
+                continue;
+            }
+
+            if y1 > y2 {
+                std::mem::swap(&mut x1, &mut x2);
+                std::mem::swap(&mut y1, &mut y2);
+            }
+
+            edges.push((x1, y1, x2, y2));
+        }
+
+        // Fill using scanline
+        for y in y_start..y_end {
+            let screen_y = (y as i32 + min_y) as f64 + 0.5;
+
+            let mut intersections: Vec<f64> = Vec::new();
+
+            for &(x1, y1, x2, y2) in &edges {
+                if y1 <= screen_y && screen_y < y2 {
+                    let t = (screen_y - y1) / (y2 - y1);
+                    let x_int = x1 + t * (x2 - x1);
+                    intersections.push(x_int);
+                }
+            }
+
+            if intersections.is_empty() {
+                continue;
+            }
+
+            intersections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Even-odd fill
+            for pair in intersections.chunks(2) {
+                if pair.len() == 2 {
+                    let x_start = (pair[0] - min_x as f64).max(0.0) as usize;
+                    let x_end = ((pair[1] - min_x as f64) as usize + 1).min(width);
+                    if x_start < x_end {
+                        for x in x_start..x_end {
+                            mask[[y, x]] = 255;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    mask.into_pyarray(py)
+}
+
+/// Render closed polygon stroke to a mask buffer
+/// Computes offset points and fills the stroke region
+#[pyfunction]
+fn render_stroke_closed_polygon<'py>(
+    py: Python<'py>,
+    points: Vec<(f64, f64)>,
+    half_width: f64,
+    miterlimit: f64,
+    width: usize,
+    height: usize,
+    min_x: i32,
+    min_y: i32,
+) -> Bound<'py, PyArray2<u8>> {
+    let n = points.len();
+    if n < 3 {
+        return Array2::<u8>::zeros((height, width)).into_pyarray(py);
+    }
+
+    // Compute left and right edge points with miter joins
+    let mut left_points: Vec<(f64, f64)> = Vec::with_capacity(n);
+    let mut right_points: Vec<(f64, f64)> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let p_prev = points[(i + n - 1) % n];
+        let p_curr = points[i];
+        let p_next = points[(i + 1) % n];
+
+        // Direction vectors
+        let d1 = normalize(subtract(p_curr, p_prev));
+        let d2 = normalize(subtract(p_next, p_curr));
+
+        // Perpendiculars
+        let perp1 = (-d1.1, d1.0);
+        let perp2 = (-d2.1, d2.0);
+
+        let cross = d1.0 * d2.1 - d1.1 * d2.0;
+
+        let (left_pt, right_pt) = if cross.abs() > 0.001 {
+            // Compute miter intersection
+            let left_p1 = (p_curr.0 + perp1.0 * half_width, p_curr.1 + perp1.1 * half_width);
+            let left_p2 = (p_curr.0 + perp2.0 * half_width, p_curr.1 + perp2.1 * half_width);
+            let right_p1 = (p_curr.0 - perp1.0 * half_width, p_curr.1 - perp1.1 * half_width);
+            let right_p2 = (p_curr.0 - perp2.0 * half_width, p_curr.1 - perp2.1 * half_width);
+
+            let mut left_pt = line_intersection(left_p1, d1, left_p2, d2).unwrap_or(left_p1);
+            let mut right_pt = line_intersection(right_p1, d1, right_p2, d2).unwrap_or(right_p1);
+
+            // Apply miterlimit
+            let max_miter = miterlimit * half_width;
+            let left_dist = ((left_pt.0 - p_curr.0).powi(2) + (left_pt.1 - p_curr.1).powi(2)).sqrt();
+            let right_dist = ((right_pt.0 - p_curr.0).powi(2) + (right_pt.1 - p_curr.1).powi(2)).sqrt();
+
+            if left_dist > max_miter {
+                let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
+                left_pt = (p_curr.0 + avg_perp.0 * half_width, p_curr.1 + avg_perp.1 * half_width);
+            }
+            if right_dist > max_miter {
+                let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
+                right_pt = (p_curr.0 - avg_perp.0 * half_width, p_curr.1 - avg_perp.1 * half_width);
+            }
+
+            (left_pt, right_pt)
+        } else {
+            // Nearly collinear
+            let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
+            let left_pt = (p_curr.0 + avg_perp.0 * half_width, p_curr.1 + avg_perp.1 * half_width);
+            let right_pt = (p_curr.0 - avg_perp.0 * half_width, p_curr.1 - avg_perp.1 * half_width);
+            (left_pt, right_pt)
+        };
+
+        left_points.push(left_pt);
+        right_points.push(right_pt);
+    }
+
+    // Build quads for each edge
+    let mut quads: Vec<Vec<(f64, f64)>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        quads.push(vec![
+            left_points[i],
+            left_points[j],
+            right_points[j],
+            right_points[i],
+        ]);
+    }
+
+    // Fill all quads using union
+    let mut mask = Array2::<u8>::zeros((height, width));
+
+    for quad in &quads {
+        // Get bounding box
+        let poly_min_y = quad.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let poly_max_y = quad.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+
+        let y_start = ((poly_min_y - min_y as f64).max(0.0) as usize).min(height);
+        let y_end = ((poly_max_y - min_y as f64 + 1.0).max(0.0) as usize).min(height);
+
+        // Build edges
+        let mut edges: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for i in 0..quad.len() {
+            let (mut x1, mut y1) = quad[i];
+            let (mut x2, mut y2) = quad[(i + 1) % quad.len()];
+
+            if (y1 - y2).abs() < 1e-10 {
+                continue;
+            }
+
+            if y1 > y2 {
+                std::mem::swap(&mut x1, &mut x2);
+                std::mem::swap(&mut y1, &mut y2);
+            }
+
+            edges.push((x1, y1, x2, y2));
+        }
+
+        // Scanline fill
+        for y in y_start..y_end {
+            let screen_y = (y as i32 + min_y) as f64 + 0.5;
+
+            let mut intersections: Vec<f64> = Vec::new();
+
+            for &(x1, y1, x2, y2) in &edges {
+                if y1 <= screen_y && screen_y < y2 {
+                    let t = (screen_y - y1) / (y2 - y1);
+                    let x_int = x1 + t * (x2 - x1);
+                    intersections.push(x_int);
+                }
+            }
+
+            if intersections.len() < 2 {
+                continue;
+            }
+
+            intersections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Fill between pairs
+            for pair in intersections.chunks(2) {
+                if pair.len() == 2 {
+                    let x_start = (pair[0] - min_x as f64).max(0.0) as usize;
+                    let x_end = ((pair[1] - min_x as f64) as usize + 1).min(width);
+                    if x_start < x_end {
+                        for x in x_start..x_end {
+                            mask[[y, x]] = 255;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    mask.into_pyarray(py)
+}
+
+// Helper functions for stroke rendering
+#[inline]
+fn subtract(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 - b.0, a.1 - b.1)
+}
+
+#[inline]
+fn normalize(v: (f64, f64)) -> (f64, f64) {
+    let len = (v.0 * v.0 + v.1 * v.1).sqrt();
+    if len < 1e-10 {
+        (0.0, 0.0)
+    } else {
+        (v.0 / len, v.1 / len)
+    }
+}
+
+#[inline]
+fn line_intersection(p1: (f64, f64), d1: (f64, f64), p2: (f64, f64), d2: (f64, f64)) -> Option<(f64, f64)> {
+    let det = d1.0 * (-d2.1) - d1.1 * (-d2.0);
+    if det.abs() < 1e-10 {
+        return None;
+    }
+    let dx = p2.0 - p1.0;
+    let dy = p2.1 - p1.1;
+    let t = (dx * (-d2.1) - dy * (-d2.0)) / det;
+    Some((p1.0 + t * d1.0, p1.1 + t * d1.1))
+}
+
+/// Interpolate gradient colors for an entire image
+/// Takes t-values array and gradient stops, returns RGBA pixels
+#[pyfunction]
+fn interpolate_gradient_colors<'py>(
+    py: Python<'py>,
+    t: numpy::PyReadonlyArray2<'py, f32>,
+    offsets: Vec<f32>,
+    colors: Vec<(u8, u8, u8, u8)>,
+    opacity: f32,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+
+    let t_arr = t.as_array();
+    let height = t_arr.shape()[0];
+    let width = t_arr.shape()[1];
+
+    let mut pixels = Array3::<u8>::zeros((height, width, 4));
+
+    if offsets.is_empty() || colors.is_empty() {
+        return pixels.into_pyarray(py);
+    }
+
+    let n_stops = offsets.len();
+
+    for y in 0..height {
+        for x in 0..width {
+            let t_val = t_arr[[y, x]];
+
+            // Find the two stops that surround this t value
+            let (r, g, b, a) = if t_val <= offsets[0] {
+                colors[0]
+            } else if t_val >= offsets[n_stops - 1] {
+                colors[n_stops - 1]
+            } else {
+                // Binary search for the right interval
+                let mut lo = 0;
+                let mut hi = n_stops - 1;
+                while lo < hi - 1 {
+                    let mid = (lo + hi) / 2;
+                    if offsets[mid] <= t_val {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+
+                let s1_offset = offsets[lo];
+                let s2_offset = offsets[hi];
+                let (s1_r, s1_g, s1_b, s1_a) = colors[lo];
+                let (s2_r, s2_g, s2_b, s2_a) = colors[hi];
+
+                let denom = s2_offset - s1_offset;
+                let ratio = if denom.abs() < 1e-10 {
+                    0.0
+                } else {
+                    ((t_val - s1_offset) / denom).clamp(0.0, 1.0)
+                };
+
+                let r = s1_r as f32 + ratio * (s2_r as f32 - s1_r as f32);
+                let g = s1_g as f32 + ratio * (s2_g as f32 - s1_g as f32);
+                let b = s1_b as f32 + ratio * (s2_b as f32 - s1_b as f32);
+                let a = s1_a as f32 + ratio * (s2_a as f32 - s1_a as f32);
+
+                (r as u8, g as u8, b as u8, a as u8)
+            };
+
+            pixels[[y, x, 0]] = r;
+            pixels[[y, x, 1]] = g;
+            pixels[[y, x, 2]] = b;
+            pixels[[y, x, 3]] = ((a as f32) * opacity) as u8;
+        }
+    }
+
+    pixels.into_pyarray(py)
+}
+
+/// Interpolate color at a single t value - helper for gradient functions
+#[inline]
+fn interpolate_color_at_t(
+    t_val: f32,
+    offsets: &[f32],
+    colors: &[(u8, u8, u8, u8)],
+    opacity: f32,
+) -> (u8, u8, u8, u8) {
+    let n_stops = offsets.len();
+
+    if t_val <= offsets[0] {
+        let (r, g, b, a) = colors[0];
+        return (r, g, b, ((a as f32) * opacity) as u8);
+    } else if t_val >= offsets[n_stops - 1] {
+        let (r, g, b, a) = colors[n_stops - 1];
+        return (r, g, b, ((a as f32) * opacity) as u8);
+    }
+
+    // Binary search for the right interval
+    let mut lo = 0;
+    let mut hi = n_stops - 1;
+    while lo < hi - 1 {
+        let mid = (lo + hi) / 2;
+        if offsets[mid] <= t_val {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    let s1_offset = offsets[lo];
+    let s2_offset = offsets[hi];
+    let (s1_r, s1_g, s1_b, s1_a) = colors[lo];
+    let (s2_r, s2_g, s2_b, s2_a) = colors[hi];
+
+    let denom = s2_offset - s1_offset;
+    let ratio = if denom.abs() < 1e-10 {
+        0.0
+    } else {
+        ((t_val - s1_offset) / denom).clamp(0.0, 1.0)
+    };
+
+    let r = s1_r as f32 + ratio * (s2_r as f32 - s1_r as f32);
+    let g = s1_g as f32 + ratio * (s2_g as f32 - s1_g as f32);
+    let b = s1_b as f32 + ratio * (s2_b as f32 - s1_b as f32);
+    let a = s1_a as f32 + ratio * (s2_a as f32 - s1_a as f32);
+
+    (r as u8, g as u8, b as u8, ((a) * opacity) as u8)
+}
+
+/// Apply spread method to t value
+#[inline]
+fn apply_spread_method(t: f32, spread_method: u8) -> f32 {
+    match spread_method {
+        1 => t.rem_euclid(1.0), // repeat
+        2 => { // reflect
+            let t2 = t.rem_euclid(2.0);
+            if t2 > 1.0 { 2.0 - t2 } else { t2 }
+        },
+        _ => t.clamp(0.0, 1.0), // pad (default)
+    }
+}
+
+/// Create a linear gradient image directly (computes t and interpolates in one pass)
+#[pyfunction]
+fn create_linear_gradient_image<'py>(
+    py: Python<'py>,
+    width: usize,
+    height: usize,
+    offset_x: i32,
+    offset_y: i32,
+    x1: f32, y1: f32,
+    dx: f32, dy: f32,
+    length: f32,
+    offsets: Vec<f32>,
+    colors: Vec<(u8, u8, u8, u8)>,
+    opacity: f32,
+    spread_method: u8, // 0=pad, 1=repeat, 2=reflect
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+
+    let mut pixels = Array3::<u8>::zeros((height, width, 4));
+
+    if offsets.is_empty() || colors.is_empty() || length.abs() < 1e-10 {
+        return pixels.into_pyarray(py);
+    }
+
+    for row in 0..height {
+        let wy = (row as i32 + offset_y) as f32;
+        for col in 0..width {
+            let wx = (col as i32 + offset_x) as f32;
+            let t_raw = ((wx - x1) * dx + (wy - y1) * dy) / length;
+            let t = apply_spread_method(t_raw, spread_method);
+            let (r, g, b, a) = interpolate_color_at_t(t, &offsets, &colors, opacity);
+            pixels[[row, col, 0]] = r;
+            pixels[[row, col, 1]] = g;
+            pixels[[row, col, 2]] = b;
+            pixels[[row, col, 3]] = a;
+        }
+    }
+
+    pixels.into_pyarray(py)
+}
+
+/// Create a radial gradient image directly (computes t with inverse transform and interpolates in one pass)
+#[pyfunction]
+fn create_radial_gradient_image<'py>(
+    py: Python<'py>,
+    width: usize,
+    height: usize,
+    offset_x: i32,
+    offset_y: i32,
+    cx: f32, cy: f32, radius: f32,
+    inv_a: f32, inv_b: f32, inv_c: f32, inv_d: f32, inv_e: f32, inv_f: f32,
+    offsets: Vec<f32>,
+    colors: Vec<(u8, u8, u8, u8)>,
+    opacity: f32,
+    spread_method: u8, // 0=pad, 1=repeat, 2=reflect
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+
+    let mut pixels = Array3::<u8>::zeros((height, width, 4));
+
+    if offsets.is_empty() || colors.is_empty() || radius.abs() < 1e-10 {
+        return pixels.into_pyarray(py);
+    }
+
+    for row in 0..height {
+        let wy = (row as i32 + offset_y) as f32;
+        for col in 0..width {
+            let wx = (col as i32 + offset_x) as f32;
+            // Inverse transform to gradient space
+            let gx = inv_a * wx + inv_b * wy + inv_e;
+            let gy = inv_c * wx + inv_d * wy + inv_f;
+            // Distance from center, normalized
+            let dist = ((gx - cx) * (gx - cx) + (gy - cy) * (gy - cy)).sqrt();
+            let t_raw = dist / radius;
+            let t = apply_spread_method(t_raw, spread_method);
+            let (r, g, b, a) = interpolate_color_at_t(t, &offsets, &colors, opacity);
+            pixels[[row, col, 0]] = r;
+            pixels[[row, col, 1]] = g;
+            pixels[[row, col, 2]] = b;
+            pixels[[row, col, 3]] = a;
+        }
+    }
+
+    pixels.into_pyarray(py)
+}
+
 /// Sample points along a cubic bezier curve
 /// Returns list of (x, y) tuples from t=1/n_samples to t=1 (excludes t=0)
 #[pyfunction]
@@ -890,6 +1485,128 @@ fn sample_arc(
     points
 }
 
+/// Alpha composite source onto destination in-place at given offset
+/// Uses Porter-Duff over operator: out = src + dst * (1 - src_alpha)
+#[pyfunction]
+fn alpha_composite_inplace<'py>(
+    _py: Python<'py>,
+    mut dst: numpy::PyReadwriteArray3<'py, u8>,  // mutable destination RGBA
+    src: numpy::PyReadonlyArray3<'py, u8>,  // source RGBA
+    offset_x: i32,
+    offset_y: i32,
+) {
+    let src_arr = src.as_array();
+    let mut dst_arr = dst.as_array_mut();
+
+    let (dst_h, dst_w, _) = (dst_arr.shape()[0], dst_arr.shape()[1], dst_arr.shape()[2]);
+    let (src_h, src_w, _) = (src_arr.shape()[0], src_arr.shape()[1], src_arr.shape()[2]);
+
+    // Calculate overlap region
+    let start_x = offset_x.max(0) as usize;
+    let start_y = offset_y.max(0) as usize;
+    let end_x = ((offset_x + src_w as i32) as usize).min(dst_w);
+    let end_y = ((offset_y + src_h as i32) as usize).min(dst_h);
+
+    let src_start_x = (-offset_x).max(0) as usize;
+    let src_start_y = (-offset_y).max(0) as usize;
+
+    for dy in start_y..end_y {
+        let sy = src_start_y + (dy - start_y);
+        if sy >= src_h { break; }
+
+        for dx in start_x..end_x {
+            let sx = src_start_x + (dx - start_x);
+            if sx >= src_w { break; }
+
+            let src_a = src_arr[[sy, sx, 3]] as u32;
+            if src_a == 0 { continue; }  // Skip fully transparent
+
+            if src_a == 255 {
+                // Fully opaque source - just copy
+                dst_arr[[dy, dx, 0]] = src_arr[[sy, sx, 0]];
+                dst_arr[[dy, dx, 1]] = src_arr[[sy, sx, 1]];
+                dst_arr[[dy, dx, 2]] = src_arr[[sy, sx, 2]];
+                dst_arr[[dy, dx, 3]] = 255;
+            } else {
+                // Alpha blending
+                let dst_a = dst_arr[[dy, dx, 3]] as u32;
+                let inv_src_a = 255 - src_a;
+
+                // out_a = src_a + dst_a * (1 - src_a/255)
+                let out_a = src_a + (dst_a * inv_src_a / 255);
+
+                if out_a == 0 {
+                    dst_arr[[dy, dx, 0]] = 0;
+                    dst_arr[[dy, dx, 1]] = 0;
+                    dst_arr[[dy, dx, 2]] = 0;
+                    dst_arr[[dy, dx, 3]] = 0;
+                } else {
+                    // out_rgb = (src_rgb * src_a + dst_rgb * dst_a * (1 - src_a/255)) / out_a
+                    for c in 0..3 {
+                        let src_c = src_arr[[sy, sx, c]] as u32;
+                        let dst_c = dst_arr[[dy, dx, c]] as u32;
+                        let out_c = (src_c * src_a + dst_c * dst_a * inv_src_a / 255) / out_a;
+                        dst_arr[[dy, dx, c]] = out_c.min(255) as u8;
+                    }
+                    dst_arr[[dy, dx, 3]] = out_a.min(255) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// Resize RGBA image using box filter (area averaging for downscale)
+#[pyfunction]
+fn resize_rgba<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+    new_width: usize,
+    new_height: usize,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+
+    let src_arr = src.as_array();
+    let (src_h, src_w, _) = (src_arr.shape()[0], src_arr.shape()[1], src_arr.shape()[2]);
+
+    let mut dst = Array3::<u8>::zeros((new_height, new_width, 4));
+
+    // Simple box filter (area averaging)
+    let scale_x = src_w as f32 / new_width as f32;
+    let scale_y = src_h as f32 / new_height as f32;
+
+    for dy in 0..new_height {
+        let sy_start = (dy as f32 * scale_y) as usize;
+        let sy_end = (((dy + 1) as f32 * scale_y) as usize).min(src_h);
+
+        for dx in 0..new_width {
+            let sx_start = (dx as f32 * scale_x) as usize;
+            let sx_end = (((dx + 1) as f32 * scale_x) as usize).min(src_w);
+
+            let mut sum = [0u32; 4];
+            let mut count = 0u32;
+
+            for sy in sy_start..sy_end {
+                for sx in sx_start..sx_end {
+                    sum[0] += src_arr[[sy, sx, 0]] as u32;
+                    sum[1] += src_arr[[sy, sx, 1]] as u32;
+                    sum[2] += src_arr[[sy, sx, 2]] as u32;
+                    sum[3] += src_arr[[sy, sx, 3]] as u32;
+                    count += 1;
+                }
+            }
+
+            if count > 0 {
+                dst[[dy, dx, 0]] = (sum[0] / count) as u8;
+                dst[[dy, dx, 1]] = (sum[1] / count) as u8;
+                dst[[dy, dx, 2]] = (sum[2] / count) as u8;
+                dst[[dy, dx, 3]] = (sum[3] / count) as u8;
+            }
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
 /// A Python module implemented in Rust for fast SVG rendering operations.
 #[pymodule]
 fn vectorstag_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -897,9 +1614,17 @@ fn vectorstag_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fill_polygon_nonzero, m)?)?;
     m.add_function(wrap_pyfunction!(fill_polygon_evenodd, m)?)?;
     m.add_function(wrap_pyfunction!(fill_multi_polygon_evenodd, m)?)?;
+    m.add_function(wrap_pyfunction!(fill_multi_polygon_nonzero, m)?)?;
+    m.add_function(wrap_pyfunction!(fill_polygons_union, m)?)?;
+    m.add_function(wrap_pyfunction!(render_stroke_closed_polygon, m)?)?;
+    m.add_function(wrap_pyfunction!(interpolate_gradient_colors, m)?)?;
+    m.add_function(wrap_pyfunction!(create_linear_gradient_image, m)?)?;
+    m.add_function(wrap_pyfunction!(create_radial_gradient_image, m)?)?;
     m.add_function(wrap_pyfunction!(sample_cubic_bezier, m)?)?;
     m.add_function(wrap_pyfunction!(sample_quadratic_bezier, m)?)?;
     m.add_function(wrap_pyfunction!(sample_arc, m)?)?;
     m.add_function(wrap_pyfunction!(parse_path, m)?)?;
+    m.add_function(wrap_pyfunction!(alpha_composite_inplace, m)?)?;
+    m.add_function(wrap_pyfunction!(resize_rgba, m)?)?;
     Ok(())
 }

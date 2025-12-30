@@ -122,6 +122,7 @@ class SVGRenderer:
             self._render_element(ctx, element)
 
         # Apply viewBox clipping - hide content outside viewBox bounds
+        img_arr = None  # Track numpy array for potential reuse in resize
         if doc.viewBox:
             vb_x, vb_y, vb_w, vb_h = doc.viewBox
 
@@ -156,22 +157,37 @@ class SVGRenderer:
             clip_x2 = min(render_width, clip_x2)
             clip_y2 = min(render_height, clip_y2)
 
-            # Only apply clipping if we have a valid rectangle
-            if clip_x2 > clip_x1 and clip_y2 > clip_y1:
-                # Create mask and apply clipping
-                mask = Image.new("L", (render_width, render_height), 0)
-                from PIL import ImageDraw
-                draw = ImageDraw.Draw(mask)
-                draw.rectangle([clip_x1, clip_y1, clip_x2, clip_y2], fill=255)
+            # Only apply clipping if we have a valid rectangle that's smaller than full size
+            needs_clip = (clip_x2 > clip_x1 and clip_y2 > clip_y1 and
+                         (clip_x1 > 0 or clip_y1 > 0 or
+                          clip_x2 < render_width or clip_y2 < render_height))
 
-                # Apply mask to alpha channel
-                r, g, b, a = image.split()
-                a = ImageChops.multiply(a, mask)
-                image = Image.merge("RGBA", (r, g, b, a))
+            if needs_clip:
+                # Use numpy for faster clipping
+                img_arr = np.array(image)
+                # Zero out alpha outside clip bounds
+                img_arr[:clip_y1, :, 3] = 0  # Top
+                img_arr[clip_y2:, :, 3] = 0  # Bottom
+                img_arr[:, :clip_x1, 3] = 0  # Left
+                img_arr[:, clip_x2:, 3] = 0  # Right
+                # If we'll resize with Rust, keep as numpy; otherwise convert back
+                if not (aa > 1 and HAS_RUST):
+                    image = Image.fromarray(img_arr, "RGBA")
+            else:
+                img_arr = None
 
         # Downscale for anti-aliasing effect
         if aa > 1:
-            image = image.resize((out_width, out_height), Image.LANCZOS)
+            if HAS_RUST:
+                # Use Rust box filter resize (faster for 4x downscale)
+                if img_arr is None:
+                    img_arr = np.ascontiguousarray(np.array(image))
+                elif not img_arr.flags['C_CONTIGUOUS']:
+                    img_arr = np.ascontiguousarray(img_arr)
+                resized_arr = vectorstag_rust.resize_rgba(img_arr, out_width, out_height)
+                image = Image.fromarray(resized_arr, "RGBA")
+            else:
+                image = image.resize((out_width, out_height), Image.LANCZOS)
 
         return image
 
@@ -252,7 +268,7 @@ class SVGRenderer:
 
         # Apply the mask and composite onto main image
         temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], mask))
-        ctx.image.alpha_composite(temp_image)
+        self._alpha_composite(ctx, temp_image, 0, 0)
 
     def _render_element_with_filter(self, ctx: "RenderContext", element: SVGElement, depth: int = 0):
         """Render an element with a filter (e.g., Gaussian blur) applied."""
@@ -389,7 +405,7 @@ class SVGRenderer:
             temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], filter_mask))
 
         # Composite blurred image onto main image at correct position
-        ctx.image.alpha_composite(temp_image, (region_x, region_y))
+        self._alpha_composite(ctx, temp_image, region_x, region_y)
 
     def _get_element_bbox(self, element: SVGElement, transform: Transform) -> Optional[tuple]:
         """Get element bounding box in screen coordinates."""
@@ -1022,7 +1038,7 @@ class SVGRenderer:
                     draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=stroke)
 
         if temp is not None:
-            ctx.image.alpha_composite(temp)
+            self._alpha_composite(ctx, temp, 0, 0)
 
     def _stroke_path_with_gradient(self, ctx: "RenderContext", points: List[Tuple[float, float]],
                                     style: Style, element_transform: Transform,
@@ -1259,7 +1275,7 @@ class SVGRenderer:
                 draw = ImageDraw.Draw(temp, "RGBA")
                 local_poly = [(x - min_x, y - min_y) for x, y in stroke_polygon]
                 draw.polygon(local_poly, fill=stroke)
-                ctx.image.alpha_composite(temp, (min_x, min_y))
+                self._alpha_composite(ctx, temp, min_x, min_y)
         else:
             draw = ImageDraw.Draw(ctx.image, "RGBA")
             draw.polygon(stroke_polygon, fill=stroke)
@@ -1315,78 +1331,111 @@ class SVGRenderer:
                                         miterlimit: float = 4.0, linejoin: str = "miter"):
         """Render closed polygon stroke using outer/inner outline approach."""
         n = len(points)
+        if n < 3:
+            return
 
-        # Compute left and right edge points with miter joins
-        left_points = []
-        right_points = []
+        # Get bounding box for stroke area
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        min_x = max(0, int(min(xs) - half_width - 2))
+        min_y = max(0, int(min(ys) - half_width - 2))
+        max_x = min(ctx.image.width, int(max(xs) + half_width + 2))
+        max_y = min(ctx.image.height, int(max(ys) + half_width + 2))
 
-        for i in range(n):
-            p_prev = points[(i - 1) % n]
-            p_curr = points[i]
-            p_next = points[(i + 1) % n]
+        if min_x >= max_x or min_y >= max_y:
+            return
 
-            d1 = self._normalize(self._subtract(p_curr, p_prev))
-            d2 = self._normalize(self._subtract(p_next, p_curr))
+        width = max_x - min_x
+        height = max_y - min_y
 
-            perp1 = (-d1[1], d1[0])
-            perp2 = (-d2[1], d2[0])
+        # Use Rust implementation if available
+        if HAS_RUST:
+            mask = vectorstag_rust.render_stroke_closed_polygon(
+                points, half_width, miterlimit, width, height, min_x, min_y
+            )
+            mask_img = Image.fromarray(mask, "L")
 
-            cross = d1[0] * d2[1] - d1[1] * d2[0]
+            # Handle round joins if needed
+            if linejoin == "round":
+                draw = ImageDraw.Draw(mask_img, "L")
+                for i in range(n):
+                    x, y = points[i]
+                    draw.ellipse([x - half_width - min_x, y - half_width - min_y,
+                                  x + half_width - min_x, y + half_width - min_y], fill=255)
 
-            if abs(cross) > 0.001:
-                # Compute miter intersection
-                left_p1 = (p_curr[0] + perp1[0] * half_width, p_curr[1] + perp1[1] * half_width)
-                left_p2 = (p_curr[0] + perp2[0] * half_width, p_curr[1] + perp2[1] * half_width)
-                right_p1 = (p_curr[0] - perp1[0] * half_width, p_curr[1] - perp1[1] * half_width)
-                right_p2 = (p_curr[0] - perp2[0] * half_width, p_curr[1] - perp2[1] * half_width)
+            # Apply stroke color with mask
+            fill_img = Image.new("RGBA", (width, height), stroke[:3] + (255,))
+            self._composite_masked_fill(ctx, fill_img, mask_img, min_x, min_y, stroke[3])
+        else:
+            # Python fallback
+            # Compute left and right edge points with miter joins
+            left_points = []
+            right_points = []
 
-                left_pt = self._line_intersection(left_p1, d1, left_p2, d2)
-                right_pt = self._line_intersection(right_p1, d1, right_p2, d2)
+            for i in range(n):
+                p_prev = points[(i - 1) % n]
+                p_curr = points[i]
+                p_next = points[(i + 1) % n]
 
-                if left_pt is None:
-                    left_pt = left_p1
-                if right_pt is None:
-                    right_pt = right_p1
+                d1 = self._normalize(self._subtract(p_curr, p_prev))
+                d2 = self._normalize(self._subtract(p_next, p_curr))
 
-                # Apply miterlimit
-                max_miter = miterlimit * half_width
-                left_dist = math.sqrt((left_pt[0] - p_curr[0])**2 + (left_pt[1] - p_curr[1])**2)
-                right_dist = math.sqrt((right_pt[0] - p_curr[0])**2 + (right_pt[1] - p_curr[1])**2)
+                perp1 = (-d1[1], d1[0])
+                perp2 = (-d2[1], d2[0])
 
-                if left_dist > max_miter:
+                cross = d1[0] * d2[1] - d1[1] * d2[0]
+
+                if abs(cross) > 0.001:
+                    left_p1 = (p_curr[0] + perp1[0] * half_width, p_curr[1] + perp1[1] * half_width)
+                    left_p2 = (p_curr[0] + perp2[0] * half_width, p_curr[1] + perp2[1] * half_width)
+                    right_p1 = (p_curr[0] - perp1[0] * half_width, p_curr[1] - perp1[1] * half_width)
+                    right_p2 = (p_curr[0] - perp2[0] * half_width, p_curr[1] - perp2[1] * half_width)
+
+                    left_pt = self._line_intersection(left_p1, d1, left_p2, d2)
+                    right_pt = self._line_intersection(right_p1, d1, right_p2, d2)
+
+                    if left_pt is None:
+                        left_pt = left_p1
+                    if right_pt is None:
+                        right_pt = right_p1
+
+                    max_miter = miterlimit * half_width
+                    left_dist = math.sqrt((left_pt[0] - p_curr[0])**2 + (left_pt[1] - p_curr[1])**2)
+                    right_dist = math.sqrt((right_pt[0] - p_curr[0])**2 + (right_pt[1] - p_curr[1])**2)
+
+                    if left_dist > max_miter:
+                        avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
+                        left_pt = (p_curr[0] + avg_perp[0] * half_width, p_curr[1] + avg_perp[1] * half_width)
+                    if right_dist > max_miter:
+                        avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
+                        right_pt = (p_curr[0] - avg_perp[0] * half_width, p_curr[1] - avg_perp[1] * half_width)
+                else:
                     avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
                     left_pt = (p_curr[0] + avg_perp[0] * half_width, p_curr[1] + avg_perp[1] * half_width)
-                if right_dist > max_miter:
-                    avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
                     right_pt = (p_curr[0] - avg_perp[0] * half_width, p_curr[1] - avg_perp[1] * half_width)
-            else:
-                # Nearly collinear
-                avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
-                left_pt = (p_curr[0] + avg_perp[0] * half_width, p_curr[1] + avg_perp[1] * half_width)
-                right_pt = (p_curr[0] - avg_perp[0] * half_width, p_curr[1] - avg_perp[1] * half_width)
 
-            left_points.append(left_pt)
-            right_points.append(right_pt)
+                left_points.append(left_pt)
+                right_points.append(right_pt)
 
-        # Render stroke as individual segments (quads) plus miter triangles
-        # This correctly handles the ring shape for closed polygon strokes
-        temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(temp, "RGBA")
+            # Cropped temp image
+            temp = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(temp, "RGBA")
 
-        # Draw each edge as a quadrilateral
-        for i in range(n):
-            j = (i + 1) % n
-            quad = [left_points[i], left_points[j], right_points[j], right_points[i]]
-            draw.polygon(quad, fill=stroke)
-
-        # Draw round joins at corners if linejoin is "round"
-        if linejoin == "round":
             for i in range(n):
-                x, y = points[i]
-                draw.ellipse([x - half_width, y - half_width,
-                              x + half_width, y + half_width], fill=stroke)
+                j = (i + 1) % n
+                quad = [(left_points[i][0] - min_x, left_points[i][1] - min_y),
+                        (left_points[j][0] - min_x, left_points[j][1] - min_y),
+                        (right_points[j][0] - min_x, right_points[j][1] - min_y),
+                        (right_points[i][0] - min_x, right_points[i][1] - min_y)]
+                draw.polygon(quad, fill=stroke)
 
-        ctx.image.alpha_composite(temp)
+            if linejoin == "round":
+                for i in range(n):
+                    x, y = points[i]
+                    draw.ellipse([x - half_width - min_x, y - half_width - min_y,
+                                  x + half_width - min_x, y + half_width - min_y], fill=stroke)
+
+            self._alpha_composite(ctx, temp, min_x, min_y)
 
     def _stroke_closed_polygon_segmented(self, ctx: "RenderContext", points: List[Tuple[float, float]],
                                           stroke: Tuple[int, int, int, int], half_width: float,
@@ -1465,7 +1514,7 @@ class SVGRenderer:
                 draw.ellipse([x - half_width, y - half_width,
                               x + half_width, y + half_width], fill=stroke)
 
-        ctx.image.alpha_composite(temp)
+        self._alpha_composite(ctx, temp, 0, 0)
 
     def _build_stroke_polygon(self, points: List[Tuple[float, float]],
                               half_width: float, linecap: str, linejoin: str,
@@ -1753,22 +1802,27 @@ class SVGRenderer:
             if self._is_self_intersecting(points):
                 self._fill_polygon_nonzero_color(ctx, points, fill)
             else:
-                # Simple non-intersecting polygon - PIL's polygon works fine
-                if fill[3] < 255:
-                    # Memory-optimized: use cropped-size temp instead of full-size
-                    xs = [p[0] for p in points]
-                    ys = [p[1] for p in points]
-                    min_x, max_x = max(0, int(min(xs))), min(ctx.image.width, int(max(xs)) + 1)
-                    min_y, max_y = max(0, int(min(ys))), min(ctx.image.height, int(max(ys)) + 1)
-                    if min_x < max_x and min_y < max_y:
-                        temp = Image.new("RGBA", (max_x - min_x, max_y - min_y), (0, 0, 0, 0))
+                # Simple non-intersecting polygon - use Rust if available
+                xs = [p[0] for p in points]
+                ys = [p[1] for p in points]
+                min_x, max_x = max(0, int(min(xs))), min(ctx.image.width, int(max(xs)) + 1)
+                min_y, max_y = max(0, int(min(ys))), min(ctx.image.height, int(max(ys)) + 1)
+                if min_x < max_x and min_y < max_y:
+                    width, height = max_x - min_x, max_y - min_y
+                    if HAS_RUST:
+                        mask = vectorstag_rust.fill_polygon_nonzero(points, width, height, min_x, min_y)
+                        mask_img = Image.fromarray(mask, "L")
+                        fill_img = Image.new("RGBA", (width, height), fill[:3] + (255,))
+                        self._composite_masked_fill(ctx, fill_img, mask_img, min_x, min_y, fill[3])
+                    elif fill[3] < 255:
+                        temp = Image.new("RGBA", (width, height), (0, 0, 0, 0))
                         draw = ImageDraw.Draw(temp, "RGBA")
                         local_points = [(x - min_x, y - min_y) for x, y in points]
                         draw.polygon(local_points, fill=fill)
-                        ctx.image.alpha_composite(temp, (min_x, min_y))
-                else:
-                    draw = ImageDraw.Draw(ctx.image, "RGBA")
-                    draw.polygon(points, fill=fill)
+                        self._alpha_composite(ctx, temp, min_x, min_y)
+                    else:
+                        draw = ImageDraw.Draw(ctx.image, "RGBA")
+                        draw.polygon(points, fill=fill)
 
     def _is_self_intersecting(self, points: list[tuple[float, float]]) -> bool:
         """Check if a polygon has self-intersecting edges (optimized)."""
@@ -2064,55 +2118,59 @@ class SVGRenderer:
         width = max_x - min_x
         height = max_y - min_y
 
-        # Create mask using scanline algorithm with nonzero winding rule
-        mask = np.zeros((height, width), dtype=np.uint8)
+        # Use Rust implementation if available (much faster)
+        if HAS_RUST:
+            mask = vectorstag_rust.fill_multi_polygon_nonzero(polygons, width, height, min_x, min_y)
+        else:
+            # Create mask using scanline algorithm with nonzero winding rule
+            mask = np.zeros((height, width), dtype=np.uint8)
 
-        # Build edge list with direction from all polygons
-        all_edges = []
-        for poly in polygons:
-            closed_points = list(poly)
-            if closed_points[0] != closed_points[-1]:
-                closed_points.append(closed_points[0])
+            # Build edge list with direction from all polygons
+            all_edges = []
+            for poly in polygons:
+                closed_points = list(poly)
+                if closed_points[0] != closed_points[-1]:
+                    closed_points.append(closed_points[0])
 
-            n = len(closed_points) - 1
-            for i in range(n):
-                p1 = closed_points[i]
-                p2 = closed_points[i + 1]
-                if p1[1] != p2[1]:  # Skip horizontal edges
-                    # Determine direction: +1 if going up, -1 if going down
-                    if p1[1] > p2[1]:
-                        p1, p2 = p2, p1
-                        direction = -1
-                    else:
-                        direction = 1
-                    all_edges.append((p1[0], p1[1], p2[0], p2[1], direction))
+                n = len(closed_points) - 1
+                for i in range(n):
+                    p1 = closed_points[i]
+                    p2 = closed_points[i + 1]
+                    if p1[1] != p2[1]:  # Skip horizontal edges
+                        # Determine direction: +1 if going up, -1 if going down
+                        if p1[1] > p2[1]:
+                            p1, p2 = p2, p1
+                            direction = -1
+                        else:
+                            direction = 1
+                        all_edges.append((p1[0], p1[1], p2[0], p2[1], direction))
 
-        # For each scanline
-        for y in range(height):
-            screen_y = y + min_y + 0.5  # Center of pixel
+            # For each scanline
+            for y in range(height):
+                screen_y = y + min_y + 0.5  # Center of pixel
 
-            # Find intersections with direction
-            intersections = []
-            for x1, y1, x2, y2, direction in all_edges:
-                if y1 <= screen_y < y2:
-                    t = (screen_y - y1) / (y2 - y1)
-                    x_intersect = x1 + t * (x2 - x1)
-                    intersections.append((x_intersect, direction))
+                # Find intersections with direction
+                intersections = []
+                for x1, y1, x2, y2, direction in all_edges:
+                    if y1 <= screen_y < y2:
+                        t = (screen_y - y1) / (y2 - y1)
+                        x_intersect = x1 + t * (x2 - x1)
+                        intersections.append((x_intersect, direction))
 
-            # Sort by x
-            intersections.sort(key=lambda p: p[0])
+                # Sort by x
+                intersections.sort(key=lambda p: p[0])
 
-            # Fill using winding count (nonzero rule)
-            winding = 0
-            prev_x = None
-            for x_int, direction in intersections:
-                if winding != 0 and prev_x is not None:
-                    x_start = max(0, int(prev_x - min_x))
-                    x_end = min(width, int(x_int - min_x))
-                    if x_start < x_end:
-                        mask[y, x_start:x_end] = 255
-                winding += direction
-                prev_x = x_int
+                # Fill using winding count (nonzero rule)
+                winding = 0
+                prev_x = None
+                for x_int, direction in intersections:
+                    if winding != 0 and prev_x is not None:
+                        x_start = max(0, int(prev_x - min_x))
+                        x_end = min(width, int(x_int - min_x))
+                        if x_start < x_end:
+                            mask[y, x_start:x_end] = 255
+                    winding += direction
+                    prev_x = x_int
 
         # Apply fill using mask (memory-optimized: no full-size temp)
         mask_img = Image.fromarray(mask, "L")
@@ -2269,14 +2327,18 @@ class SVGRenderer:
                 element_transform
             )
 
-        # Create mask from polygon with fill-rule support
-        if fill_rule == "evenodd":
+        # Create mask from polygon with fill-rule support using Rust if available
+        if HAS_RUST:
+            if fill_rule == "evenodd":
+                mask = vectorstag_rust.fill_polygon_evenodd(points, grad_width, grad_height, min_x, min_y)
+            else:
+                mask = vectorstag_rust.fill_polygon_nonzero(points, grad_width, grad_height, min_x, min_y)
+            mask_crop = Image.fromarray(mask, "L")
+        elif fill_rule == "evenodd":
             mask_crop = self._create_evenodd_mask(points, min_x, min_y, grad_width, grad_height)
         else:
-            # Create cropped-size mask directly (memory-optimized)
             mask_crop = Image.new("L", (grad_width, grad_height), 0)
             mask_draw = ImageDraw.Draw(mask_crop)
-            # Offset points to local coordinates
             local_points = [(x - min_x, y - min_y) for x, y in points]
             mask_draw.polygon(local_points, fill=255)
 
@@ -2367,29 +2429,43 @@ class SVGRenderer:
         dx /= length
         dy /= length
 
-        # Memory-optimized: use float32 and reuse arrays
-        # Create single coordinate array, compute t in-place
+        # Get spread method
+        spread_method = getattr(gradient, 'spread_method', 'pad')
+        spread_code = 0  # pad
+        if spread_method == "repeat":
+            spread_code = 1
+        elif spread_method == "reflect":
+            spread_code = 2
+
+        # Use Rust implementation if available (much faster)
+        if HAS_RUST:
+            offsets = [float(s.offset) for s in gradient.stops]
+            colors = [tuple(s.color) for s in gradient.stops]
+            pixels = vectorstag_rust.create_linear_gradient_image(
+                width, height, offset_x, offset_y,
+                float(x1), float(y1), float(dx), float(dy), float(length),
+                offsets, colors, opacity, spread_code
+            )
+            return Image.fromarray(pixels, "RGBA")
+
+        # Python fallback
         t = np.empty((height, width), dtype=np.float32)
         y_base = np.arange(height, dtype=np.float32) + offset_y
         x_base = np.arange(width, dtype=np.float32) + offset_x
 
-        # Compute t row by row to minimize peak memory
         for row in range(height):
             wy = y_base[row]
             t[row, :] = ((x_base - x1) * dx + (wy - y1) * dy) / length
 
-        # Apply spreadMethod in-place
-        spread_method = getattr(gradient, 'spread_method', 'pad')
         if spread_method == "repeat":
             np.remainder(t, 1.0, out=t)
         elif spread_method == "reflect":
             np.remainder(t, 2.0, out=t)
             mask = t > 1.0
             t[mask] = 2.0 - t[mask]
-        else:  # pad
+        else:
             np.clip(t, 0, 1, out=t)
 
-        # Vectorized color interpolation
         pixels = self._interpolate_gradient_colors_vectorized(gradient.stops, t, opacity)
         return Image.fromarray(pixels, "RGBA")
 
@@ -2435,30 +2511,45 @@ class SVGRenderer:
         inv_e = float((combined_transform.c * combined_transform.f - combined_transform.d * combined_transform.e) / det)
         inv_f = float((combined_transform.b * combined_transform.e - combined_transform.a * combined_transform.f) / det)
 
-        # Memory-optimized: use float32 and compute row by row
+        # Get spread method
+        spread_method = getattr(gradient, 'spread_method', 'pad')
+        spread_code = 0  # pad
+        if spread_method == "repeat":
+            spread_code = 1
+        elif spread_method == "reflect":
+            spread_code = 2
+
+        # Use Rust implementation if available (much faster)
+        if HAS_RUST:
+            offsets = [float(s.offset) for s in gradient.stops]
+            colors = [tuple(s.color) for s in gradient.stops]
+            pixels = vectorstag_rust.create_radial_gradient_image(
+                width, height, offset_x, offset_y,
+                float(cx), float(cy), float(r),
+                inv_a, inv_b, inv_c, inv_d, inv_e, inv_f,
+                offsets, colors, opacity, spread_code
+            )
+            return Image.fromarray(pixels, "RGBA")
+
+        # Python fallback
         t = np.empty((height, width), dtype=np.float32)
         x_base = np.arange(width, dtype=np.float32) + offset_x
 
         for row in range(height):
             wy = float(row + offset_y)
-            # Inverse transform to gradient space
             gx = inv_a * x_base + (inv_b * wy + inv_e)
             gy = inv_c * x_base + (inv_d * wy + inv_f)
-            # Distance from center, normalized
             t[row, :] = np.sqrt((gx - cx) ** 2 + (gy - cy) ** 2) / r
 
-        # Apply spreadMethod in-place
-        spread_method = getattr(gradient, 'spread_method', 'pad')
         if spread_method == "repeat":
             np.remainder(t, 1.0, out=t)
         elif spread_method == "reflect":
             np.remainder(t, 2.0, out=t)
             mask = t > 1.0
             t[mask] = 2.0 - t[mask]
-        else:  # pad
+        else:
             np.clip(t, 0, 1, out=t)
 
-        # Vectorized color interpolation
         pixels = self._interpolate_gradient_colors_vectorized(gradient.stops, t, opacity)
         return Image.fromarray(pixels, "RGBA")
 
@@ -2466,46 +2557,49 @@ class SVGRenderer:
                                                   t: np.ndarray, opacity: float) -> np.ndarray:
         """Memory-optimized vectorized color interpolation for gradient images."""
         height, width = t.shape
-        pixels = np.empty((height, width, 4), dtype=np.uint8)
 
         if not stops:
-            pixels.fill(0)
+            return np.zeros((height, width, 4), dtype=np.uint8)
+
+        # Use Rust implementation if available (much faster)
+        if HAS_RUST:
+            offsets = [float(s.offset) for s in stops]
+            colors = [tuple(s.color) for s in stops]
+            t_float32 = t.astype(np.float32) if t.dtype != np.float32 else t
+            return vectorstag_rust.interpolate_gradient_colors(t_float32, offsets, colors, opacity)
+        else:
+            pixels = np.empty((height, width, 4), dtype=np.uint8)
+
+            # Build arrays of stop offsets and colors
+            offsets = np.array([s.offset for s in stops], dtype=np.float32)
+            colors = np.array([s.color for s in stops], dtype=np.float32)
+
+            # Use searchsorted to find which stop segment each pixel belongs to
+            indices = np.searchsorted(offsets, t, side='right') - 1
+            np.clip(indices, 0, len(stops) - 2, out=indices)
+
+            # Pre-compute ratios for all pixels
+            lower_offsets = offsets[indices]
+            upper_offsets = offsets[indices + 1]
+            denom = upper_offsets - lower_offsets
+
+            # Avoid division by zero
+            safe_denom = np.where(denom > 1e-10, denom, 1.0)
+            ratio = np.clip((t - lower_offsets) / safe_denom, 0, 1)
+            ratio = np.where(denom > 1e-10, ratio, 0.0).astype(np.float32)
+
+            # Interpolate each color channel
+            for c in range(4):
+                lower_colors = colors[indices, c]
+                upper_colors = colors[indices + 1, c]
+                interp = lower_colors + ratio * (upper_colors - lower_colors)
+                if c == 3:  # Alpha channel
+                    pixels[:, :, c] = (interp * opacity).astype(np.uint8)
+                else:
+                    pixels[:, :, c] = interp.astype(np.uint8)
+
+            del indices, lower_offsets, upper_offsets, denom, safe_denom, ratio
             return pixels
-
-        # Build arrays of stop offsets and colors
-        offsets = np.array([s.offset for s in stops], dtype=np.float32)
-        colors = np.array([s.color for s in stops], dtype=np.float32)
-
-        # Use searchsorted to find which stop segment each pixel belongs to
-        # This is more memory efficient than creating masks for each segment
-        indices = np.searchsorted(offsets, t, side='right') - 1
-        np.clip(indices, 0, len(stops) - 2, out=indices)
-
-        # Pre-compute ratios for all pixels
-        # ratio = (t - offset[i]) / (offset[i+1] - offset[i])
-        lower_offsets = offsets[indices]
-        upper_offsets = offsets[indices + 1]
-        denom = upper_offsets - lower_offsets
-
-        # Avoid division by zero - where denom is tiny, use 0 ratio
-        safe_denom = np.where(denom > 1e-10, denom, 1.0)
-        ratio = np.clip((t - lower_offsets) / safe_denom, 0, 1)
-        ratio = np.where(denom > 1e-10, ratio, 0.0).astype(np.float32)
-
-        # Interpolate each color channel
-        for c in range(4):
-            lower_colors = colors[indices, c]
-            upper_colors = colors[indices + 1, c]
-            interp = lower_colors + ratio * (upper_colors - lower_colors)
-            if c == 3:  # Alpha channel
-                pixels[:, :, c] = (interp * opacity).astype(np.uint8)
-            else:
-                pixels[:, :, c] = interp.astype(np.uint8)
-
-        # Clean up large temporaries
-        del indices, lower_offsets, upper_offsets, denom, safe_denom, ratio
-
-        return pixels
 
     def _interpolate_gradient_color(self, stops: list[GradientStop],
                                     t: float) -> tuple[int, int, int, int]:
@@ -2537,6 +2631,12 @@ class SVGRenderer:
 
         return stops[-1].color
 
+    def _alpha_composite(self, ctx: "RenderContext", src_img: Image.Image,
+                         dest_x: int, dest_y: int):
+        """Alpha composite src onto ctx.image at destination coordinates."""
+        # Note: Rust alpha_composite has too much conversion overhead vs PIL
+        ctx.image.alpha_composite(src_img, (dest_x, dest_y))
+
     def _composite_masked_fill(self, ctx: "RenderContext", fill_img: Image.Image,
                                mask_img: Image.Image, dest_x: int, dest_y: int,
                                fill_alpha: int = 255):
@@ -2558,18 +2658,20 @@ class SVGRenderer:
             fill_img.putalpha(mask_img)
 
         # Composite directly at destination without full-size temp
-        ctx.image.alpha_composite(fill_img, (dest_x, dest_y))
+        self._alpha_composite(ctx, fill_img, dest_x, dest_y)
 
     def _composite_gradient_masked(self, ctx: "RenderContext", grad_img: Image.Image,
                                     mask_img: Image.Image, dest_x: int, dest_y: int):
         """Composite a gradient with mask without creating a full-size temp image."""
-        # Apply mask to gradient's alpha channel
-        grad_r, grad_g, grad_b, grad_a = grad_img.split()
-        masked_alpha = ImageChops.multiply(grad_a, mask_img)
-        grad_masked = Image.merge("RGBA", (grad_r, grad_g, grad_b, masked_alpha))
+        # Apply mask to gradient's alpha using numpy (faster than split/merge)
+        grad_arr = np.array(grad_img)
+        mask_arr = np.array(mask_img)
+        # Multiply alpha channel by mask (both are 0-255)
+        grad_arr[:, :, 3] = (grad_arr[:, :, 3].astype(np.uint16) * mask_arr // 255).astype(np.uint8)
+        grad_masked = Image.fromarray(grad_arr, "RGBA")
 
         # Composite directly at destination
-        ctx.image.alpha_composite(grad_masked, (dest_x, dest_y))
+        self._alpha_composite(ctx, grad_masked, dest_x, dest_y)
 
     # Font mapping for common font families
     FONT_PATHS = {
@@ -2715,6 +2817,7 @@ class RenderContext:
                  clip_paths: dict[str, ClipPath] = None,
                  filters: dict = None):
         self.image = image
+        self.image_arr = None  # Optional numpy array for Rust compositing
         self.gradients = gradients
         self.base_transform = base_transform
         self.clip_paths = clip_paths or {}

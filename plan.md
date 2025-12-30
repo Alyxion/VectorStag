@@ -8,16 +8,16 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 **Date**: 2025-12-30
 
 ### Performance vs Reference Renderers
-- **VectorStag**: ~9.4 files/sec at 400x400 with 4x antialiasing
-- **CairoSVG**: ~24 files/sec (VectorStag is ~0.4x)
-- **Resvg**: ~75 files/sec (VectorStag is ~0.13x)
+- **VectorStag**: ~23 files/sec at 400x400 with 4x antialiasing (single-thread)
+- **CairoSVG**: ~41 files/sec (VectorStag is ~0.56x)
+- **Resvg**: ~75 files/sec (VectorStag is ~0.31x)
+- **Multiprocessing**: ~340 files/sec with 12 workers
 
 ### Emoji Test Results (3427 Noto emojis)
-- **Average Accuracy**: 99.9%
-- **99%+ Accuracy**: 99.9% (3424 files)
-- **95-99%**: 0.1% (3 files)
+- **Average Accuracy**: 99.8%
+- **99%+ Accuracy**: 99.9% (3423 files)
+- **95-99%**: 0.1% (4 files)
 - **<80%**: 0.0% (0 files)
-- **Throughput**: ~50 files/sec
 
 ### Flag Test Results (358 Noto flags)
 - **Average Accuracy**: 99.7%
@@ -63,6 +63,10 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 5. **Memory optimization** - Eliminated full-size temp images, use cropped regions
 6. **Rust fill algorithms** - `fill_polygon_evenodd` and `fill_multi_polygon_evenodd` via Rust extension
 7. **Float32 gradients** - Reduced memory from float64 to float32, row-by-row computation
+8. **Rust resize** - Box filter resize in Rust, faster than PIL LANCZOS for 4x downscale
+9. **Rust gradient images** - `create_linear_gradient_image` and `create_radial_gradient_image` in Rust
+10. **Numpy clipping optimization** - Reuse numpy arrays between clipping and resize steps
+11. **Rust polygon nonzero fill** - All polygon fill operations now use Rust when available
 
 ### Bug Fixes (2025-12-30)
 1. **Recursion protection** - Added MAX_PARSE_DEPTH and MAX_RENDER_DEPTH limits to prevent stack overflow
@@ -192,6 +196,23 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - lineargradient1/2.svg: CairoSVG fills gaps that don't exist
 - Gaussian blur: CairoSVG doesn't apply properly
 - Negative viewBox: CairoSVG stretches content incorrectly
+
+---
+
+## Performance Notes
+
+VectorStag achieves ~60% of CairoSVG performance at 4x antialiasing. The remaining performance gap is due to:
+
+1. **PIL alpha_composite overhead** (~25% of render time) - PIL's native compositing is called per-element. Cairo does this in native C with less overhead.
+
+2. **Image.new allocation** (~16% of render time) - Creating temporary images for semi-transparent fills. Cairo reuses internal buffers.
+
+3. **Python/C boundary crossing** - Each PIL/numpy call has overhead that pure C libraries avoid.
+
+### Potential Future Optimizations
+- Replace PIL compositing with native Rust implementation (tested, but conversion overhead made it slower)
+- Implement full rendering pipeline in Rust (major rewrite)
+- Reduce temporary image allocations by reusing buffers
 
 ---
 
