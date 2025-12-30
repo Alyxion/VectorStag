@@ -330,44 +330,36 @@ class SVGRenderer:
         # PIL GaussianBlur radius - at least 1 pixel
         if blur_radius >= 0.5:
             # Use premultiplied alpha to avoid blending with black from transparent pixels
-            # When transparent pixels are (0,0,0,0), naive blur mixes color with black
-            # Premultiplied alpha ensures transparent pixels contribute no color
-            import numpy as np
-            arr = np.array(temp_image, dtype=np.float32)
-            r, g, b, a = arr[:,:,0], arr[:,:,1], arr[:,:,2], arr[:,:,3]
+            # Memory-optimized: work with uint8 arrays, avoid float32 where possible
+            arr = np.array(temp_image, dtype=np.uint8)
+            alpha = arr[:, :, 3].astype(np.float32)
 
-            # Convert to premultiplied alpha (R' = R * A / 255)
-            alpha_norm = a / 255.0
-            r_pre = r * alpha_norm
-            g_pre = g * alpha_norm
-            b_pre = b * alpha_norm
-
-            # Create premultiplied image and blur all channels
+            # Create premultiplied channels and blur them
             blur = ImageFilter.GaussianBlur(radius=blur_radius)
-            r_img = Image.fromarray(r_pre.astype(np.uint8), mode='L').filter(blur)
-            g_img = Image.fromarray(g_pre.astype(np.uint8), mode='L').filter(blur)
-            b_img = Image.fromarray(b_pre.astype(np.uint8), mode='L').filter(blur)
-            a_img = Image.fromarray(a.astype(np.uint8), mode='L').filter(blur)
+            blurred_channels = []
 
-            # Convert back from premultiplied
-            r_blur = np.array(r_img, dtype=np.float32)
-            g_blur = np.array(g_img, dtype=np.float32)
-            b_blur = np.array(b_img, dtype=np.float32)
-            a_blur = np.array(a_img, dtype=np.float32)
+            # Premultiply and blur RGB channels
+            for c in range(3):
+                channel = arr[:, :, c].astype(np.float32)
+                premult = (channel * alpha / 255.0).astype(np.uint8)
+                blurred = np.array(Image.fromarray(premult, mode='L').filter(blur), dtype=np.float32)
+                blurred_channels.append(blurred)
+                del channel, premult
+
+            # Blur alpha channel
+            alpha_blurred = np.array(Image.fromarray(arr[:, :, 3], mode='L').filter(blur), dtype=np.float32)
+            del arr, alpha
 
             # Un-premultiply: R = R' * 255 / A (avoid division by zero)
-            alpha_blur_norm = np.maximum(a_blur, 1) / 255.0  # Avoid div by 0
-            r_final = np.clip(r_blur / alpha_blur_norm, 0, 255).astype(np.uint8)
-            g_final = np.clip(g_blur / alpha_blur_norm, 0, 255).astype(np.uint8)
-            b_final = np.clip(b_blur / alpha_blur_norm, 0, 255).astype(np.uint8)
-            a_final = a_blur.astype(np.uint8)
+            alpha_safe = np.maximum(alpha_blurred, 1.0)
+            result = np.empty((temp_image.height, temp_image.width, 4), dtype=np.uint8)
+            for c in range(3):
+                result[:, :, c] = np.clip(blurred_channels[c] * 255.0 / alpha_safe, 0, 255).astype(np.uint8)
+            result[:, :, 3] = alpha_blurred.astype(np.uint8)
+            del blurred_channels, alpha_blurred, alpha_safe
 
-            temp_image = Image.merge("RGBA", (
-                Image.fromarray(r_final, mode='L'),
-                Image.fromarray(g_final, mode='L'),
-                Image.fromarray(b_final, mode='L'),
-                Image.fromarray(a_final, mode='L')
-            ))
+            temp_image = Image.fromarray(result, mode='RGBA')
+            del result
 
         # Apply filter region clipping
         if elem_bbox:
@@ -1256,12 +1248,18 @@ class SVGRenderer:
             stroke_polygon.append((left_points[0][0] - d[0] * half_width,
                                    left_points[0][1] - d[1] * half_width))
 
-        # Draw the stroke polygon
+        # Draw the stroke polygon (memory-optimized for semi-transparent strokes)
         if stroke[3] < 255:
-            temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(temp, "RGBA")
-            draw.polygon(stroke_polygon, fill=stroke)
-            ctx.image.alpha_composite(temp)
+            xs = [p[0] for p in stroke_polygon]
+            ys = [p[1] for p in stroke_polygon]
+            min_x, max_x = max(0, int(min(xs))), min(ctx.image.width, int(max(xs)) + 1)
+            min_y, max_y = max(0, int(min(ys))), min(ctx.image.height, int(max(ys)) + 1)
+            if min_x < max_x and min_y < max_y:
+                temp = Image.new("RGBA", (max_x - min_x, max_y - min_y), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(temp, "RGBA")
+                local_poly = [(x - min_x, y - min_y) for x, y in stroke_polygon]
+                draw.polygon(local_poly, fill=stroke)
+                ctx.image.alpha_composite(temp, (min_x, min_y))
         else:
             draw = ImageDraw.Draw(ctx.image, "RGBA")
             draw.polygon(stroke_polygon, fill=stroke)
@@ -1757,10 +1755,17 @@ class SVGRenderer:
             else:
                 # Simple non-intersecting polygon - PIL's polygon works fine
                 if fill[3] < 255:
-                    temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-                    draw = ImageDraw.Draw(temp, "RGBA")
-                    draw.polygon(points, fill=fill)
-                    ctx.image.alpha_composite(temp)
+                    # Memory-optimized: use cropped-size temp instead of full-size
+                    xs = [p[0] for p in points]
+                    ys = [p[1] for p in points]
+                    min_x, max_x = max(0, int(min(xs))), min(ctx.image.width, int(max(xs)) + 1)
+                    min_y, max_y = max(0, int(min(ys))), min(ctx.image.height, int(max(ys)) + 1)
+                    if min_x < max_x and min_y < max_y:
+                        temp = Image.new("RGBA", (max_x - min_x, max_y - min_y), (0, 0, 0, 0))
+                        draw = ImageDraw.Draw(temp, "RGBA")
+                        local_points = [(x - min_x, y - min_y) for x, y in points]
+                        draw.polygon(local_points, fill=fill)
+                        ctx.image.alpha_composite(temp, (min_x, min_y))
                 else:
                     draw = ImageDraw.Draw(ctx.image, "RGBA")
                     draw.polygon(points, fill=fill)
@@ -1916,16 +1921,10 @@ class SVGRenderer:
                     winding += direction
                     prev_x = x_int
 
-        # Apply fill using mask
+        # Apply fill using mask (memory-optimized: no full-size temp)
         mask_img = Image.fromarray(mask_arr, "L")
-        fill_img = Image.new("RGBA", (crop_width, crop_height), fill)
-
-        if fill[3] < 255:
-            temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-            temp.paste(fill_img, (min_x, min_y), mask_img)
-            ctx.image.alpha_composite(temp)
-        else:
-            ctx.image.paste(fill_img, (min_x, min_y), mask_img)
+        fill_img = Image.new("RGBA", (crop_width, crop_height), fill[:3] + (255,))
+        self._composite_masked_fill(ctx, fill_img, mask_img, min_x, min_y, fill[3])
 
     def _fill_multi_polygon_evenodd(self, ctx: "RenderContext",
                                      polygons: list[list[tuple[float, float]]],
@@ -1963,48 +1962,52 @@ class SVGRenderer:
         width = max_x - min_x
         height = max_y - min_y
 
-        # Create mask using scanline algorithm with even-odd rule across ALL polygons
-        mask = np.zeros((height, width), dtype=np.uint8)
+        # Use Rust implementation if available (much faster)
+        if HAS_RUST:
+            mask = vectorstag_rust.fill_multi_polygon_evenodd(polygons, width, height, min_x, min_y)
+        else:
+            # Create mask using scanline algorithm with even-odd rule across ALL polygons
+            mask = np.zeros((height, width), dtype=np.uint8)
 
-        # Build edge list from all polygons
-        all_edges = []
-        for poly in polygons:
-            closed_points = list(poly)
-            if closed_points[0] != closed_points[-1]:
-                closed_points.append(closed_points[0])
+            # Build edge list from all polygons
+            all_edges = []
+            for poly in polygons:
+                closed_points = list(poly)
+                if closed_points[0] != closed_points[-1]:
+                    closed_points.append(closed_points[0])
 
-            n = len(closed_points) - 1
-            for i in range(n):
-                p1 = closed_points[i]
-                p2 = closed_points[i + 1]
-                all_edges.append((p1, p2))
+                n = len(closed_points) - 1
+                for i in range(n):
+                    p1 = closed_points[i]
+                    p2 = closed_points[i + 1]
+                    all_edges.append((p1, p2))
 
-        # For each scanline
-        for y in range(height):
-            screen_y = y + min_y + 0.5  # Center of pixel
+            # For each scanline
+            for y in range(height):
+                screen_y = y + min_y + 0.5  # Center of pixel
 
-            # Find intersections with all edges from all polygons
-            intersections = []
+                # Find intersections with all edges from all polygons
+                intersections = []
 
-            for p1, p2 in all_edges:
-                # Check if edge crosses this scanline
-                if (p1[1] <= screen_y < p2[1]) or (p2[1] <= screen_y < p1[1]):
-                    # Compute x intersection
-                    if abs(p2[1] - p1[1]) > 1e-10:
-                        t = (screen_y - p1[1]) / (p2[1] - p1[1])
-                        x_intersect = p1[0] + t * (p2[0] - p1[0])
-                        intersections.append(x_intersect)
+                for p1, p2 in all_edges:
+                    # Check if edge crosses this scanline
+                    if (p1[1] <= screen_y < p2[1]) or (p2[1] <= screen_y < p1[1]):
+                        # Compute x intersection
+                        if abs(p2[1] - p1[1]) > 1e-10:
+                            t = (screen_y - p1[1]) / (p2[1] - p1[1])
+                            x_intersect = p1[0] + t * (p2[0] - p1[0])
+                            intersections.append(x_intersect)
 
-            # Sort intersections
-            intersections.sort()
+                # Sort intersections
+                intersections.sort()
 
-            # Fill between pairs (even-odd rule)
-            for i in range(0, len(intersections) - 1, 2):
-                x_start = max(0, int(intersections[i] - min_x))
-                x_end = min(width, int(intersections[i + 1] - min_x) + 1)
-                mask[y, x_start:x_end] = 255
+                # Fill between pairs (even-odd rule)
+                for i in range(0, len(intersections) - 1, 2):
+                    x_start = max(0, int(intersections[i] - min_x))
+                    x_end = min(width, int(intersections[i + 1] - min_x) + 1)
+                    mask[y, x_start:x_end] = 255
 
-        # Apply fill using mask
+        # Apply fill using mask (memory-optimized: no full-size temp)
         mask_img = Image.fromarray(mask, "L")
 
         if fill_ref and fill_ref.startswith("url("):
@@ -2019,19 +2022,11 @@ class SVGRenderer:
                     style.fill_opacity * style.opacity,
                     element_transform
                 )
-                # Use alpha_composite for proper blending
-                temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-                temp.paste(grad_img, (min_x, min_y), mask_img)
-                ctx.image.alpha_composite(temp)
+                self._composite_gradient_masked(ctx, grad_img, mask_img, min_x, min_y)
         elif fill:
             # Solid fill
-            fill_img = Image.new("RGBA", (width, height), fill)
-            if fill[3] < 255:
-                temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-                temp.paste(fill_img, (min_x, min_y), mask_img)
-                ctx.image.alpha_composite(temp)
-            else:
-                ctx.image.paste(fill_img, (min_x, min_y), mask_img)
+            fill_img = Image.new("RGBA", (width, height), fill[:3] + (255,))
+            self._composite_masked_fill(ctx, fill_img, mask_img, min_x, min_y, fill[3])
 
     def _fill_multi_polygon_nonzero(self, ctx: "RenderContext",
                                       polygons: list[list[tuple[float, float]]],
@@ -2119,7 +2114,7 @@ class SVGRenderer:
                 winding += direction
                 prev_x = x_int
 
-        # Apply fill using mask
+        # Apply fill using mask (memory-optimized: no full-size temp)
         mask_img = Image.fromarray(mask, "L")
 
         if fill_ref and fill_ref.startswith("url("):
@@ -2134,22 +2129,11 @@ class SVGRenderer:
                     style.fill_opacity * style.opacity,
                     element_transform
                 )
-                # Use proper alpha compositing for gradients
-                temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-                grad_r, grad_g, grad_b, grad_a = grad_img.split()
-                masked_alpha = ImageChops.multiply(grad_a, mask_img)
-                grad_masked = Image.merge("RGBA", (grad_r, grad_g, grad_b, masked_alpha))
-                temp.paste(grad_masked, (min_x, min_y))
-                ctx.image.alpha_composite(temp)
+                self._composite_gradient_masked(ctx, grad_img, mask_img, min_x, min_y)
         elif fill:
             # Solid fill
-            fill_img = Image.new("RGBA", (width, height), fill)
-            if fill[3] < 255:
-                temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-                temp.paste(fill_img, (min_x, min_y), mask_img)
-                ctx.image.alpha_composite(temp)
-            else:
-                ctx.image.paste(fill_img, (min_x, min_y), mask_img)
+            fill_img = Image.new("RGBA", (width, height), fill[:3] + (255,))
+            self._composite_masked_fill(ctx, fill_img, mask_img, min_x, min_y, fill[3])
 
     def _create_gradient_for_mask(self, ctx: "RenderContext",
                                    gradient, width: int, height: int,
@@ -2194,55 +2178,52 @@ class SVGRenderer:
         width = max_x - min_x
         height = max_y - min_y
 
-        # Create mask using scanline algorithm with even-odd rule
-        mask = np.zeros((height, width), dtype=np.uint8)
-
-        # Close the polygon
-        closed_points = list(points)
-        if closed_points[0] != closed_points[-1]:
-            closed_points.append(closed_points[0])
-
-        n = len(closed_points) - 1
-
-        # For each scanline
-        for y in range(height):
-            screen_y = y + min_y + 0.5  # Center of pixel
-
-            # Find intersections with all edges
-            intersections = []
-
-            for i in range(n):
-                p1 = closed_points[i]
-                p2 = closed_points[i + 1]
-
-                # Check if edge crosses this scanline
-                if (p1[1] <= screen_y < p2[1]) or (p2[1] <= screen_y < p1[1]):
-                    # Compute x intersection
-                    if abs(p2[1] - p1[1]) > 1e-10:
-                        t = (screen_y - p1[1]) / (p2[1] - p1[1])
-                        x_intersect = p1[0] + t * (p2[0] - p1[0])
-                        intersections.append(x_intersect)
-
-            # Sort intersections
-            intersections.sort()
-
-            # Fill between pairs (even-odd rule)
-            for i in range(0, len(intersections) - 1, 2):
-                x_start = max(0, int(intersections[i] - min_x))
-                x_end = min(width, int(intersections[i + 1] - min_x) + 1)
-                mask[y, x_start:x_end] = 255
-
-        # Apply fill using mask with proper alpha compositing
-        fill_img = Image.new("RGBA", (width, height), fill)
-        mask_img = Image.fromarray(mask, "L")
-
-        if fill[3] < 255:
-            # Semi-transparent - need proper compositing
-            temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-            temp.paste(fill_img, (min_x, min_y), mask_img)
-            ctx.image.alpha_composite(temp)
+        # Use Rust implementation if available (much faster)
+        if HAS_RUST:
+            mask = vectorstag_rust.fill_polygon_evenodd(points, width, height, min_x, min_y)
         else:
-            ctx.image.paste(fill_img, (min_x, min_y), mask_img)
+            # Create mask using scanline algorithm with even-odd rule
+            mask = np.zeros((height, width), dtype=np.uint8)
+
+            # Close the polygon
+            closed_points = list(points)
+            if closed_points[0] != closed_points[-1]:
+                closed_points.append(closed_points[0])
+
+            n = len(closed_points) - 1
+
+            # For each scanline
+            for y in range(height):
+                screen_y = y + min_y + 0.5  # Center of pixel
+
+                # Find intersections with all edges
+                intersections = []
+
+                for i in range(n):
+                    p1 = closed_points[i]
+                    p2 = closed_points[i + 1]
+
+                    # Check if edge crosses this scanline
+                    if (p1[1] <= screen_y < p2[1]) or (p2[1] <= screen_y < p1[1]):
+                        # Compute x intersection
+                        if abs(p2[1] - p1[1]) > 1e-10:
+                            t = (screen_y - p1[1]) / (p2[1] - p1[1])
+                            x_intersect = p1[0] + t * (p2[0] - p1[0])
+                            intersections.append(x_intersect)
+
+                # Sort intersections
+                intersections.sort()
+
+                # Fill between pairs (even-odd rule)
+                for i in range(0, len(intersections) - 1, 2):
+                    x_start = max(0, int(intersections[i] - min_x))
+                    x_end = min(width, int(intersections[i + 1] - min_x) + 1)
+                    mask[y, x_start:x_end] = 255
+
+        # Apply fill using mask (memory-optimized: no full-size temp)
+        mask_img = Image.fromarray(mask, "L")
+        fill_img = Image.new("RGBA", (width, height), fill[:3] + (255,))
+        self._composite_masked_fill(ctx, fill_img, mask_img, min_x, min_y, fill[3])
 
     def _fill_polygon_with_gradient(self, ctx: "RenderContext",
                                     points: list[tuple[float, float]],
@@ -2292,20 +2273,15 @@ class SVGRenderer:
         if fill_rule == "evenodd":
             mask_crop = self._create_evenodd_mask(points, min_x, min_y, grad_width, grad_height)
         else:
-            mask = Image.new("L", (ctx.image.width, ctx.image.height), 0)
-            mask_draw = ImageDraw.Draw(mask)
-            mask_draw.polygon(points, fill=255)
-            mask_crop = mask.crop((min_x, min_y, max_x, max_y))
+            # Create cropped-size mask directly (memory-optimized)
+            mask_crop = Image.new("L", (grad_width, grad_height), 0)
+            mask_draw = ImageDraw.Draw(mask_crop)
+            # Offset points to local coordinates
+            local_points = [(x - min_x, y - min_y) for x, y in points]
+            mask_draw.polygon(local_points, fill=255)
 
-        # Apply gradient with mask using proper alpha compositing
-        # Create temp image for compositing
-        temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
-        # Apply mask to gradient's alpha channel
-        grad_r, grad_g, grad_b, grad_a = grad_img.split()
-        masked_alpha = ImageChops.multiply(grad_a, mask_crop)
-        grad_masked = Image.merge("RGBA", (grad_r, grad_g, grad_b, masked_alpha))
-        temp.paste(grad_masked, (min_x, min_y))
-        ctx.image.alpha_composite(temp)
+        # Apply gradient with mask (memory-optimized: no full-size temp)
+        self._composite_gradient_masked(ctx, grad_img, mask_crop, min_x, min_y)
 
     def _create_evenodd_mask(self, points: list[tuple[float, float]],
                              min_x: int, min_y: int, width: int, height: int) -> Image.Image:
@@ -2350,7 +2326,7 @@ class SVGRenderer:
                                       offset_x: int, offset_y: int,
                                       opacity: float,
                                       element_transform: Transform = None) -> Image.Image:
-        """Create an image filled with a linear gradient (vectorized)."""
+        """Create an image filled with a linear gradient (memory-optimized)."""
         if not gradient.stops:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
@@ -2371,15 +2347,12 @@ class SVGRenderer:
             x2, y2 = gradient.transform.apply(x2, y2)
 
         # For userSpaceOnUse, apply element transform then base transform
-        # The gradient coords are in user space, which needs to be transformed
-        # through the element's coordinate system to screen space
         if gradient.units == "userSpaceOnUse" and element_transform:
             x1, y1 = element_transform.apply(x1, y1)
             x2, y2 = element_transform.apply(x2, y2)
             x1, y1 = ctx.base_transform.apply(x1, y1)
             x2, y2 = ctx.base_transform.apply(x2, y2)
         else:
-            # Apply base transform to get screen coords
             x1, y1 = ctx.base_transform.apply(x1, y1)
             x2, y2 = ctx.base_transform.apply(x2, y2)
 
@@ -2394,26 +2367,27 @@ class SVGRenderer:
         dx /= length
         dy /= length
 
-        # Vectorized: create coordinate grids
-        y_coords, x_coords = np.mgrid[0:height, 0:width]
-        wx = x_coords + offset_x
-        wy = y_coords + offset_y
+        # Memory-optimized: use float32 and reuse arrays
+        # Create single coordinate array, compute t in-place
+        t = np.empty((height, width), dtype=np.float32)
+        y_base = np.arange(height, dtype=np.float32) + offset_y
+        x_base = np.arange(width, dtype=np.float32) + offset_x
 
-        # Project onto gradient line
-        t = ((wx - x1) * dx + (wy - y1) * dy) / length
+        # Compute t row by row to minimize peak memory
+        for row in range(height):
+            wy = y_base[row]
+            t[row, :] = ((x_base - x1) * dx + (wy - y1) * dy) / length
 
-        # Apply spreadMethod
+        # Apply spreadMethod in-place
         spread_method = getattr(gradient, 'spread_method', 'pad')
         if spread_method == "repeat":
-            # Wrap t to [0, 1) range
-            t = t % 1.0
+            np.remainder(t, 1.0, out=t)
         elif spread_method == "reflect":
-            # Reflect: 0→1→0→1...
-            # Use modulo 2 then fold back
-            t = t % 2.0
-            t = np.where(t > 1.0, 2.0 - t, t)
-        else:  # pad (default)
-            t = np.clip(t, 0, 1)
+            np.remainder(t, 2.0, out=t)
+            mask = t > 1.0
+            t[mask] = 2.0 - t[mask]
+        else:  # pad
+            np.clip(t, 0, 1, out=t)
 
         # Vectorized color interpolation
         pixels = self._interpolate_gradient_colors_vectorized(gradient.stops, t, opacity)
@@ -2426,7 +2400,7 @@ class SVGRenderer:
                                       offset_x: int, offset_y: int,
                                       opacity: float,
                                       element_transform: Transform = None) -> Image.Image:
-        """Create an image filled with a radial gradient (vectorized)."""
+        """Create an image filled with a radial gradient (memory-optimized)."""
         if not gradient.stops:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
@@ -2444,7 +2418,6 @@ class SVGRenderer:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
         # Build combined transform and compute inverse
-        # For userSpaceOnUse, include element transform
         combined_transform = ctx.base_transform
         if gradient.units == "userSpaceOnUse" and element_transform:
             combined_transform = ctx.base_transform.multiply(element_transform)
@@ -2455,36 +2428,35 @@ class SVGRenderer:
         if abs(det) < 1e-10:
             det = 1e-10
 
-        inv_a = combined_transform.d / det
-        inv_b = -combined_transform.c / det  # Fixed: was .b, should be .c
-        inv_c = -combined_transform.b / det  # Fixed: was .c, should be .b
-        inv_d = combined_transform.a / det
-        inv_e = (combined_transform.c * combined_transform.f - combined_transform.d * combined_transform.e) / det  # Fixed
-        inv_f = (combined_transform.b * combined_transform.e - combined_transform.a * combined_transform.f) / det  # Fixed
+        inv_a = float(combined_transform.d / det)
+        inv_b = float(-combined_transform.c / det)
+        inv_c = float(-combined_transform.b / det)
+        inv_d = float(combined_transform.a / det)
+        inv_e = float((combined_transform.c * combined_transform.f - combined_transform.d * combined_transform.e) / det)
+        inv_f = float((combined_transform.b * combined_transform.e - combined_transform.a * combined_transform.f) / det)
 
-        # Vectorized: create coordinate grids
-        y_coords, x_coords = np.mgrid[0:height, 0:width]
-        wx = x_coords + offset_x
-        wy = y_coords + offset_y
+        # Memory-optimized: use float32 and compute row by row
+        t = np.empty((height, width), dtype=np.float32)
+        x_base = np.arange(width, dtype=np.float32) + offset_x
 
-        # Inverse transform to gradient space
-        gx = inv_a * wx + inv_b * wy + inv_e
-        gy = inv_c * wx + inv_d * wy + inv_f
+        for row in range(height):
+            wy = float(row + offset_y)
+            # Inverse transform to gradient space
+            gx = inv_a * x_base + (inv_b * wy + inv_e)
+            gy = inv_c * x_base + (inv_d * wy + inv_f)
+            # Distance from center, normalized
+            t[row, :] = np.sqrt((gx - cx) ** 2 + (gy - cy) ** 2) / r
 
-        # Distance from center, normalized to 0-1
-        t = np.sqrt((gx - cx) ** 2 + (gy - cy) ** 2) / r
-
-        # Apply spreadMethod
+        # Apply spreadMethod in-place
         spread_method = getattr(gradient, 'spread_method', 'pad')
         if spread_method == "repeat":
-            # Wrap t to [0, 1) range
-            t = t % 1.0
+            np.remainder(t, 1.0, out=t)
         elif spread_method == "reflect":
-            # Reflect: 0→1→0→1...
-            t = t % 2.0
-            t = np.where(t > 1.0, 2.0 - t, t)
-        else:  # pad (default)
-            t = np.clip(t, 0, 1)
+            np.remainder(t, 2.0, out=t)
+            mask = t > 1.0
+            t[mask] = 2.0 - t[mask]
+        else:  # pad
+            np.clip(t, 0, 1, out=t)
 
         # Vectorized color interpolation
         pixels = self._interpolate_gradient_colors_vectorized(gradient.stops, t, opacity)
@@ -2492,61 +2464,46 @@ class SVGRenderer:
 
     def _interpolate_gradient_colors_vectorized(self, stops: list[GradientStop],
                                                   t: np.ndarray, opacity: float) -> np.ndarray:
-        """Vectorized color interpolation for entire gradient image."""
+        """Memory-optimized vectorized color interpolation for gradient images."""
         height, width = t.shape
-        pixels = np.zeros((height, width, 4), dtype=np.uint8)
+        pixels = np.empty((height, width, 4), dtype=np.uint8)
 
         if not stops:
+            pixels.fill(0)
             return pixels
 
         # Build arrays of stop offsets and colors
-        offsets = np.array([s.offset for s in stops])
+        offsets = np.array([s.offset for s in stops], dtype=np.float32)
         colors = np.array([s.color for s in stops], dtype=np.float32)
 
-        # For each pair of adjacent stops, fill in the pixels
-        for i in range(len(stops) - 1):
-            s1_offset, s2_offset = offsets[i], offsets[i + 1]
-            s1_color, s2_color = colors[i], colors[i + 1]
+        # Use searchsorted to find which stop segment each pixel belongs to
+        # This is more memory efficient than creating masks for each segment
+        indices = np.searchsorted(offsets, t, side='right') - 1
+        np.clip(indices, 0, len(stops) - 2, out=indices)
 
-            # Mask for pixels in this range
-            if i == 0:
-                mask = t <= s2_offset
-            elif i == len(stops) - 2:
-                mask = t > s1_offset
+        # Pre-compute ratios for all pixels
+        # ratio = (t - offset[i]) / (offset[i+1] - offset[i])
+        lower_offsets = offsets[indices]
+        upper_offsets = offsets[indices + 1]
+        denom = upper_offsets - lower_offsets
+
+        # Avoid division by zero - where denom is tiny, use 0 ratio
+        safe_denom = np.where(denom > 1e-10, denom, 1.0)
+        ratio = np.clip((t - lower_offsets) / safe_denom, 0, 1)
+        ratio = np.where(denom > 1e-10, ratio, 0.0).astype(np.float32)
+
+        # Interpolate each color channel
+        for c in range(4):
+            lower_colors = colors[indices, c]
+            upper_colors = colors[indices + 1, c]
+            interp = lower_colors + ratio * (upper_colors - lower_colors)
+            if c == 3:  # Alpha channel
+                pixels[:, :, c] = (interp * opacity).astype(np.uint8)
             else:
-                mask = (t > s1_offset) & (t <= s2_offset)
+                pixels[:, :, c] = interp.astype(np.uint8)
 
-            if not np.any(mask):
-                continue
-
-            # Compute interpolation ratio
-            denom = s2_offset - s1_offset
-            if denom < 1e-10:
-                ratio = np.zeros_like(t)
-            else:
-                ratio = np.clip((t - s1_offset) / denom, 0, 1)
-
-            # Interpolate colors for masked pixels
-            for c in range(4):
-                interp = s1_color[c] + ratio * (s2_color[c] - s1_color[c])
-                if c == 3:  # Alpha channel
-                    pixels[:, :, c] = np.where(mask, (interp * opacity).astype(np.uint8), pixels[:, :, c])
-                else:
-                    pixels[:, :, c] = np.where(mask, interp.astype(np.uint8), pixels[:, :, c])
-
-        # Handle pixels before first stop
-        before_mask = t <= offsets[0]
-        if np.any(before_mask):
-            for c in range(4):
-                val = colors[0][c] if c < 3 else colors[0][c] * opacity
-                pixels[:, :, c] = np.where(before_mask, int(val), pixels[:, :, c])
-
-        # Handle pixels after last stop
-        after_mask = t >= offsets[-1]
-        if np.any(after_mask):
-            for c in range(4):
-                val = colors[-1][c] if c < 3 else colors[-1][c] * opacity
-                pixels[:, :, c] = np.where(after_mask, int(val), pixels[:, :, c])
+        # Clean up large temporaries
+        del indices, lower_offsets, upper_offsets, denom, safe_denom, ratio
 
         return pixels
 
@@ -2579,6 +2536,40 @@ class SVGRenderer:
                 )
 
         return stops[-1].color
+
+    def _composite_masked_fill(self, ctx: "RenderContext", fill_img: Image.Image,
+                               mask_img: Image.Image, dest_x: int, dest_y: int,
+                               fill_alpha: int = 255):
+        """Composite a masked fill without creating a full-size temp image.
+
+        Args:
+            ctx: Render context
+            fill_img: The fill image (same size as mask)
+            mask_img: The mask image (L mode)
+            dest_x, dest_y: Destination coordinates on ctx.image
+            fill_alpha: Alpha value of the fill (0-255)
+        """
+        # Apply mask to fill's alpha channel
+        if fill_alpha < 255:
+            # Scale mask by fill alpha for semi-transparent fills
+            scaled_mask = mask_img.point(lambda x: x * fill_alpha // 255)
+            fill_img.putalpha(scaled_mask)
+        else:
+            fill_img.putalpha(mask_img)
+
+        # Composite directly at destination without full-size temp
+        ctx.image.alpha_composite(fill_img, (dest_x, dest_y))
+
+    def _composite_gradient_masked(self, ctx: "RenderContext", grad_img: Image.Image,
+                                    mask_img: Image.Image, dest_x: int, dest_y: int):
+        """Composite a gradient with mask without creating a full-size temp image."""
+        # Apply mask to gradient's alpha channel
+        grad_r, grad_g, grad_b, grad_a = grad_img.split()
+        masked_alpha = ImageChops.multiply(grad_a, mask_img)
+        grad_masked = Image.merge("RGBA", (grad_r, grad_g, grad_b, masked_alpha))
+
+        # Composite directly at destination
+        ctx.image.alpha_composite(grad_masked, (dest_x, dest_y))
 
     # Font mapping for common font families
     FONT_PATHS = {

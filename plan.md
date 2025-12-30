@@ -5,7 +5,12 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 
 ## Current Status: 99.9% Emoji / 99.7% Flag Accuracy
 
-**Date**: 2025-12-29
+**Date**: 2025-12-30
+
+### Performance vs Reference Renderers
+- **VectorStag**: ~9.4 files/sec at 400x400 with 4x antialiasing
+- **CairoSVG**: ~24 files/sec (VectorStag is ~0.4x)
+- **Resvg**: ~75 files/sec (VectorStag is ~0.13x)
 
 ### Emoji Test Results (3427 Noto emojis)
 - **Average Accuracy**: 99.9%
@@ -50,11 +55,18 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 
 ## Recent Optimizations & Fixes
 
-### Performance (2025-12-29)
+### Performance (2025-12-30)
 1. **Vectorized gradient rendering** - 5.7x faster using numpy
 2. **Optimized self-intersection check** - Skip for >200 points, limit to 5000 pairs
 3. **Vectorized scanline fill** - Numpy-based edge processing
-4. **Multiprocessing** - 16-worker parallel testing
+4. **Multiprocessing** - 12-worker parallel testing (memory-optimized)
+5. **Memory optimization** - Eliminated full-size temp images, use cropped regions
+6. **Rust fill algorithms** - `fill_polygon_evenodd` and `fill_multi_polygon_evenodd` via Rust extension
+7. **Float32 gradients** - Reduced memory from float64 to float32, row-by-row computation
+
+### Bug Fixes (2025-12-30)
+1. **Recursion protection** - Added MAX_PARSE_DEPTH and MAX_RENDER_DEPTH limits to prevent stack overflow
+2. **Circular `<use>` detection** - Track `_use_stack` to prevent infinite loops on circular references
 
 ### Bug Fixes (2025-12-29)
 1. **Gradient alpha compositing** - Fixed `paste` → `alpha_composite` for proper transparency
