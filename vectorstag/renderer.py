@@ -86,9 +86,6 @@ class SVGRenderer:
         render_width = out_width * aa
         render_height = out_height * aa
 
-        # Create image at higher resolution for anti-aliasing
-        image = Image.new("RGBA", (render_width, render_height), self.background)
-
         # Calculate scaling transform (including AA factor)
         scale_x = render_width / src_w if src_w else 1
         scale_y = render_height / src_h if src_h else 1
@@ -114,15 +111,33 @@ class SVGRenderer:
                 Transform.scale(scale)
             )
 
-        # Create render context
+        # Create numpy array directly (skip PIL Image.new for Rust path)
+        if HAS_RUST:
+            # Create numpy array with background color directly
+            image_arr = np.zeros((render_height, render_width, 4), dtype=np.uint8)
+            if self.background != (0, 0, 0, 0):
+                image_arr[:, :] = self.background
+            image = None  # We'll create PIL image at the end if needed
+        else:
+            # Fallback: create PIL image for non-Rust path
+            image = Image.new("RGBA", (render_width, render_height), self.background)
+            image_arr = None
+
+        # Create render context with numpy array as primary (if Rust available)
         ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.filters)
+        ctx.image_arr = image_arr
 
         # Render all elements
         for element in doc.elements:
             self._render_element(ctx, element)
 
+        # Get the rendered array (either from ctx or convert from PIL)
+        if HAS_RUST and ctx.image_arr is not None:
+            img_arr = ctx.image_arr
+        else:
+            img_arr = np.array(image)
+
         # Apply viewBox clipping - hide content outside viewBox bounds
-        img_arr = None  # Track numpy array for potential reuse in resize
         if doc.viewBox:
             vb_x, vb_y, vb_w, vb_h = doc.viewBox
 
@@ -163,33 +178,26 @@ class SVGRenderer:
                           clip_x2 < render_width or clip_y2 < render_height))
 
             if needs_clip:
-                # Use numpy for faster clipping
-                img_arr = np.array(image)
                 # Zero out alpha outside clip bounds
                 img_arr[:clip_y1, :, 3] = 0  # Top
                 img_arr[clip_y2:, :, 3] = 0  # Bottom
                 img_arr[:, :clip_x1, 3] = 0  # Left
                 img_arr[:, clip_x2:, 3] = 0  # Right
-                # If we'll resize with Rust, keep as numpy; otherwise convert back
-                if not (aa > 1 and HAS_RUST):
-                    image = Image.fromarray(img_arr, "RGBA")
-            else:
-                img_arr = None
 
         # Downscale for anti-aliasing effect
         if aa > 1:
             if HAS_RUST:
                 # Use Rust box filter resize (faster for 4x downscale)
-                if img_arr is None:
-                    img_arr = np.ascontiguousarray(np.array(image))
-                elif not img_arr.flags['C_CONTIGUOUS']:
+                if not img_arr.flags['C_CONTIGUOUS']:
                     img_arr = np.ascontiguousarray(img_arr)
                 resized_arr = vectorstag_rust.resize_rgba(img_arr, out_width, out_height)
-                image = Image.fromarray(resized_arr, "RGBA")
+                return Image.fromarray(resized_arr, "RGBA")
             else:
-                image = image.resize((out_width, out_height), Image.LANCZOS)
+                image = Image.fromarray(img_arr, "RGBA")
+                return image.resize((out_width, out_height), Image.LANCZOS)
 
-        return image
+        # No resize needed - convert to PIL at the end
+        return Image.fromarray(img_arr, "RGBA")
 
     def _render_element(self, ctx: "RenderContext", element: SVGElement, depth: int = 0):
         """Render a single element."""
@@ -236,7 +244,7 @@ class SVGRenderer:
         clip_path = ctx.clip_paths[element.clip_path_id]
 
         # Create a temporary image for the element
-        temp_image = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+        temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
         temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.filters)
 
         # Render the element without clipping to the temp image
@@ -291,13 +299,13 @@ class SVGRenderer:
             # Region in screen coordinates with padding
             region_x = max(0, int(ex) - blur_padding)
             region_y = max(0, int(ey) - blur_padding)
-            region_x2 = min(ctx.image.width, int(ex + ew) + blur_padding)
-            region_y2 = min(ctx.image.height, int(ey + eh) + blur_padding)
+            region_x2 = min(ctx.image_width, int(ex + ew) + blur_padding)
+            region_y2 = min(ctx.image_height, int(ey + eh) + blur_padding)
             region_w = region_x2 - region_x
             region_h = region_y2 - region_y
 
             # Only use region optimization if region is significantly smaller than full image
-            use_region = region_w * region_h < ctx.image.width * ctx.image.height * 0.5
+            use_region = region_w * region_h < ctx.image_width * ctx.image_height * 0.5
         else:
             use_region = False
 
@@ -312,7 +320,7 @@ class SVGRenderer:
         else:
             # Fall back to full image rendering
             region_x, region_y = 0, 0
-            temp_image = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+            temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
             temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.filters)
 
         # Render the element without filter to the temp image
@@ -441,7 +449,7 @@ class SVGRenderer:
     def _create_clip_mask(self, ctx: "RenderContext", clip_path: ClipPath,
                           element_transform: Transform) -> Image.Image:
         """Create a mask image from a clip path."""
-        mask = Image.new("L", ctx.image.size, 0)
+        mask = Image.new("L", ctx.image_size, 0)
 
         for clip_elem in clip_path.elements:
             full_transform = ctx.base_transform.multiply(element_transform).multiply(clip_elem.transform)
@@ -995,9 +1003,9 @@ class SVGRenderer:
 
         int_width = max(1, int(width))
 
-        # Use temp image for semi-transparent strokes
-        if stroke[3] < 255:
-            temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+        # Use temp image for semi-transparent strokes or when ctx.image is None (Rust path)
+        if stroke[3] < 255 or ctx.image is None:
+            temp = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
             draw = ImageDraw.Draw(temp, "RGBA")
         else:
             temp = None
@@ -1264,21 +1272,8 @@ class SVGRenderer:
             stroke_polygon.append((left_points[0][0] - d[0] * half_width,
                                    left_points[0][1] - d[1] * half_width))
 
-        # Draw the stroke polygon (memory-optimized for semi-transparent strokes)
-        if stroke[3] < 255:
-            xs = [p[0] for p in stroke_polygon]
-            ys = [p[1] for p in stroke_polygon]
-            min_x, max_x = max(0, int(min(xs))), min(ctx.image.width, int(max(xs)) + 1)
-            min_y, max_y = max(0, int(min(ys))), min(ctx.image.height, int(max(ys)) + 1)
-            if min_x < max_x and min_y < max_y:
-                temp = Image.new("RGBA", (max_x - min_x, max_y - min_y), (0, 0, 0, 0))
-                draw = ImageDraw.Draw(temp, "RGBA")
-                local_poly = [(x - min_x, y - min_y) for x, y in stroke_polygon]
-                draw.polygon(local_poly, fill=stroke)
-                self._alpha_composite(ctx, temp, min_x, min_y)
-        else:
-            draw = ImageDraw.Draw(ctx.image, "RGBA")
-            draw.polygon(stroke_polygon, fill=stroke)
+        # Draw the stroke polygon using fast path when available
+        self._fill_polygon_with_rule(ctx, stroke_polygon, stroke, "nonzero")
 
     def _stroke_closed_polygon(self, ctx: "RenderContext", points: List[Tuple[float, float]],
                                stroke: Tuple[int, int, int, int], half_width: float,
@@ -1339,8 +1334,8 @@ class SVGRenderer:
         ys = [p[1] for p in points]
         min_x = max(0, int(min(xs) - half_width - 2))
         min_y = max(0, int(min(ys) - half_width - 2))
-        max_x = min(ctx.image.width, int(max(xs) + half_width + 2))
-        max_y = min(ctx.image.height, int(max(ys) + half_width + 2))
+        max_x = min(ctx.image_width, int(max(xs) + half_width + 2))
+        max_y = min(ctx.image_height, int(max(ys) + half_width + 2))
 
         if min_x >= max_x or min_y >= max_y:
             return
@@ -1446,7 +1441,7 @@ class SVGRenderer:
         """
         n = len(points)
 
-        temp = Image.new("RGBA", ctx.image.size, (0, 0, 0, 0))
+        temp = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(temp, "RGBA")
 
         # For each edge, draw a quadrilateral
@@ -1794,27 +1789,32 @@ class SVGRenderer:
                                 fill: tuple[int, int, int, int],
                                 fill_rule: str):
         """Fill a polygon with the specified fill rule."""
+        # Fast path: use Rust to render directly to numpy array
+        if HAS_RUST and ctx.image_arr is not None:
+            fill_rule_code = 1 if fill_rule == "evenodd" else 0
+            vectorstag_rust.fill_polygon_to_array(
+                ctx.image_arr, points,
+                fill[0], fill[1], fill[2], fill[3],
+                fill_rule_code
+            )
+            return
+
+        # Fallback: PIL-based rendering
         if fill_rule == "evenodd":
             self._fill_polygon_evenodd(ctx, points, fill)
         else:
             # Check if polygon is self-intersecting (stars, complex shapes)
-            # PIL's polygon() uses even-odd rule, so we need scanline nonzero for self-intersecting
             if self._is_self_intersecting(points):
                 self._fill_polygon_nonzero_color(ctx, points, fill)
             else:
-                # Simple non-intersecting polygon - use Rust if available
+                # Simple non-intersecting polygon
                 xs = [p[0] for p in points]
                 ys = [p[1] for p in points]
-                min_x, max_x = max(0, int(min(xs))), min(ctx.image.width, int(max(xs)) + 1)
-                min_y, max_y = max(0, int(min(ys))), min(ctx.image.height, int(max(ys)) + 1)
+                min_x, max_x = max(0, int(min(xs))), min(ctx.image_width, int(max(xs)) + 1)
+                min_y, max_y = max(0, int(min(ys))), min(ctx.image_height, int(max(ys)) + 1)
                 if min_x < max_x and min_y < max_y:
                     width, height = max_x - min_x, max_y - min_y
-                    if HAS_RUST:
-                        mask = vectorstag_rust.fill_polygon_nonzero(points, width, height, min_x, min_y)
-                        mask_img = Image.fromarray(mask, "L")
-                        fill_img = Image.new("RGBA", (width, height), fill[:3] + (255,))
-                        self._composite_masked_fill(ctx, fill_img, mask_img, min_x, min_y, fill[3])
-                    elif fill[3] < 255:
+                    if fill[3] < 255 or ctx.image is None:
                         temp = Image.new("RGBA", (width, height), (0, 0, 0, 0))
                         draw = ImageDraw.Draw(temp, "RGBA")
                         local_points = [(x - min_x, y - min_y) for x, y in points]
@@ -1890,7 +1890,7 @@ class SVGRenderer:
         if len(points) < 3:
             return
 
-        width, height = ctx.image.size
+        width, height = ctx.image_size
 
         # Get bounding box using numpy for speed
         pts_arr = np.array(points)
@@ -2007,8 +2007,8 @@ class SVGRenderer:
         # Clip to image bounds
         min_x = max(0, min_x)
         min_y = max(0, min_y)
-        max_x = min(ctx.image.width, max_x)
-        max_y = min(ctx.image.height, max_y)
+        max_x = min(ctx.image_width, max_x)
+        max_y = min(ctx.image_height, max_y)
 
         if min_x >= max_x or min_y >= max_y:
             return
@@ -2109,8 +2109,8 @@ class SVGRenderer:
         # Clip to image bounds
         min_x = max(0, min_x)
         min_y = max(0, min_y)
-        max_x = min(ctx.image.width, max_x)
-        max_y = min(ctx.image.height, max_y)
+        max_x = min(ctx.image_width, max_x)
+        max_y = min(ctx.image_height, max_y)
 
         if min_x >= max_x or min_y >= max_y:
             return
@@ -2176,7 +2176,7 @@ class SVGRenderer:
         mask_img = Image.fromarray(mask, "L")
 
         if fill_ref and fill_ref.startswith("url("):
-            # Gradient fill
+            # Gradient fill - still needs mask-based approach
             match = fill_ref[4:-1]
             if match.startswith("#"):
                 match = match[1:]
@@ -2189,9 +2189,16 @@ class SVGRenderer:
                 )
                 self._composite_gradient_masked(ctx, grad_img, mask_img, min_x, min_y)
         elif fill:
-            # Solid fill
-            fill_img = Image.new("RGBA", (width, height), fill[:3] + (255,))
-            self._composite_masked_fill(ctx, fill_img, mask_img, min_x, min_y, fill[3])
+            # Solid fill - use Rust direct rendering if available
+            if HAS_RUST and ctx.image_arr is not None:
+                vectorstag_rust.fill_multi_polygon_to_array(
+                    ctx.image_arr, polygons,
+                    fill[0], fill[1], fill[2], fill[3],
+                    0  # nonzero fill rule
+                )
+            else:
+                fill_img = Image.new("RGBA", (width, height), fill[:3] + (255,))
+                self._composite_masked_fill(ctx, fill_img, mask_img, min_x, min_y, fill[3])
 
     def _create_gradient_for_mask(self, ctx: "RenderContext",
                                    gradient, width: int, height: int,
@@ -2227,8 +2234,8 @@ class SVGRenderer:
         # Clip to image bounds
         min_x = max(0, min_x)
         min_y = max(0, min_y)
-        max_x = min(ctx.image.width, max_x)
-        max_y = min(ctx.image.height, max_y)
+        max_x = min(ctx.image_width, max_x)
+        max_y = min(ctx.image_height, max_y)
 
         if min_x >= max_x or min_y >= max_y:
             return
@@ -2306,8 +2313,8 @@ class SVGRenderer:
         # Clip to image bounds
         min_x = max(0, min_x)
         min_y = max(0, min_y)
-        max_x = min(ctx.image.width, max_x)
-        max_y = min(ctx.image.height, max_y)
+        max_x = min(ctx.image_width, max_x)
+        max_y = min(ctx.image_height, max_y)
 
         if min_x >= max_x or min_y >= max_y:
             return
@@ -2328,22 +2335,24 @@ class SVGRenderer:
             )
 
         # Create mask from polygon with fill-rule support using Rust if available
+        # Keep mask as numpy array for optimal performance
         if HAS_RUST:
             if fill_rule == "evenodd":
-                mask = vectorstag_rust.fill_polygon_evenodd(points, grad_width, grad_height, min_x, min_y)
+                mask_arr = vectorstag_rust.fill_polygon_evenodd(points, grad_width, grad_height, min_x, min_y)
             else:
-                mask = vectorstag_rust.fill_polygon_nonzero(points, grad_width, grad_height, min_x, min_y)
-            mask_crop = Image.fromarray(mask, "L")
+                mask_arr = vectorstag_rust.fill_polygon_nonzero(points, grad_width, grad_height, min_x, min_y)
         elif fill_rule == "evenodd":
-            mask_crop = self._create_evenodd_mask(points, min_x, min_y, grad_width, grad_height)
+            mask_img = self._create_evenodd_mask(points, min_x, min_y, grad_width, grad_height)
+            mask_arr = np.array(mask_img)
         else:
             mask_crop = Image.new("L", (grad_width, grad_height), 0)
             mask_draw = ImageDraw.Draw(mask_crop)
             local_points = [(x - min_x, y - min_y) for x, y in points]
             mask_draw.polygon(local_points, fill=255)
+            mask_arr = np.array(mask_crop)
 
         # Apply gradient with mask (memory-optimized: no full-size temp)
-        self._composite_gradient_masked(ctx, grad_img, mask_crop, min_x, min_y)
+        self._composite_gradient_masked(ctx, grad_img, mask_arr, min_x, min_y)
 
     def _create_evenodd_mask(self, points: list[tuple[float, float]],
                              min_x: int, min_y: int, width: int, height: int) -> Image.Image:
@@ -2446,7 +2455,8 @@ class SVGRenderer:
                 float(x1), float(y1), float(dx), float(dy), float(length),
                 offsets, colors, opacity, spread_code
             )
-            return Image.fromarray(pixels, "RGBA")
+            # Return numpy array directly - avoid PIL conversion
+            return pixels
 
         # Python fallback
         t = np.empty((height, width), dtype=np.float32)
@@ -2529,7 +2539,8 @@ class SVGRenderer:
                 inv_a, inv_b, inv_c, inv_d, inv_e, inv_f,
                 offsets, colors, opacity, spread_code
             )
-            return Image.fromarray(pixels, "RGBA")
+            # Return numpy array directly - avoid PIL conversion
+            return pixels
 
         # Python fallback
         t = np.empty((height, width), dtype=np.float32)
@@ -2633,9 +2644,46 @@ class SVGRenderer:
 
     def _alpha_composite(self, ctx: "RenderContext", src_img: Image.Image,
                          dest_x: int, dest_y: int):
-        """Alpha composite src onto ctx.image at destination coordinates."""
-        # Note: Rust alpha_composite has too much conversion overhead vs PIL
-        ctx.image.alpha_composite(src_img, (dest_x, dest_y))
+        """Alpha composite src onto ctx.image or ctx.image_arr at destination coordinates."""
+        if ctx.image is not None:
+            # Use PIL's native compositing
+            ctx.image.alpha_composite(src_img, (dest_x, dest_y))
+        elif HAS_RUST:
+            # Use Rust for fast compositing onto numpy array
+            src_arr = np.ascontiguousarray(np.array(src_img))
+            vectorstag_rust.alpha_composite_inplace(ctx.image_arr, src_arr, dest_x, dest_y)
+        else:
+            # Fallback: numpy alpha compositing
+            src_arr = np.array(src_img)
+            src_h, src_w = src_arr.shape[:2]
+            dst_h, dst_w = ctx.image_arr.shape[:2]
+
+            # Clip to destination bounds
+            x1, y1 = max(0, dest_x), max(0, dest_y)
+            x2, y2 = min(dst_w, dest_x + src_w), min(dst_h, dest_y + src_h)
+            if x2 <= x1 or y2 <= y1:
+                return
+
+            # Corresponding source region
+            sx1, sy1 = x1 - dest_x, y1 - dest_y
+            sx2, sy2 = sx1 + (x2 - x1), sy1 + (y2 - y1)
+
+            # Alpha composite formula: out = src + dst * (1 - src_alpha)
+            dst_region = ctx.image_arr[y1:y2, x1:x2]
+            src_region = src_arr[sy1:sy2, sx1:sx2]
+
+            src_alpha = src_region[:, :, 3:4].astype(np.float32) / 255.0
+            dst_alpha = dst_region[:, :, 3:4].astype(np.float32) / 255.0
+
+            # Porter-Duff 'over' compositing
+            out_alpha = src_alpha + dst_alpha * (1.0 - src_alpha)
+            out_alpha_safe = np.where(out_alpha == 0, 1.0, out_alpha)  # Avoid div by zero
+
+            out_rgb = (src_region[:, :, :3].astype(np.float32) * src_alpha +
+                      dst_region[:, :, :3].astype(np.float32) * dst_alpha * (1.0 - src_alpha)) / out_alpha_safe
+
+            ctx.image_arr[y1:y2, x1:x2, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
+            ctx.image_arr[y1:y2, x1:x2, 3:4] = np.clip(out_alpha * 255, 0, 255).astype(np.uint8)
 
     def _composite_masked_fill(self, ctx: "RenderContext", fill_img: Image.Image,
                                mask_img: Image.Image, dest_x: int, dest_y: int,
@@ -2660,18 +2708,29 @@ class SVGRenderer:
         # Composite directly at destination without full-size temp
         self._alpha_composite(ctx, fill_img, dest_x, dest_y)
 
-    def _composite_gradient_masked(self, ctx: "RenderContext", grad_img: Image.Image,
-                                    mask_img: Image.Image, dest_x: int, dest_y: int):
-        """Composite a gradient with mask without creating a full-size temp image."""
-        # Apply mask to gradient's alpha using numpy (faster than split/merge)
-        grad_arr = np.array(grad_img)
-        mask_arr = np.array(mask_img)
+    def _composite_gradient_masked(self, ctx: "RenderContext", grad_img,
+                                    mask_img, dest_x: int, dest_y: int):
+        """Composite a gradient with mask without creating a full-size temp image.
+
+        Args:
+            grad_img: Gradient image (can be PIL Image or numpy array)
+            mask_img: Mask image (can be PIL Image 'L' mode or numpy array)
+        """
+        # Convert to numpy if needed
+        grad_arr = grad_img if isinstance(grad_img, np.ndarray) else np.array(grad_img)
+        mask_arr = mask_img if isinstance(mask_img, np.ndarray) else np.array(mask_img)
+
         # Multiply alpha channel by mask (both are 0-255)
         grad_arr[:, :, 3] = (grad_arr[:, :, 3].astype(np.uint16) * mask_arr // 255).astype(np.uint8)
-        grad_masked = Image.fromarray(grad_arr, "RGBA")
 
-        # Composite directly at destination
-        self._alpha_composite(ctx, grad_masked, dest_x, dest_y)
+        # Composite directly at destination - avoid PIL conversion when possible
+        if ctx.image is None and HAS_RUST:
+            # Direct Rust compositing onto numpy array
+            grad_arr = np.ascontiguousarray(grad_arr)
+            vectorstag_rust.alpha_composite_inplace(ctx.image_arr, grad_arr, dest_x, dest_y)
+        else:
+            grad_masked = Image.fromarray(grad_arr, "RGBA")
+            self._alpha_composite(ctx, grad_masked, dest_x, dest_y)
 
     # Font mapping for common font families
     FONT_PATHS = {
@@ -2759,8 +2818,6 @@ class SVGRenderer:
         if not fill:
             fill = (0, 0, 0, 255)
 
-        draw = ImageDraw.Draw(ctx.image, "RGBA")
-
         # Calculate font size with transform scaling
         font_size = max(1, int(text.font_size * self._get_scale(ctx, text.transform)))
         font = self._get_font(text.font_family, font_size)
@@ -2772,7 +2829,15 @@ class SVGRenderer:
         anchor_map = {"start": "ls", "middle": "ms", "end": "rs"}
         anchor = anchor_map.get(text.text_anchor, "ls")
 
-        draw.text((x, y), text.text, fill=fill, font=font, anchor=anchor)
+        if ctx.image is None:
+            # Create temp image for text rendering when using Rust path
+            temp = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(temp, "RGBA")
+            draw.text((x, y), text.text, fill=fill, font=font, anchor=anchor)
+            self._alpha_composite(ctx, temp, 0, 0)
+        else:
+            draw = ImageDraw.Draw(ctx.image, "RGBA")
+            draw.text((x, y), text.text, fill=fill, font=font, anchor=anchor)
 
     def _get_scale(self, ctx: "RenderContext", element_transform: Transform) -> float:
         """Get the effective scale factor."""
@@ -2822,3 +2887,24 @@ class RenderContext:
         self.base_transform = base_transform
         self.clip_paths = clip_paths or {}
         self.filters = filters or {}
+
+    @property
+    def image_width(self) -> int:
+        """Get image width from either PIL image or numpy array."""
+        if self.image_arr is not None:
+            return self.image_arr.shape[1]
+        return self.image.width
+
+    @property
+    def image_height(self) -> int:
+        """Get image height from either PIL image or numpy array."""
+        if self.image_arr is not None:
+            return self.image_arr.shape[0]
+        return self.image.height
+
+    @property
+    def image_size(self) -> tuple[int, int]:
+        """Get image (width, height) from either PIL image or numpy array."""
+        if self.image_arr is not None:
+            return (self.image_arr.shape[1], self.image_arr.shape[0])
+        return self.image.size

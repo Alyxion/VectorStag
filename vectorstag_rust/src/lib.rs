@@ -1485,6 +1485,269 @@ fn sample_arc(
     points
 }
 
+/// Fill polygon with solid color and composite directly onto destination array
+/// This combines mask creation, color fill, and alpha compositing in one step
+/// Avoids creating any intermediate PIL images
+#[pyfunction]
+fn fill_polygon_to_array<'py>(
+    _py: Python<'py>,
+    mut dst: numpy::PyReadwriteArray3<'py, u8>,  // mutable destination RGBA
+    points: Vec<(f64, f64)>,
+    r: u8, g: u8, b: u8, a: u8,  // fill color with alpha
+    fill_rule: u8,  // 0 = nonzero, 1 = evenodd
+) {
+    let n = points.len();
+    if n < 3 || a == 0 {
+        return;
+    }
+
+    let mut dst_arr = dst.as_array_mut();
+    let (dst_h, dst_w, _) = (dst_arr.shape()[0], dst_arr.shape()[1], dst_arr.shape()[2]);
+
+    // Find bounding box (handle negative coordinates properly)
+    let raw_min_x = points.iter().map(|p| p.0.floor() as i32).min().unwrap_or(0);
+    let raw_max_x = points.iter().map(|p| p.0.ceil() as i32).max().unwrap_or(0);
+    let raw_min_y = points.iter().map(|p| p.1.floor() as i32).min().unwrap_or(0);
+    let raw_max_y = points.iter().map(|p| p.1.ceil() as i32).max().unwrap_or(0);
+
+    // Clamp to image bounds (must check bounds BEFORE converting to usize)
+    let min_x = raw_min_x.max(0).min(dst_w as i32) as usize;
+    let max_x = raw_max_x.max(0).min(dst_w as i32) as usize;
+    let min_y = raw_min_y.max(0).min(dst_h as i32) as usize;
+    let max_y = raw_max_y.max(0).min(dst_h as i32) as usize;
+
+    if min_x >= max_x || min_y >= max_y {
+        return;
+    }
+
+    // Close the polygon if needed
+    let mut pts = points.clone();
+    if (pts[0].0 - pts[n - 1].0).abs() > 1e-10 || (pts[0].1 - pts[n - 1].1).abs() > 1e-10 {
+        pts.push(pts[0]);
+    }
+
+    // Build edge list (non-horizontal edges only)
+    let mut edges: Vec<(f64, f64, f64, f64, i32)> = Vec::with_capacity(pts.len());
+    for i in 0..pts.len() - 1 {
+        let (mut x1, mut y1) = pts[i];
+        let (mut x2, mut y2) = pts[i + 1];
+        if (y1 - y2).abs() < 1e-10 { continue; }
+        let direction = if y1 > y2 {
+            std::mem::swap(&mut x1, &mut x2);
+            std::mem::swap(&mut y1, &mut y2);
+            -1
+        } else { 1 };
+        edges.push((x1, y1, x2, y2, direction));
+    }
+
+    let src_a = a as u32;
+    let inv_src_a = 255 - src_a;
+
+    // Scanline fill with direct compositing
+    for y in min_y..max_y {
+        let screen_y = y as f64 + 0.5;
+        let mut intersections: Vec<(f64, i32)> = Vec::with_capacity(edges.len());
+
+        for &(x1, y1, x2, y2, direction) in &edges {
+            if y1 <= screen_y && screen_y < y2 {
+                let t = (screen_y - y1) / (y2 - y1);
+                let x_int = x1 + t * (x2 - x1);
+                intersections.push((x_int, direction));
+            }
+        }
+
+        if intersections.is_empty() { continue; }
+        intersections.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+        let mut winding = 0i32;
+        let mut i = 0;
+
+        while i < intersections.len() {
+            let x_start = intersections[i].0;
+            winding += intersections[i].1;
+
+            // Find end of fill span
+            while i + 1 < intersections.len() {
+                let inside = if fill_rule == 1 {
+                    winding % 2 != 0  // evenodd
+                } else {
+                    winding != 0  // nonzero
+                };
+                if !inside { break; }
+                i += 1;
+                winding += intersections[i].1;
+            }
+
+            let x_end = if i < intersections.len() { intersections[i].0 } else { x_start };
+
+            // Fill pixels in span
+            let px_start = (x_start.floor() as usize).max(min_x);
+            let px_end = (x_end.ceil() as usize).min(max_x);
+
+            for x in px_start..px_end {
+                // Alpha composite the fill color onto destination
+                if src_a == 255 {
+                    // Fully opaque - just overwrite
+                    dst_arr[[y, x, 0]] = r;
+                    dst_arr[[y, x, 1]] = g;
+                    dst_arr[[y, x, 2]] = b;
+                    dst_arr[[y, x, 3]] = 255;
+                } else {
+                    // Alpha blend
+                    let dst_a = dst_arr[[y, x, 3]] as u32;
+                    let out_a = src_a + (dst_a * inv_src_a / 255);
+
+                    if out_a > 0 {
+                        let dst_r = dst_arr[[y, x, 0]] as u32;
+                        let dst_g = dst_arr[[y, x, 1]] as u32;
+                        let dst_b = dst_arr[[y, x, 2]] as u32;
+
+                        dst_arr[[y, x, 0]] = ((r as u32 * src_a + dst_r * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
+                        dst_arr[[y, x, 1]] = ((g as u32 * src_a + dst_g * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
+                        dst_arr[[y, x, 2]] = ((b as u32 * src_a + dst_b * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
+                        dst_arr[[y, x, 3]] = out_a.min(255) as u8;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Fill multiple polygons with solid color and composite directly onto destination array
+/// Handles multiple contours (outer + holes) in one pass
+#[pyfunction]
+fn fill_multi_polygon_to_array<'py>(
+    _py: Python<'py>,
+    mut dst: numpy::PyReadwriteArray3<'py, u8>,
+    all_points: Vec<Vec<(f64, f64)>>,
+    r: u8, g: u8, b: u8, a: u8,
+    fill_rule: u8,
+) {
+    if all_points.is_empty() || a == 0 {
+        return;
+    }
+
+    let mut dst_arr = dst.as_array_mut();
+    let (dst_h, dst_w, _) = (dst_arr.shape()[0], dst_arr.shape()[1], dst_arr.shape()[2]);
+
+    // Find bounding box across all polygons (using i32 to handle negatives)
+    let mut raw_min_x = i32::MAX;
+    let mut raw_max_x = i32::MIN;
+    let mut raw_min_y = i32::MAX;
+    let mut raw_max_y = i32::MIN;
+
+    // Build all edges
+    let mut all_edges: Vec<(f64, f64, f64, f64, i32)> = Vec::new();
+
+    for points in &all_points {
+        let n = points.len();
+        if n < 3 { continue; }
+
+        for p in points {
+            let px = p.0.floor() as i32;
+            let py = p.1.floor() as i32;
+            raw_min_x = raw_min_x.min(px);
+            raw_max_x = raw_max_x.max(p.0.ceil() as i32);
+            raw_min_y = raw_min_y.min(py);
+            raw_max_y = raw_max_y.max(p.1.ceil() as i32);
+        }
+
+        let mut pts = points.clone();
+        if (pts[0].0 - pts[n - 1].0).abs() > 1e-10 || (pts[0].1 - pts[n - 1].1).abs() > 1e-10 {
+            pts.push(pts[0]);
+        }
+
+        for i in 0..pts.len() - 1 {
+            let (mut x1, mut y1) = pts[i];
+            let (mut x2, mut y2) = pts[i + 1];
+            if (y1 - y2).abs() < 1e-10 { continue; }
+            let direction = if y1 > y2 {
+                std::mem::swap(&mut x1, &mut x2);
+                std::mem::swap(&mut y1, &mut y2);
+                -1
+            } else { 1 };
+            all_edges.push((x1, y1, x2, y2, direction));
+        }
+    }
+
+    // Check if we found any valid polygons
+    if raw_min_x == i32::MAX || raw_max_x == i32::MIN {
+        return;
+    }
+
+    // Clamp to image bounds (must check bounds BEFORE converting to usize)
+    let global_min_x = raw_min_x.max(0).min(dst_w as i32) as usize;
+    let global_max_x = raw_max_x.max(0).min(dst_w as i32) as usize;
+    let global_min_y = raw_min_y.max(0).min(dst_h as i32) as usize;
+    let global_max_y = raw_max_y.max(0).min(dst_h as i32) as usize;
+
+    if global_min_x >= global_max_x || global_min_y >= global_max_y {
+        return;
+    }
+
+    let src_a = a as u32;
+    let inv_src_a = 255 - src_a;
+
+    // Scanline fill
+    for y in global_min_y..global_max_y {
+        let screen_y = y as f64 + 0.5;
+        let mut intersections: Vec<(f64, i32)> = Vec::with_capacity(all_edges.len());
+
+        for &(x1, y1, x2, y2, direction) in &all_edges {
+            if y1 <= screen_y && screen_y < y2 {
+                let t = (screen_y - y1) / (y2 - y1);
+                let x_int = x1 + t * (x2 - x1);
+                intersections.push((x_int, direction));
+            }
+        }
+
+        if intersections.is_empty() { continue; }
+        intersections.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+        let mut winding = 0i32;
+        let mut i = 0;
+
+        while i < intersections.len() {
+            let x_start = intersections[i].0;
+            winding += intersections[i].1;
+
+            while i + 1 < intersections.len() {
+                let inside = if fill_rule == 1 { winding % 2 != 0 } else { winding != 0 };
+                if !inside { break; }
+                i += 1;
+                winding += intersections[i].1;
+            }
+
+            let x_end = if i < intersections.len() { intersections[i].0 } else { x_start };
+            let px_start = (x_start.floor() as usize).max(global_min_x);
+            let px_end = (x_end.ceil() as usize).min(global_max_x);
+
+            for x in px_start..px_end {
+                if src_a == 255 {
+                    dst_arr[[y, x, 0]] = r;
+                    dst_arr[[y, x, 1]] = g;
+                    dst_arr[[y, x, 2]] = b;
+                    dst_arr[[y, x, 3]] = 255;
+                } else {
+                    let dst_a = dst_arr[[y, x, 3]] as u32;
+                    let out_a = src_a + (dst_a * inv_src_a / 255);
+                    if out_a > 0 {
+                        let dst_r = dst_arr[[y, x, 0]] as u32;
+                        let dst_g = dst_arr[[y, x, 1]] as u32;
+                        let dst_b = dst_arr[[y, x, 2]] as u32;
+                        dst_arr[[y, x, 0]] = ((r as u32 * src_a + dst_r * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
+                        dst_arr[[y, x, 1]] = ((g as u32 * src_a + dst_g * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
+                        dst_arr[[y, x, 2]] = ((b as u32 * src_a + dst_b * dst_a * inv_src_a / 255) / out_a).min(255) as u8;
+                        dst_arr[[y, x, 3]] = out_a.min(255) as u8;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
 /// Alpha composite source onto destination in-place at given offset
 /// Uses Porter-Duff over operator: out = src + dst * (1 - src_alpha)
 #[pyfunction]
@@ -1626,5 +1889,7 @@ fn vectorstag_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_path, m)?)?;
     m.add_function(wrap_pyfunction!(alpha_composite_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(resize_rgba, m)?)?;
+    m.add_function(wrap_pyfunction!(fill_polygon_to_array, m)?)?;
+    m.add_function(wrap_pyfunction!(fill_multi_polygon_to_array, m)?)?;
     Ok(())
 }

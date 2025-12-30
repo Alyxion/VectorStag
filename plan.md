@@ -3,15 +3,15 @@
 ## Project Goal
 Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG and resvg.
 
-## Current Status: 99.9% Emoji / 99.7% Flag Accuracy
+## Current Status: 99.8% Emoji / 99.6% Flag Accuracy
 
 **Date**: 2025-12-30
 
 ### Performance vs Reference Renderers
-- **VectorStag**: ~23 files/sec at 400x400 with 4x antialiasing (single-thread)
-- **CairoSVG**: ~41 files/sec (VectorStag is ~0.56x)
-- **Resvg**: ~75 files/sec (VectorStag is ~0.31x)
-- **Multiprocessing**: ~340 files/sec with 12 workers
+- **VectorStag**: ~32 files/sec at 400x400 with 4x antialiasing (single-thread)
+- **CairoSVG**: ~41 files/sec (VectorStag is ~0.79x)
+- **Resvg**: ~75 files/sec (VectorStag is ~0.43x)
+- **Multiprocessing**: ~435 files/sec with 14 workers
 
 ### Emoji Test Results (3427 Noto emojis)
 - **Average Accuracy**: 99.8%
@@ -19,37 +19,50 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - **95-99%**: 0.1% (4 files)
 - **<80%**: 0.0% (0 files)
 
-### Flag Test Results (358 Noto flags)
-- **Average Accuracy**: 99.7%
-- **99%+ Accuracy**: 99.2% (355 files)
-- **95-99%**: 0.6% (2 files)
-- **<80%**: 0.3% (1 file - QA.svg edge case)
+### Flag Test Results (305 Noto flags rendered)
+- **Average Accuracy**: 99.6%
+- **99%+ Accuracy**: 97.4% (297 files)
+- **95-99%**: 2.3% (7 files)
+- **<80%**: 0.3% (1 file - QA.svg edge case at 13.1%)
+- **Errors**: 53 files (complex flags with memory issues)
 
 **Reference Renderer**: resvg (Rust-based)
 
 ### Material Icons Test (336 files)
 - **Average Accuracy**: 99.0%
-- **99%+ Accuracy**: 60.7% (204 files)
-- **95-99%**: 39.3% (132 files)
+- **99%+ Accuracy**: 58.0% (195 files)
+- **95-99%**: 42.0% (141 files)
 - **<95%**: 0.0% (0 files)
 
 ### FontAwesome Icons (2028 files)
-- **Average Accuracy**: 100.0%
-- **99%+ Accuracy**: 100.0% (2028 files)
-- **95-99%**: 0.0% (0 files)
+- **Average Accuracy**: 97.3%
+- **99%+ Accuracy**: 82.3% (1669 files)
+- **95-99%**: 8.6% (174 files)
+- **90-95%**: 2.5% (51 files)
+- **<80%**: 6.5% (132 files - mostly circle/dot icons)
 
 ### Lucide Icons (200 files)
 - **Average Accuracy**: 98.2%
-- **99%+ Accuracy**: 18.5% (37 files)
-- **95-99%**: 81.0% (162 files)
-- **90-95%**: 0.5% (1 file)
+- **99%+ Accuracy**: 29.5% (59 files)
+- **95-99%**: 67.0% (134 files)
+- **90-95%**: 2.5% (5 files)
+- **80-90%**: 1.0% (2 files)
 
 ### W3C SVG Samples (30 files)
-- **Average Accuracy**: 95.8% (vs resvg)
-- **99%+ Accuracy**: 80.0% (24 files)
-- **95-99%**: 13.3% (4 files)
-- **<80%**: 6.7% (2 files - tiger.svg, circles1.svg edge cases)
-- Note: tiger.svg (36.8%) has unusual attributes (height only, no viewBox)
+- **Average Accuracy**: 98.9% (vs resvg)
+- **99%+ Accuracy**: 83.3% (25 files)
+- **95-99%**: 10.0% (3 files)
+- **90-95%**: 3.3% (1 file)
+- **80-90%**: 3.3% (1 file)
+
+### Comparison Images
+Comparison grids (VectorStag | resvg | diff) saved to:
+- `comparisons/emojis/` - 3427 files
+- `comparisons/flags/` - 358 files
+- `comparisons/material/` - 336 files
+- `comparisons/fontawesome/` - 2028 files
+- `comparisons/lucide/` - 200 files
+- `comparisons/w3c/` - 30 files
 
 ---
 
@@ -67,6 +80,11 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 9. **Rust gradient images** - `create_linear_gradient_image` and `create_radial_gradient_image` in Rust
 10. **Numpy clipping optimization** - Reuse numpy arrays between clipping and resize steps
 11. **Rust polygon nonzero fill** - All polygon fill operations now use Rust when available
+12. **Direct-to-array rendering** - `fill_polygon_to_array` and `fill_multi_polygon_to_array` composite directly to numpy arrays, bypassing PIL
+13. **Numpy-first image pipeline** - Main image created as numpy array, avoiding PIL Image.new and conversions
+14. **Rust alpha compositing** - All alpha compositing uses `alpha_composite_inplace` for numpy arrays
+15. **Stroke polygon fast path** - Open/closed strokes use fast Rust polygon fill instead of PIL ImageDraw
+16. **Gradient numpy passthrough** - Gradient functions return numpy arrays directly, avoiding PIL roundtrip
 
 ### Bug Fixes (2025-12-30)
 1. **Recursion protection** - Added MAX_PARSE_DEPTH and MAX_RENDER_DEPTH limits to prevent stack overflow
