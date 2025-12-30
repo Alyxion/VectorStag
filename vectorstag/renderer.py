@@ -626,6 +626,9 @@ class SVGRenderer:
         elif isinstance(prim, FeDiffuseLighting):
             if HAS_RUST:
                 light = prim.light_source
+                if light is None:
+                    # No light source = no lighting effect (transparent output)
+                    return np.zeros_like(in1)
                 if isinstance(light, FeDistantLight):
                     lt, az, el = 0, light.azimuth, light.elevation
                     lx, ly, lz, px, py, pz, se, lca = 0, 0, 0, 0, 0, 0, 1, 180
@@ -640,7 +643,8 @@ class SVGRenderer:
                     se = light.specular_exponent
                     lca = light.limiting_cone_angle if light.limiting_cone_angle else 180
                 else:
-                    lt, az, el, lx, ly, lz, px, py, pz, se, lca = 0, 225, 45, 0, 0, 0, 0, 0, 0, 1, 180
+                    # Unknown light type - no effect
+                    return np.zeros_like(in1)
                 return vectorstag_rust.fe_diffuse_lighting(
                     in1, prim.surface_scale * scale, prim.diffuse_constant, prim.lighting_color,
                     lt, az, el, lx, ly, lz, px, py, pz, se, lca)
@@ -649,6 +653,9 @@ class SVGRenderer:
         elif isinstance(prim, FeSpecularLighting):
             if HAS_RUST:
                 light = prim.light_source
+                if light is None:
+                    # No light source = no lighting effect (transparent output)
+                    return np.zeros_like(in1)
                 if isinstance(light, FeDistantLight):
                     lt, az, el = 0, light.azimuth, light.elevation
                     lx, ly, lz, px, py, pz, se, lca = 0, 0, 0, 0, 0, 0, 1, 180
@@ -663,7 +670,8 @@ class SVGRenderer:
                     se = light.specular_exponent
                     lca = light.limiting_cone_angle if light.limiting_cone_angle else 180
                 else:
-                    lt, az, el, lx, ly, lz, px, py, pz, se, lca = 0, 225, 45, 0, 0, 0, 0, 0, 0, 1, 180
+                    # Unknown light type - no effect
+                    return np.zeros_like(in1)
                 return vectorstag_rust.fe_specular_lighting(
                     in1, prim.surface_scale * scale, prim.specular_constant, prim.specular_exponent,
                     prim.lighting_color, lt, az, el, lx, ly, lz, px, py, pz, se, lca)
@@ -678,14 +686,60 @@ class SVGRenderer:
             return in1
 
         elif isinstance(prim, FeImage):
-            # TODO: Load external image
+            # Load image from href (data URL or element reference)
+            href = prim.href.strip()
+            if href.startswith('data:'):
+                # Data URL - parse and decode
+                try:
+                    import base64
+                    from io import BytesIO
+
+                    # Parse data URL format: data:[<mediatype>][;base64],<data>
+                    header, data = href.split(',', 1)
+                    if ';base64' in header:
+                        img_data = base64.b64decode(data)
+                        img = Image.open(BytesIO(img_data)).convert('RGBA')
+
+                        # Resize to fit filter region if needed
+                        target_w, target_h = width, height
+                        if img.size != (target_w, target_h):
+                            # Apply preserveAspectRatio
+                            if 'none' in prim.preserveAspectRatio.lower():
+                                img = img.resize((target_w, target_h), Image.LANCZOS)
+                            else:
+                                # Preserve aspect ratio (xMidYMid by default)
+                                img_ratio = img.width / img.height
+                                target_ratio = target_w / target_h
+                                if img_ratio > target_ratio:
+                                    new_w = target_w
+                                    new_h = int(target_w / img_ratio)
+                                else:
+                                    new_h = target_h
+                                    new_w = int(target_h * img_ratio)
+                                img = img.resize((new_w, new_h), Image.LANCZOS)
+
+                                # Center the image
+                                result = np.zeros((target_h, target_w, 4), dtype=np.uint8)
+                                x_off = (target_w - new_w) // 2
+                                y_off = (target_h - new_h) // 2
+                                img_arr = np.array(img)
+                                result[y_off:y_off+new_h, x_off:x_off+new_w] = img_arr
+                                return result
+
+                        return np.array(img)
+                except Exception:
+                    pass
+            elif href.startswith('#'):
+                # Element reference - not supported yet
+                pass
+
             return in1
 
         return in1
 
     def _execute_filter_chain_with_merge(self, filter_def: Filter, source_graphic: np.ndarray,
                                           width: int, height: int, scale: float) -> np.ndarray:
-        """Execute filter chain with proper feMerge support."""
+        """Execute filter chain with proper feMerge support and subregion handling."""
         buffers = {
             "SourceGraphic": source_graphic,
             "SourceAlpha": self._get_source_alpha(source_graphic),
@@ -698,6 +752,9 @@ class SVGRenderer:
                 in1 = last_result
             else:
                 in1 = buffers.get(prim.input1, last_result)
+
+            # Calculate primitive subregion
+            subregion = self._calculate_primitive_subregion(prim, filter_def, width, height, scale)
 
             if isinstance(prim, FeMerge):
                 # Handle merge specially - collect all node inputs
@@ -715,13 +772,116 @@ class SVGRenderer:
             else:
                 in2_name = getattr(prim, 'input2', None)
                 in2 = buffers.get(in2_name, source_graphic) if in2_name else None
-                result = self._execute_filter_primitive(prim, in1, in2, width, height, scale)
+                result = self._execute_filter_primitive_with_subregion(
+                    prim, in1, in2, width, height, scale, subregion
+                )
 
             if prim.result:
                 buffers[prim.result] = result
             last_result = result
 
         return last_result
+
+    def _calculate_primitive_subregion(self, prim: FilterPrimitive, filter_def: Filter,
+                                        width: int, height: int, scale: float) -> tuple:
+        """Calculate the subregion for a filter primitive in pixel coordinates.
+
+        Returns (x, y, w, h, clip_x, clip_y) where:
+        - x, y, w, h: the primitive's logical subregion (can be negative/outside bounds)
+        - clip_x, clip_y, clip_w, clip_h: the clipped region that fits in the output
+        """
+        # Default subregion is the entire filter region
+        x, y, w, h = 0, 0, width, height
+
+        # Check if primitive has explicit subregion
+        has_subregion = (prim.x is not None or prim.y is not None or
+                         prim.width is not None or prim.height is not None)
+
+        if has_subregion:
+            if filter_def.primitive_units == "objectBoundingBox":
+                # Values are fractions (0-1) of the filter region
+                x = int((prim.x or 0) * width)
+                y = int((prim.y or 0) * height)
+                w = int((prim.width if prim.width is not None else 1.0) * width)
+                h = int((prim.height if prim.height is not None else 1.0) * height)
+            else:
+                # userSpaceOnUse - values are in user coordinates, scale them
+                x = int((prim.x or 0) * scale)
+                y = int((prim.y or 0) * scale)
+                w = int((prim.width if prim.width is not None else width / scale) * scale)
+                h = int((prim.height if prim.height is not None else height / scale) * scale)
+
+        # Calculate clipped region (the part that's visible in the output)
+        clip_x = max(0, x)
+        clip_y = max(0, y)
+        clip_x2 = min(width, x + w)
+        clip_y2 = min(height, y + h)
+        clip_w = max(0, clip_x2 - clip_x)
+        clip_h = max(0, clip_y2 - clip_y)
+
+        # Return both the logical subregion and the clipped region
+        return (x, y, w, h, clip_x, clip_y, clip_w, clip_h)
+
+    def _execute_filter_primitive_with_subregion(self, prim: FilterPrimitive, in1: np.ndarray,
+                                                   in2: Optional[np.ndarray], width: int, height: int,
+                                                   scale: float, subregion: tuple) -> np.ndarray:
+        """Execute a filter primitive with subregion handling."""
+        # Unpack subregion: logical (x, y, w, h) and clipped (clip_x, clip_y, clip_w, clip_h)
+        log_x, log_y, log_w, log_h, clip_x, clip_y, clip_w, clip_h = subregion
+
+        # Special handling for primitives that need subregion support
+        if isinstance(prim, FeFlood):
+            # Create transparent output, fill only the clipped subregion
+            result = np.zeros((height, width, 4), dtype=np.uint8)
+            if clip_w > 0 and clip_h > 0:
+                result[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w] = prim.flood_color
+            return result
+
+        elif isinstance(prim, FeTile):
+            # feTile tiles the entire input buffer (including transparent areas)
+            # to fill the output region. The tile is the entire input buffer.
+            if HAS_RUST:
+                # Use the entire input as the tile source
+                tile_src = in1
+                th, tw = tile_src.shape[:2]
+                if th > 0 and tw > 0:
+                    # If subregion is specified, tile only to that region
+                    if clip_w < width or clip_h < height or clip_x > 0 or clip_y > 0:
+                        # Tile to fill the clipped region
+                        # Account for the offset from the logical origin
+                        offset_x = clip_x % tw
+                        offset_y = clip_y % th
+
+                        tile_w = clip_w + offset_x
+                        tile_h = clip_h + offset_y
+                        tiled = vectorstag_rust.fe_tile(tile_src, tile_w, tile_h)
+
+                        result = np.zeros((height, width, 4), dtype=np.uint8)
+                        result[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w] = tiled[offset_y:offset_y+clip_h, offset_x:offset_x+clip_w]
+                        return result
+                    else:
+                        # Tile to fill the entire filter region
+                        return vectorstag_rust.fe_tile(tile_src, width, height)
+            return in1
+
+        elif isinstance(prim, FeTurbulence):
+            # Generate noise for the full region, then mask to subregion
+            noise_type = 0 if prim.type == "turbulence" else 1
+            stitch = prim.stitch_tiles == "stitch"
+            if HAS_RUST:
+                full_noise = vectorstag_rust.fe_turbulence(
+                    width, height, prim.base_frequency_x, prim.base_frequency_y,
+                    prim.num_octaves, prim.seed, noise_type, stitch)
+                # If subregion is specified and not full size, mask it
+                if clip_w < width or clip_h < height or clip_x > 0 or clip_y > 0:
+                    result = np.zeros((height, width, 4), dtype=np.uint8)
+                    result[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w] = full_noise[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w]
+                    return result
+                return full_noise
+            return np.random.randint(0, 256, (height, width, 4), dtype=np.uint8)
+
+        # For other primitives, use the standard execution
+        return self._execute_filter_primitive(prim, in1, in2, width, height, scale)
 
     def _get_element_bbox(self, element: SVGElement, transform: Transform) -> Optional[tuple]:
         """Get element bounding box in screen coordinates."""

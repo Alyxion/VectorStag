@@ -3,7 +3,7 @@
 ## Project Goal
 Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG and resvg.
 
-## Current Status: 89% resvg-test-suite / 100% FontAwesome / 99.9% Emoji / 99.9% Flag Accuracy
+## Current Status: 92% resvg-filter-suite / 100% FontAwesome / 99.9% Emoji / 99.9% Flag Accuracy
 
 **Date**: 2025-12-30
 
@@ -93,24 +93,34 @@ Implemented comprehensive SVG filter support with all filter primitives in Rust 
 - feDiffuseLighting, feSpecularLighting, feDropShadow
 - Light sources: FeDistantLight, FePointLight, FeSpotLight
 
-**Filter Accuracy by Subcategory**:
+**Filter Accuracy by Subcategory** (260 tests):
 | Filter | Accuracy | Notes |
 |--------|----------|-------|
+| feDisplacementMap | 100.0% | Excellent |
 | feDistantLight | 99.7% | Excellent |
 | flood-opacity | 99.8% | Excellent |
-| feDropShadow | 96.5% | Excellent |
-| feGaussianBlur | 95.9% | O(1) sliding window blur |
-| feOffset | 96.3% | Excellent |
-| flood-color | 96.5% | Excellent |
-| feComponentTransfer | 94.2% | Good |
-| filter-functions | 92.4% | Good |
-| feDiffuseLighting | 92.1% | Good |
-| feBlend | 91.4% | All blend modes supported |
-| feTurbulence | 82.7% | Perlin noise implemented |
-| feConvolveMatrix | 76.4% | Limited by pattern support |
-| feSpecularLighting | 68.9% | Lighting calculations need work |
-| feImage | 67.1% | External image linking not supported |
-| feTile | 64.0% | Tiling needs improvement |
+| feDropShadow | 97.6% | Excellent |
+| feOffset | 97.4% | Excellent |
+| feComponentTransfer | 97.2% | Excellent |
+| enable-background | 97.2% | Excellent |
+| filter-functions | 97.1% | Excellent |
+| feGaussianBlur | 96.7% | O(1) sliding window blur |
+| feMerge | 96.8% | Excellent |
+| flood-color | 96.6% | Excellent |
+| feFlood | 96.3% | Fixed subregion handling |
+| feComposite | 95.9% | Excellent |
+| feDiffuseLighting | 95.7% | Fixed no-light-source case |
+| feBlend | 92.9% | All blend modes supported |
+| feTile | 92.9% | Fixed subregion tiling |
+| feTurbulence | 92.9% | Perlin noise implemented |
+| feSpotLight | 92.2% | Good |
+| fePointLight | 90.7% | Good |
+| filter | 90.4% | Good |
+| feColorMatrix | 89.7% | Some UB tests |
+| feMorphology | 89.4% | Radius clamping |
+| feConvolveMatrix | 80.6% | Limited by pattern support |
+| feImage | 80.3% | Data URLs supported |
+| feSpecularLighting | 70.4% | Complex lighting calculations |
 
 **Performance Optimizations**:
 1. **O(1) Gaussian blur** - Replaced O(radius) box blur with sliding window approach
@@ -410,6 +420,71 @@ VectorStag achieves ~60% of CairoSVG performance at 4x antialiasing. The remaini
 - [ ] Symbol viewBox handling
 - [ ] feSpecularLighting accuracy improvements
 - [ ] feTile implementation improvements
+
+---
+
+## Testing & Quality Assurance
+
+### Test Suite Locations
+
+| Collection | SVG Source | Reference PNGs | Tests |
+|------------|-----------|----------------|-------|
+| emojis | `SciStagEssentialData/images/noto/emojis/svg/` | `references/emojis/resvg/` | 3427 |
+| flags | `SciStagEssentialData/images/noto/flags/svg/` | `references/flags/resvg/` | 358 |
+| fontawesome | `advanced_svg/fontawesome/fa/fontawesome-free-6.4.2-web/svgs/` | `references/fontawesome/resvg/` | 2028 |
+| material | `advanced_svg/material/` | `references/material/resvg/` | 336 |
+| lucide | `advanced_svg/lucide/` | `references/lucide/resvg/` | 200 |
+| w3c | `samples/svg/` | `references/w3c/resvg/` | 30 |
+| resvg-test-suite | `resvg-test-suite/tests/` | Built-in `.png` files | 1679 |
+
+### Running Tests
+
+**Quick verification (run after changes):**
+```bash
+# Verify accuracy hasn't regressed (should all be >99%)
+python svg_compare.py compare --emojis --limit 200
+python svg_compare.py compare --flags --limit 200
+python svg_compare.py compare --fontawesome --limit 200
+```
+
+**Full test suite:**
+```bash
+# Full accuracy test all collections
+python svg_compare.py compare --all -j 16
+
+# resvg-test-suite benchmark (1679 tests)
+python benchmark_resvg_tests.py
+
+# Filter-specific benchmark
+python quick_filter_bench.py
+```
+
+**Pre-render references (one-time setup):**
+```bash
+python svg_compare.py prerender --all -j 16
+```
+
+### Expected Results (2025-12-30)
+
+| Test Suite | Accuracy | Threshold |
+|------------|----------|-----------|
+| Emojis | 99.9% | >99% |
+| Flags | 99.9% | >99% |
+| FontAwesome | 100.0% | >99% |
+| Material | 99.0% | >95% |
+| Lucide | 98.7% | >95% |
+| W3C | 99.3% | >95% |
+| resvg-test-suite | 89.1% | >85% |
+| resvg filters | 90.7% | >85% |
+
+### Performance Benchmarks
+
+| Collection | VectorStag | resvg | Ratio |
+|------------|------------|-------|-------|
+| FontAwesome (128x128) | ~159 files/sec | ~156 files/sec | 1.0x (parity) |
+| Emojis (200x200) | ~49 files/sec | ~295 files/sec | 5.6x slower |
+
+Note: Complex SVGs (emojis with many gradients/paths) are slower due to Python overhead. Simple icons render at parity with native Rust resvg.
 
 ---
 

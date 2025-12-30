@@ -2887,10 +2887,16 @@ fn fe_specular_lighting<'py>(
     let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
     let mut dst = Array3::<u8>::zeros((h, w, 4));
 
-    // Eye vector (looking down Z axis)
+    // Clamp specularExponent to [1, 128] per SVG spec
+    let specular_exponent = specular_exponent_param.clamp(1.0, 128.0);
+    // Clamp specularConstant to >= 0
+    let spec_constant = specular_constant.max(0.0);
+
+    // Eye vector (looking down Z axis towards the surface)
     let (ex, ey, ez) = (0.0f32, 0.0, 1.0);
 
-    let (lx, ly, lz) = if light_type == 0 {
+    // Pre-compute distant light direction
+    let (dist_lx, dist_ly, dist_lz) = if light_type == 0 {
         let az = azimuth.to_radians();
         let el = elevation.to_radians();
         (az.cos() * el.cos(), az.sin() * el.cos(), el.sin())
@@ -2910,54 +2916,79 @@ fn fe_specular_lighting<'py>(
             let ix = x as i32;
             let iy = y as i32;
 
+            // Compute surface normal from height differences (Sobel-like)
             let dx = get_height(ix + 1, iy) - get_height(ix - 1, iy);
             let dy = get_height(ix, iy + 1) - get_height(ix, iy - 1);
 
+            // Normal vector (pointing towards viewer)
             let nx = -dx;
             let ny = -dy;
             let nz = 1.0f32;
             let n_len = (nx * nx + ny * ny + nz * nz).sqrt();
-            let (nx, ny, nz) = (nx / n_len, ny / n_len, nz / n_len);
+            let (nx, ny, nz) = if n_len > 1e-6 {
+                (nx / n_len, ny / n_len, nz / n_len)
+            } else {
+                (0.0, 0.0, 1.0)
+            };
 
+            // Compute light direction based on light type
             let (lx, ly, lz) = if light_type == 1 || light_type == 2 {
+                // Point light or spotlight
+                let z = get_height(ix, iy);
                 let dx = light_x - x as f32;
                 let dy = light_y - y as f32;
-                let dz = light_z - get_height(ix, iy);
+                let dz = light_z - z;
                 let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
                 (dx / len, dy / len, dz / len)
             } else {
-                (lx, ly, lz)
+                (dist_lx, dist_ly, dist_lz)
             };
 
-            // Half vector
+            // Half vector between light and eye
             let hx = lx + ex;
             let hy = ly + ey;
             let hz = lz + ez;
-            let h_len = (hx * hx + hy * hy + hz * hz).sqrt().max(1e-6);
-            let (hx, hy, hz) = (hx / h_len, hy / h_len, hz / h_len);
+            let h_len = (hx * hx + hy * hy + hz * hz).sqrt();
+            let (hx, hy, hz) = if h_len > 1e-6 {
+                (hx / h_len, hy / h_len, hz / h_len)
+            } else {
+                (0.0, 0.0, 1.0)
+            };
 
-            // N dot H
+            // N dot H (clamped to positive)
             let n_dot_h = (nx * hx + ny * hy + nz * hz).max(0.0);
 
+            // Spotlight intensity falloff
             let intensity = if light_type == 2 {
+                // Spotlight direction (from light to pointsAt)
                 let sx = points_at_x - light_x;
                 let sy = points_at_y - light_y;
                 let sz = points_at_z - light_z;
                 let s_len = (sx * sx + sy * sy + sz * sz).sqrt().max(1e-6);
                 let (sx, sy, sz) = (sx / s_len, sy / s_len, sz / s_len);
+
+                // Light ray points from light to pixel, but we need the opposite
+                // Dot product of (-L) with S = alignment between spotlight aim and light ray
                 let l_dot_s = -(lx * sx + ly * sy + lz * sz);
+
+                // Apply cone angle and falloff
                 let cone_cos = limiting_cone_angle.to_radians().cos();
-                if l_dot_s < cone_cos { 0.0 } else { l_dot_s.powf(spot_exponent) }
+                if l_dot_s < cone_cos {
+                    0.0
+                } else {
+                    l_dot_s.powf(spot_exponent)
+                }
             } else {
                 1.0
             };
 
-            let specular = n_dot_h.powf(specular_exponent_param) * specular_constant * intensity;
+            // Specular component
+            let specular = n_dot_h.powf(specular_exponent) * spec_constant * intensity;
 
             dst[[y, x, 0]] = (light_color.0 as f32 * specular).clamp(0.0, 255.0) as u8;
             dst[[y, x, 1]] = (light_color.1 as f32 * specular).clamp(0.0, 255.0) as u8;
             dst[[y, x, 2]] = (light_color.2 as f32 * specular).clamp(0.0, 255.0) as u8;
-            // Alpha = max(R, G, B) for specular
+            // Alpha = max(R, G, B) for specular lighting
             let max_rgb = dst[[y, x, 0]].max(dst[[y, x, 1]]).max(dst[[y, x, 2]]);
             dst[[y, x, 3]] = max_rgb;
         }
