@@ -3,9 +3,27 @@
 ## Project Goal
 Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG and resvg.
 
-## Current Status: 100% FontAwesome / 99.8% Emoji / 99.7% Flag Accuracy
+## Current Status: 90% resvg-test-suite / 100% FontAwesome / 99.9% Emoji / 99.9% Flag Accuracy
 
 **Date**: 2025-12-30
+
+### resvg-test-suite Results (1679 tests)
+- **Average Accuracy**: 90.0%
+- **99%+ Accuracy**: 35.5% (594 tests)
+- **95-99%**: 23.9% (399 tests)
+- **90-95%**: 10.5% (175 tests)
+- **80-90%**: 9.9% (166 tests)
+- **<80%**: 20.2% (337 tests - mostly complex filter primitives)
+
+| Category | Accuracy | Tests |
+|----------|----------|-------|
+| shapes | 96.71% | 133 |
+| text | 95.60% | 356 |
+| painting | 93.67% | 304 |
+| masking | 92.50% | 93 |
+| paint-servers | 90.28% | 149 |
+| structure | 88.45% | 247 |
+| filters | 80.05% | 397 |
 
 ### Performance vs Reference Renderers
 - **VectorStag**: ~32 files/sec at 400x400 with 4x antialiasing (single-thread)
@@ -24,12 +42,12 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - **95-99%**: 0.1% (4 files)
 - **<80%**: 0.0% (0 files)
 
-### Flag Test Results (295 Noto flags rendered)
-- **Average Accuracy**: 99.7%
-- **99%+ Accuracy**: 99.3% (293 files)
-- **95-99%**: 0.3% (1 file)
-- **<80%**: 0.3% (1 file - QA.svg edge case at 13.1%)
-- **Errors**: 63 files (complex flags with memory issues)
+### Flag Test Results (358 Noto flags)
+- **Average Accuracy**: 99.9%
+- **99%+ Accuracy**: 99.4% (356 files)
+- **95-99%**: 0.6% (2 files - AF.svg, complex emblems)
+- **<95%**: 0.0% (0 files)
+- **Errors**: 0 (single-threaded); memory issues with parallel workers on complex flags
 
 **Reference Renderer**: resvg (Rust-based)
 
@@ -83,6 +101,18 @@ Comparison grids (VectorStag | resvg | diff) saved to:
 15. **Stroke polygon fast path** - Open/closed strokes use fast Rust polygon fill instead of PIL ImageDraw
 16. **Gradient numpy passthrough** - Gradient functions return numpy arrays directly, avoiding PIL roundtrip
 
+### resvg-test-suite Improvements (2025-12-30)
+1. **`<mask>` element** - Implemented SVG masking with luminance-based alpha (mask elements render content, convert to luminance, apply as alpha mask)
+2. **`<symbol>` element** - Symbols now properly parse and render only when referenced by `<use>`, not directly
+3. **`<image>` element** - Added support for embedded images via data URLs (base64 PNG/JPEG)
+4. **RGBA color support** - Added parsing for `#RGBA`, `#RRGGBBAA`, and `rgba()` color formats with alpha channel
+5. **HSL/HSLA colors** - Implemented HSL to RGB conversion for `hsl()` and `hsla()` color functions
+6. **Radial gradient `fr`** - Added focal radius attribute support for radial gradients
+7. **CSS unit parsing** - Added support for mm, rem, vmin, vmax, ch, rlh, vh, vw, q units
+8. **visibility:hidden** - Added visibility attribute to Style, elements with visibility:hidden don't render
+9. **Improved similarity calculation** - Benchmark now ignores RGB values when alpha=0 (transparent pixels)
+10. **Error handling** - Fixed various parsing errors for edge cases (invalid hex colors, percentage opacity, etc.)
+
 ### Bug Fixes (2025-12-30)
 1. **Recursion protection** - Added MAX_PARSE_DEPTH and MAX_RENDER_DEPTH limits to prevent stack overflow
 2. **Circular `<use>` detection** - Track `_use_stack` to prevent infinite loops on circular references
@@ -96,6 +126,7 @@ Comparison grids (VectorStag | resvg | diff) saved to:
 10. **Letterbox background color** - Fixed viewBox clipping to set letterbox areas to background color instead of transparent (was causing 8% similarity drop)
 11. **Round join pie slices** - Changed round join corners from full circles to pie slice arcs, preventing over-fill at corners
 12. **Skip miter triangles for round joins** - Miter triangles were filling corners with square shapes even when linejoin="round", overriding the pieslice arcs (Android 99.72% → 99.85%)
+13. **preserveAspectRatio="none" in comparisons** - Fixed `render_vectorstag_for_comparison()` to check `should_stretch()` for SVGs with `preserveAspectRatio="none"` (QA.svg 13% → 99.99%)
 
 ### Notes
 - **Text Rendering**: Now working well - use CairoSVG as reference for text comparisons
@@ -223,6 +254,33 @@ Comparison grids (VectorStag | resvg | diff) saved to:
 - [x] `<switch>` element support
 - [x] requiredExtensions fallback
 
+### Symbol Element
+- [x] `<symbol>` element support
+- [x] Only renders when referenced by `<use>`
+
+### Image Element
+- [x] `<image>` element with data URLs
+- [x] Base64 PNG/JPEG support
+- [x] preserveAspectRatio
+
+### Mask Element
+- [x] `<mask>` element support
+- [x] Luminance-based masking
+- [x] maskUnits and maskContentUnits
+
+### Colors
+- [x] Hex colors (#RGB, #RRGGBB, #RGBA, #RRGGBBAA)
+- [x] rgb() and rgba() functions
+- [x] hsl() and hsla() functions
+- [x] Named colors (140+ CSS colors)
+- [x] currentColor keyword
+
+### CSS Units
+- [x] px, pt, pc, mm, cm, in
+- [x] em, ex, rem, ch
+- [x] vw, vh, vmin, vmax
+- [x] Percentages
+
 ---
 
 ## Known Issues
@@ -262,16 +320,24 @@ VectorStag achieves ~60% of CairoSVG performance at 4x antialiasing. The remaini
 ### Medium Priority
 - [x] spreadMethod (pad, reflect, repeat) for gradients *(implemented 2025-12-29)*
 - [x] currentColor keyword support *(implemented 2025-12-29)*
+- [x] `<mask>` element *(implemented 2025-12-30)*
+- [x] `<image>` element with data URLs *(implemented 2025-12-30)*
+- [x] `<symbol>` element *(implemented 2025-12-30)*
+- [x] visibility attribute *(implemented 2025-12-30)*
+- [x] RGBA colors (#RGBA, #RRGGBBAA, rgba()) *(implemented 2025-12-30)*
+- [x] HSL/HSLA colors *(implemented 2025-12-30)*
+- [x] Radial gradient focal radius (fr) *(implemented 2025-12-30)*
 - [ ] stroke-dashoffset
-- [ ] `<mask>` element
-- [ ] `<filter>` elements (feGaussianBlur, etc.)
+- [ ] `<filter>` primitives (feDiffuseLighting, feSpecularLighting, feComposite, etc.)
 - [ ] `<marker>` for arrowheads
+- [ ] External file references in `<image>`
+- [ ] Embedded SVG in `<image>`
 
 ### Low Priority
-- [ ] `<tspan>`, text-anchor, dominant-baseline
+- [ ] `<tspan>` advanced features
 - [ ] `<style>` block CSS rules
-- [ ] `<image>` element
-- [ ] `<pattern>` fills
+- [ ] `<pattern>` fills (partially working)
+- [ ] Symbol viewBox handling
 
 ---
 
@@ -319,6 +385,34 @@ python render.py input.svg output.png --width 800 --height 600
 
 # Render with options
 python render.py input.svg output.png --antialias 8 --background white
+```
+
+### 4. benchmark_resvg_tests.py - resvg Test Suite Benchmark
+```bash
+# Clone the test suite first (one-time setup)
+git clone https://github.com/nicubunu/resvg-test-suite.git
+
+# Run full benchmark (1679 tests)
+python benchmark_resvg_tests.py
+
+# Run specific category
+python benchmark_resvg_tests.py --category shapes
+python benchmark_resvg_tests.py --category text
+python benchmark_resvg_tests.py --category filters
+python benchmark_resvg_tests.py --category masking
+python benchmark_resvg_tests.py --category paint-servers
+python benchmark_resvg_tests.py --category painting
+python benchmark_resvg_tests.py --category structure
+
+# Run subcategory
+python benchmark_resvg_tests.py --category structure/symbol
+python benchmark_resvg_tests.py --category masking/mask
+
+# Limit number of tests
+python benchmark_resvg_tests.py --limit 100
+
+# Use multiple workers (may have memory issues)
+python benchmark_resvg_tests.py -j 4
 ```
 
 ### Collection Flags

@@ -492,11 +492,20 @@ def get_resvg_native_aspect(svg_path: Path) -> float:
 
 
 def render_vectorstag_for_comparison(svg_path: Path, size: int) -> Optional[Image.Image]:
-    """Render VectorStag at native dimensions and fit to canvas."""
+    """Render VectorStag at appropriate dimensions and fit to canvas."""
     try:
         renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
-        # Render at native dimensions to preserve aspect ratio
-        img = renderer.render_file(str(svg_path))
+
+        # Check if SVG should be stretched (preserveAspectRatio="none")
+        stretch = should_stretch(svg_path)
+
+        if stretch:
+            # Render at target size (stretched to fill)
+            img = renderer.render_file(str(svg_path), size, size)
+        else:
+            # Render at native dimensions to preserve aspect ratio
+            img = renderer.render_file(str(svg_path))
+
         if img is None:
             return None
         return fit_to_canvas(img, size)

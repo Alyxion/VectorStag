@@ -66,6 +66,37 @@ When in doubt, use resvg as the reference renderer.
 - `svg_compare.py` - Main comparison tool (prerender, compare, list)
 - `benchmark.py` - Performance benchmarking and profiling
 - `render.py` - Simple single-file rendering
+- `benchmark_resvg_tests.py` - Benchmark against resvg-test-suite (1679 tests)
+
+## Testing
+
+### Quick Regression Check
+```bash
+# Check all icon collections (should maintain 98%+ accuracy)
+python svg_compare.py compare --all
+
+# Expected results:
+# - Flags: 99.9%
+# - Emojis: 99.9%
+# - Material: 99.0%
+# - Lucide: 98.6%
+# - FontAwesome: 100%
+# - W3C: 99.3%
+```
+
+### resvg-test-suite Benchmark
+```bash
+# Full benchmark (1679 tests, ~10 minutes single-threaded)
+python benchmark_resvg_tests.py
+
+# Expected: 90% average accuracy
+# Categories: shapes (97%), text (96%), painting (94%), masking (93%),
+#             paint-servers (90%), structure (88%), filters (80%)
+
+# Test specific category
+python benchmark_resvg_tests.py --category shapes
+python benchmark_resvg_tests.py --category masking/mask
+```
 
 ## Development Guidelines
 - Use 8 workers for batch operations to avoid memory pressure: `-j 8`

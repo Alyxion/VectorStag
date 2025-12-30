@@ -16,8 +16,8 @@ from .parser import (
     SVGParser, SVGDocument, SVGElement, Transform, Style,
     RectElement, CircleElement, EllipseElement, LineElement,
     PolylineElement, PolygonElement, PathElement, GroupElement,
-    TextElement, LinearGradient, RadialGradient, GradientStop,
-    ClipPath, FILL_NOT_SET
+    TextElement, ImageElement, LinearGradient, RadialGradient, GradientStop,
+    ClipPath, Mask, FILL_NOT_SET
 )
 
 
@@ -124,7 +124,7 @@ class SVGRenderer:
             image_arr = None
 
         # Create render context with numpy array as primary (if Rust available)
-        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.filters)
+        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.masks, doc.filters)
         ctx.image_arr = image_arr
 
         # Render all elements
@@ -210,9 +210,19 @@ class SVGRenderer:
         if element.style.display == "none":
             return
 
+        # Skip elements with visibility: hidden (but still process children)
+        # For non-group elements, visibility:hidden means don't render
+        if element.style.visibility == "hidden" and not isinstance(element, GroupElement):
+            return
+
         # Check if element has a clip path
         if element.clip_path_id and element.clip_path_id in ctx.clip_paths:
             self._render_element_with_clip(ctx, element, depth)
+            return
+
+        # Check if element has a mask
+        if element.mask_id and element.mask_id in ctx.masks:
+            self._render_element_with_mask(ctx, element, depth)
             return
 
         # Apply Gaussian blur filter if present
@@ -239,6 +249,8 @@ class SVGRenderer:
             self._render_path(ctx, element)
         elif isinstance(element, TextElement):
             self._render_text(ctx, element)
+        elif isinstance(element, ImageElement):
+            self._render_image(ctx, element)
 
     def _render_element_with_clip(self, ctx: "RenderContext", element: SVGElement, depth: int = 0):
         """Render an element with a clip path applied."""
@@ -246,7 +258,7 @@ class SVGRenderer:
 
         # Create a temporary image for the element
         temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
-        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.filters)
+        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters)
 
         # Temporarily remove clip path to render to temp image
         old_clip_path_id = element.clip_path_id
@@ -263,6 +275,81 @@ class SVGRenderer:
 
         # Apply the mask and composite onto main image
         temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], mask))
+        self._alpha_composite(ctx, temp_image, 0, 0)
+
+    def _render_element_with_mask(self, ctx: "RenderContext", element: SVGElement, depth: int = 0):
+        """Render an element with an SVG mask applied."""
+        mask_def = ctx.masks[element.mask_id]
+
+        # Create a temporary image for the element
+        temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
+        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters)
+
+        # Temporarily remove mask to render to temp image
+        old_mask_id = element.mask_id
+        element.mask_id = None
+
+        # Render the element
+        self._render_element(temp_ctx, element, depth + 1)
+
+        # Restore mask
+        element.mask_id = old_mask_id
+
+        # Calculate mask bounds in screen coordinates
+        # Get element bounding box for objectBoundingBox units
+        elem_bbox = self._get_element_bbox(element, ctx.base_transform)
+
+        if mask_def.mask_units == "objectBoundingBox" and elem_bbox:
+            bbox_x, bbox_y, bbox_w, bbox_h = elem_bbox
+            # Mask x, y, width, height are fractions of bounding box
+            mask_x = bbox_x + mask_def.x * bbox_w
+            mask_y = bbox_y + mask_def.y * bbox_h
+            mask_w = mask_def.width * bbox_w
+            mask_h = mask_def.height * bbox_h
+        else:
+            # userSpaceOnUse - transform mask coordinates
+            combined = ctx.base_transform.multiply(element.transform)
+            p1 = combined.apply(mask_def.x, mask_def.y)
+            p2 = combined.apply(mask_def.x + mask_def.width, mask_def.y + mask_def.height)
+            mask_x, mask_y = min(p1[0], p2[0]), min(p1[1], p2[1])
+            mask_w, mask_h = abs(p2[0] - p1[0]), abs(p2[1] - p1[1])
+
+        # Render mask content to a temporary image
+        mask_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
+
+        # Set up transform for mask content
+        if mask_def.mask_content_units == "objectBoundingBox" and elem_bbox:
+            # Scale content to bounding box
+            bbox_x, bbox_y, bbox_w, bbox_h = elem_bbox
+            mask_transform = ctx.base_transform.multiply(
+                Transform.translate(bbox_x, bbox_y).multiply(
+                    Transform.scale(bbox_w, bbox_h)
+                )
+            )
+        else:
+            # userSpaceOnUse - use base transform
+            mask_transform = ctx.base_transform
+
+        mask_ctx = RenderContext(mask_image, ctx.gradients, mask_transform, ctx.clip_paths, ctx.masks, ctx.filters)
+
+        # Render mask elements
+        for mask_elem in mask_def.elements:
+            self._render_element(mask_ctx, mask_elem, depth + 1)
+
+        # Convert mask to luminance
+        # SVG spec: mask luminance = 0.2126*R + 0.7152*G + 0.0722*B, multiplied by alpha
+        mask_arr = np.array(mask_image, dtype=np.float32)
+        luminance = (0.2126 * mask_arr[:, :, 0] +
+                     0.7152 * mask_arr[:, :, 1] +
+                     0.0722 * mask_arr[:, :, 2])
+        # Apply mask's own alpha
+        luminance = luminance * (mask_arr[:, :, 3] / 255.0)
+        luminance = np.clip(luminance, 0, 255).astype(np.uint8)
+
+        mask_lum = Image.fromarray(luminance, mode="L")
+
+        # Apply the luminance mask to element's alpha channel
+        temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], mask_lum))
         self._alpha_composite(ctx, temp_image, 0, 0)
 
     def _render_element_with_filter(self, ctx: "RenderContext", element: SVGElement, depth: int = 0):
@@ -304,12 +391,12 @@ class SVGRenderer:
             # Create offset transform that shifts rendering to region coordinates
             offset_transform = Transform(1, 0, 0, 1, -region_x, -region_y)
             adjusted_base = offset_transform.multiply(ctx.base_transform)
-            temp_ctx = RenderContext(temp_image, ctx.gradients, adjusted_base, ctx.clip_paths, ctx.filters)
+            temp_ctx = RenderContext(temp_image, ctx.gradients, adjusted_base, ctx.clip_paths, ctx.masks, ctx.filters)
         else:
             # Fall back to full image rendering
             region_x, region_y = 0, 0
             temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
-            temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.filters)
+            temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters)
 
         # Render the element without filter to the temp image
         old_filter_id = element.style.filter_id
@@ -2545,9 +2632,16 @@ class SVGRenderer:
             cx = bx + gradient.cx * bw
             cy = by + gradient.cy * bh
             r = gradient.r * max(bw, bh)
+            # Focal point defaults to center
+            fx = bx + (gradient.fx if gradient.fx is not None else gradient.cx) * bw
+            fy = by + (gradient.fy if gradient.fy is not None else gradient.cy) * bh
+            fr = gradient.fr * max(bw, bh)
         else:
             cx, cy = gradient.cx, gradient.cy
             r = gradient.r
+            fx = gradient.fx if gradient.fx is not None else cx
+            fy = gradient.fy if gradient.fy is not None else cy
+            fr = gradient.fr
 
         if r == 0:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -2595,11 +2689,18 @@ class SVGRenderer:
         t = np.empty((height, width), dtype=np.float32)
         x_base = np.arange(width, dtype=np.float32) + offset_x
 
+        # Calculate effective radius for gradient (r - fr)
+        effective_r = r - fr
+        if effective_r <= 0:
+            effective_r = 1e-10  # Avoid division by zero
+
         for row in range(height):
             wy = float(row + offset_y)
             gx = inv_a * x_base + (inv_b * wy + inv_e)
             gy = inv_c * x_base + (inv_d * wy + inv_f)
-            t[row, :] = np.sqrt((gx - cx) ** 2 + (gy - cy) ** 2) / r
+            # Distance from focal point, normalized with focal radius
+            dist = np.sqrt((gx - fx) ** 2 + (gy - fy) ** 2)
+            t[row, :] = (dist - fr) / effective_r
 
         if spread_method == "repeat":
             np.remainder(t, 1.0, out=t)
@@ -2898,6 +2999,119 @@ class SVGRenderer:
             draw = ImageDraw.Draw(ctx.image, "RGBA")
             draw.text((x, y), text.text, fill=fill, font=font, anchor=anchor)
 
+    def _render_image(self, ctx: "RenderContext", img_elem: ImageElement):
+        """Render image element (embedded or external images)."""
+        import base64
+        import io
+
+        href = img_elem.href
+        if not href:
+            return
+
+        try:
+            # Handle data URLs (embedded images)
+            if href.startswith("data:"):
+                # Parse data URL: data:[<mediatype>][;base64],<data>
+                # Remove newlines and whitespace that may be in the data URL
+                href = href.replace("\n", "").replace("\r", "").replace(" ", "")
+
+                if ";base64," in href:
+                    data_start = href.index(";base64,") + 8
+                    data = base64.b64decode(href[data_start:])
+                elif "," in href:
+                    # Non-base64 data URL (rare)
+                    data_start = href.index(",") + 1
+                    data = href[data_start:].encode()
+                else:
+                    return
+
+                img = Image.open(io.BytesIO(data)).convert("RGBA")
+            else:
+                # External file reference - not supported for security
+                return
+
+            # Get target dimensions
+            transform = ctx.base_transform.multiply(img_elem.transform)
+
+            # Calculate position and size
+            x = img_elem.x
+            y = img_elem.y
+            width = img_elem.width if img_elem.width > 0 else img.width
+            height = img_elem.height if img_elem.height > 0 else img.height
+
+            # Handle preserveAspectRatio
+            par = img_elem.preserveAspectRatio
+            if par != "none":
+                # Calculate aspect-ratio-preserving fit
+                src_aspect = img.width / img.height if img.height > 0 else 1
+                dst_aspect = width / height if height > 0 else 1
+
+                if "meet" in par:
+                    # Scale to fit within bounds (may have letterboxing)
+                    if src_aspect > dst_aspect:
+                        new_width = width
+                        new_height = width / src_aspect
+                    else:
+                        new_height = height
+                        new_width = height * src_aspect
+                elif "slice" in par:
+                    # Scale to cover bounds (may crop)
+                    if src_aspect > dst_aspect:
+                        new_height = height
+                        new_width = height * src_aspect
+                    else:
+                        new_width = width
+                        new_height = width / src_aspect
+                else:
+                    new_width = width
+                    new_height = height
+
+                # Handle alignment (xMidYMid is default)
+                x_offset = 0
+                y_offset = 0
+                if "xMid" in par:
+                    x_offset = (width - new_width) / 2
+                elif "xMax" in par:
+                    x_offset = width - new_width
+                if "YMid" in par:
+                    y_offset = (height - new_height) / 2
+                elif "YMax" in par:
+                    y_offset = height - new_height
+
+                x += x_offset
+                y += y_offset
+                width = new_width
+                height = new_height
+
+            # Apply transform to get final coordinates
+            x1, y1 = transform.apply(x, y)
+            x2, y2 = transform.apply(x + width, y + height)
+
+            # Calculate final dimensions
+            final_width = int(abs(x2 - x1))
+            final_height = int(abs(y2 - y1))
+            final_x = int(min(x1, x2))
+            final_y = int(min(y1, y2))
+
+            if final_width <= 0 or final_height <= 0:
+                return
+
+            # Resize image to target dimensions
+            resized = img.resize((final_width, final_height), Image.LANCZOS)
+
+            # Apply opacity if needed
+            if img_elem.style.opacity < 1.0:
+                alpha = resized.getchannel("A")
+                alpha = alpha.point(lambda a: int(a * img_elem.style.opacity))
+                resized.putalpha(alpha)
+
+            # Composite onto canvas
+            self._alpha_composite(ctx, resized, final_x, final_y)
+
+        except Exception:
+            # Silently fail for invalid images
+            pass
+
     def _get_scale(self, ctx: "RenderContext", element_transform: Transform) -> float:
         """Get the effective scale factor."""
         full = ctx.base_transform.multiply(element_transform)
@@ -2939,12 +3153,14 @@ class RenderContext:
                  gradients: dict[str, Union[LinearGradient, RadialGradient]],
                  base_transform: Transform,
                  clip_paths: dict[str, ClipPath] = None,
+                 masks: dict[str, Mask] = None,
                  filters: dict = None):
         self.image = image
         self.image_arr = None  # Optional numpy array for Rust compositing
         self.gradients = gradients
         self.base_transform = base_transform
         self.clip_paths = clip_paths or {}
+        self.masks = masks or {}
         self.filters = filters or {}
 
     @property

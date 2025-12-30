@@ -107,6 +107,7 @@ class RadialGradient:
     r: float = 0.5
     fx: Optional[float] = None
     fy: Optional[float] = None
+    fr: float = 0.0  # focal radius - gradient starts at fr distance from focal point
     stops: list[GradientStop] = field(default_factory=list)
     units: str = "objectBoundingBox"
     transform: Optional[Transform] = None
@@ -134,6 +135,7 @@ class Style:
     fill_rule: str = "nonzero"  # nonzero, evenodd
     filter_id: Optional[str] = None  # Filter reference
     display: str = "inline"  # none, inline, block, etc.
+    visibility: str = "visible"  # visible, hidden, collapse
 
 
 @dataclass
@@ -144,6 +146,7 @@ class SVGElement:
     transform: Transform
     children: list["SVGElement"] = field(default_factory=list)
     clip_path_id: Optional[str] = None
+    mask_id: Optional[str] = None
     filter_id: Optional[str] = None
 
 
@@ -220,11 +223,35 @@ class TextElement(SVGElement):
 
 
 @dataclass
+class ImageElement(SVGElement):
+    """Image element for embedding raster images."""
+    x: float = 0
+    y: float = 0
+    width: float = 0
+    height: float = 0
+    href: str = ""  # Data URL or external reference
+    preserveAspectRatio: str = "xMidYMid meet"
+
+
+@dataclass
 class ClipPath:
     """Clip path definition."""
     id: str
     elements: list[SVGElement] = field(default_factory=list)
     clip_path_id: Optional[str] = None  # For nested clip paths (intersection)
+
+
+@dataclass
+class Mask:
+    """Mask definition."""
+    id: str
+    elements: list[SVGElement] = field(default_factory=list)
+    x: float = -0.1  # Default mask region (in objectBoundingBox units)
+    y: float = -0.1
+    width: float = 1.2
+    height: float = 1.2
+    mask_units: str = "objectBoundingBox"  # or "userSpaceOnUse"
+    mask_content_units: str = "userSpaceOnUse"  # or "objectBoundingBox"
 
 
 @dataclass
@@ -249,6 +276,7 @@ class SVGDocument:
     elements: list[SVGElement] = field(default_factory=list)
     gradients: dict[str, Union[LinearGradient, RadialGradient]] = field(default_factory=dict)
     clip_paths: dict[str, ClipPath] = field(default_factory=dict)
+    masks: dict[str, Mask] = field(default_factory=dict)
     filters: dict[str, GaussianBlurFilter] = field(default_factory=dict)
     preserve_aspect_ratio: str = "xMidYMid"  # SVG default
 
@@ -409,6 +437,7 @@ class SVGParser:
     def __init__(self):
         self.gradients: dict[str, Union[LinearGradient, RadialGradient]] = {}
         self.clip_paths: dict[str, ClipPath] = {}
+        self.masks: dict[str, Mask] = {}
         self.defs: dict[str, ET.Element] = {}
         self.default_width = 300
         self.default_height = 150
@@ -473,6 +502,7 @@ class SVGParser:
         # Reset state
         self.gradients = {}
         self.clip_paths = {}
+        self.masks = {}
         self.filters = {}
         self.defs = {}
         self.css_classes = {}
@@ -483,8 +513,9 @@ class SVGParser:
         # First pass: collect defs
         self._collect_defs(root)
 
-        # Parse clip paths
+        # Parse clip paths and masks
         self._parse_clip_paths(root)
+        self._parse_masks(root)
 
         # Resolve gradient references
         self._resolve_gradient_refs()
@@ -524,6 +555,7 @@ class SVGParser:
             elements=elements,
             gradients=self.gradients,
             clip_paths=self.clip_paths,
+            masks=self.masks,
             filters=self.filters,
             preserve_aspect_ratio=preserve_aspect_ratio
         )
@@ -614,6 +646,46 @@ class SVGParser:
                         id=clip_id,
                         elements=clip_elements,
                         clip_path_id=nested_clip
+                    )
+
+    def _parse_masks(self, root: ET.Element):
+        """Parse all mask elements."""
+        for elem in root.iter():
+            tag = self._strip_ns(elem.tag)
+            if tag == "mask":
+                mask_id = elem.get("id")
+                if mask_id:
+                    # Parse child elements as mask content
+                    mask_elements = []
+                    for child in elem:
+                        child_tag = self._strip_ns(child.tag)
+                        parsed = self._parse_element(
+                            child, Transform.identity(), Style(), depth=1
+                        )
+                        if parsed:
+                            mask_elements.append(parsed)
+
+                    # Parse mask attributes
+                    def parse_mask_val(val: str, default: float) -> float:
+                        if val is None:
+                            return default
+                        val = val.strip()
+                        if val.endswith('%'):
+                            return float(val[:-1]) / 100.0
+                        try:
+                            return float(val)
+                        except ValueError:
+                            return default
+
+                    self.masks[mask_id] = Mask(
+                        id=mask_id,
+                        elements=mask_elements,
+                        x=parse_mask_val(elem.get("x"), -0.1),
+                        y=parse_mask_val(elem.get("y"), -0.1),
+                        width=parse_mask_val(elem.get("width"), 1.2),
+                        height=parse_mask_val(elem.get("height"), 1.2),
+                        mask_units=elem.get("maskUnits", "objectBoundingBox"),
+                        mask_content_units=elem.get("maskContentUnits", "userSpaceOnUse")
                     )
 
     def _parse_filter(self, elem: ET.Element):
@@ -733,10 +805,13 @@ class SVGParser:
 
         fx = elem.get("fx")
         fy = elem.get("fy")
+        fr = elem.get("fr")
         if fx:
             grad.fx = self._parse_gradient_coord(fx)
         if fy:
             grad.fy = self._parse_gradient_coord(fy)
+        if fr:
+            grad.fr = self._parse_gradient_coord(fr)
 
         transform_str = elem.get("gradientTransform")
         if transform_str:
@@ -751,7 +826,14 @@ class SVGParser:
         value = value.strip()
         if value.endswith("%"):
             return float(value[:-1]) / 100.0
-        return float(value)
+        # Try parsing with units
+        try:
+            return self._parse_length(value)
+        except (ValueError, AttributeError):
+            try:
+                return float(value)
+            except ValueError:
+                return 0.0
 
     def _parse_gradient_stops(self, elem: ET.Element) -> list[GradientStop]:
         """Parse gradient stop elements."""
@@ -761,9 +843,16 @@ class SVGParser:
             if tag == "stop":
                 offset = child.get("offset", "0")
                 if offset.endswith("%"):
-                    offset = float(offset[:-1]) / 100.0
+                    try:
+                        offset = float(offset[:-1]) / 100.0
+                    except ValueError:
+                        offset = 0.0
                 else:
-                    offset = float(offset)
+                    try:
+                        offset = float(offset)
+                    except ValueError:
+                        # Invalid offset (like "5mm") - treat as 0
+                        offset = 0.0
 
                 # Get color from style or attributes
                 style_str = child.get("style", "")
@@ -774,7 +863,13 @@ class SVGParser:
 
                 color = self._parse_color(color_str)
                 if color:
-                    opacity = float(opacity_str)
+                    try:
+                        if opacity_str.endswith('%'):
+                            opacity = float(opacity_str[:-1]) / 100.0
+                        else:
+                            opacity = float(opacity_str)
+                    except (ValueError, AttributeError):
+                        opacity = 1.0
                     color = (color[0], color[1], color[2], int(opacity * 255))
                 else:
                     color = (0, 0, 0, 255)
@@ -803,9 +898,10 @@ class SVGParser:
             tag = self._strip_ns(child.tag)
 
             # Skip defs, metadata, etc.
+            # symbol elements only render when referenced by <use>
             if tag in ("defs", "metadata", "title", "desc", "style",
                        "linearGradient", "radialGradient", "SVGTestCase",
-                       "OperatorScript", "Paragraph"):
+                       "OperatorScript", "Paragraph", "symbol"):
                 continue
 
             elem = self._parse_element(child, parent_transform, parent_style, parent_text_anchor,
@@ -868,8 +964,9 @@ class SVGParser:
         local_transform = self._parse_transform(transform_str) if transform_str else Transform.identity()
         transform = parent_transform.multiply(local_transform)
 
-        # Parse clip-path attribute
+        # Parse clip-path and mask attributes
         clip_path_id = self._parse_url_reference(elem.get("clip-path", ""))
+        mask_id = self._parse_url_reference(elem.get("mask", ""))
 
         result = None
         if tag == "rect":
@@ -888,6 +985,9 @@ class SVGParser:
             result = self._parse_path(elem, style, transform)
         elif tag == "g":
             result = self._parse_group(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
+        elif tag == "symbol":
+            # Symbol is like a group but may have viewBox
+            result = self._parse_symbol(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
         elif tag == "switch":
             result = self._parse_switch(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
         elif tag == "text":
@@ -896,10 +996,15 @@ class SVGParser:
             result = self._parse_use(elem, style, transform, parent_style, depth + 1)
         elif tag == "svg":
             result = self._parse_nested_svg(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
+        elif tag == "image":
+            result = self._parse_image(elem, style, transform)
 
-        # Set clip path on the parsed element
-        if result and clip_path_id:
-            result.clip_path_id = clip_path_id
+        # Set clip path and mask on the parsed element
+        if result:
+            if clip_path_id:
+                result.clip_path_id = clip_path_id
+            if mask_id:
+                result.mask_id = mask_id
 
         return result
 
@@ -936,7 +1041,8 @@ class SVGParser:
             stroke_miterlimit=parent_style.stroke_miterlimit,
             opacity=parent_style.opacity,
             fill_rule=parent_style.fill_rule,
-            display=parent_style.display
+            display=parent_style.display,
+            visibility=parent_style.visibility
         )
 
         # First apply CSS classes (lowest priority)
@@ -954,7 +1060,7 @@ class SVGParser:
         # Merge with direct attributes (highest priority)
         for attr in ["fill", "stroke", "stroke-width", "fill-opacity",
                      "stroke-opacity", "opacity", "fill-rule",
-                     "stroke-linecap", "stroke-linejoin", "stroke-miterlimit", "stroke-dasharray", "filter", "display"]:
+                     "stroke-linecap", "stroke-linejoin", "stroke-miterlimit", "stroke-dasharray", "filter", "display", "visibility"]:
             val = elem.get(attr)
             if val:
                 style_dict[attr] = val
@@ -968,8 +1074,12 @@ class SVGParser:
                 # Gradient reference
                 style.fill = fill_val
             else:
-                color = self._parse_color(fill_val)
-                if color:
+                result = self._parse_color_with_alpha(fill_val)
+                if result:
+                    color, alpha = result
+                    # Apply color alpha to fill_opacity
+                    if alpha < 1.0:
+                        style.fill_opacity *= alpha
                     style.fill = (*color, 255)
 
         if "stroke" in style_dict:
@@ -979,21 +1089,46 @@ class SVGParser:
             elif stroke_val.startswith("url("):
                 style.stroke = stroke_val
             else:
-                color = self._parse_color(stroke_val)
-                if color:
+                result = self._parse_color_with_alpha(stroke_val)
+                if result:
+                    color, alpha = result
+                    # Apply color alpha to stroke_opacity
+                    if alpha < 1.0:
+                        style.stroke_opacity *= alpha
                     style.stroke = (*color, 255)
 
         if "stroke-width" in style_dict:
             style.stroke_width = self._parse_length(style_dict["stroke-width"])
 
         if "fill-opacity" in style_dict:
-            style.fill_opacity = float(style_dict["fill-opacity"])
+            try:
+                val = style_dict["fill-opacity"]
+                if val.endswith('%'):
+                    style.fill_opacity = float(val[:-1]) / 100.0
+                else:
+                    style.fill_opacity = float(val)
+            except (ValueError, AttributeError):
+                pass
 
         if "stroke-opacity" in style_dict:
-            style.stroke_opacity = float(style_dict["stroke-opacity"])
+            try:
+                val = style_dict["stroke-opacity"]
+                if val.endswith('%'):
+                    style.stroke_opacity = float(val[:-1]) / 100.0
+                else:
+                    style.stroke_opacity = float(val)
+            except (ValueError, AttributeError):
+                pass
 
         if "opacity" in style_dict:
-            style.opacity = float(style_dict["opacity"])
+            try:
+                val = style_dict["opacity"]
+                if val.endswith('%'):
+                    style.opacity = float(val[:-1]) / 100.0
+                else:
+                    style.opacity = float(val)
+            except (ValueError, AttributeError):
+                pass
 
         if "fill-rule" in style_dict:
             style.fill_rule = style_dict["fill-rule"]
@@ -1005,7 +1140,10 @@ class SVGParser:
             style.stroke_linejoin = style_dict["stroke-linejoin"]
 
         if "stroke-miterlimit" in style_dict:
-            style.stroke_miterlimit = float(style_dict["stroke-miterlimit"])
+            try:
+                style.stroke_miterlimit = float(style_dict["stroke-miterlimit"])
+            except (ValueError, AttributeError):
+                pass
 
         if "stroke-dasharray" in style_dict:
             dasharray_str = style_dict["stroke-dasharray"].strip()
@@ -1013,7 +1151,7 @@ class SVGParser:
                 # Parse comma or space separated values
                 parts = dasharray_str.replace(",", " ").split()
                 try:
-                    style.stroke_dasharray = [float(p) for p in parts if p]
+                    style.stroke_dasharray = [self._parse_length(p) for p in parts if p]
                 except ValueError:
                     pass
 
@@ -1022,6 +1160,11 @@ class SVGParser:
             # CSS spec: children of display:none elements are never rendered
             if parent_style.display != "none":
                 style.display = style_dict["display"]
+
+        if "visibility" in style_dict:
+            # visibility is inherited but CAN be overridden by children
+            # (unlike display:none which hides entire subtree)
+            style.visibility = style_dict["visibility"]
 
         # Parse filter reference
         if "filter" in style_dict:
@@ -1059,18 +1202,36 @@ class SVGParser:
         # Hex color
         if color_str.startswith("#"):
             hex_str = color_str[1:]
-            if len(hex_str) == 3:
-                # Short form #RGB
-                r = int(hex_str[0] * 2, 16)
-                g = int(hex_str[1] * 2, 16)
-                b = int(hex_str[2] * 2, 16)
-                return (r, g, b)
-            elif len(hex_str) == 6:
-                # Full form #RRGGBB
-                r = int(hex_str[0:2], 16)
-                g = int(hex_str[2:4], 16)
-                b = int(hex_str[4:6], 16)
-                return (r, g, b)
+            try:
+                if len(hex_str) == 3:
+                    # Short form #RGB
+                    r = int(hex_str[0] * 2, 16)
+                    g = int(hex_str[1] * 2, 16)
+                    b = int(hex_str[2] * 2, 16)
+                    return (r, g, b)
+                elif len(hex_str) == 4:
+                    # Short form #RGBA
+                    r = int(hex_str[0] * 2, 16)
+                    g = int(hex_str[1] * 2, 16)
+                    b = int(hex_str[2] * 2, 16)
+                    # Alpha is handled separately
+                    return (r, g, b)
+                elif len(hex_str) == 6:
+                    # Full form #RRGGBB
+                    r = int(hex_str[0:2], 16)
+                    g = int(hex_str[2:4], 16)
+                    b = int(hex_str[4:6], 16)
+                    return (r, g, b)
+                elif len(hex_str) == 8:
+                    # Full form #RRGGBBAA
+                    r = int(hex_str[0:2], 16)
+                    g = int(hex_str[2:4], 16)
+                    b = int(hex_str[4:6], 16)
+                    # Alpha is handled separately
+                    return (r, g, b)
+            except ValueError:
+                # Invalid hex characters
+                return None
 
         # RGB function
         rgb_match = re.match(r"rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", color_str)
@@ -1086,7 +1247,121 @@ class SVGParser:
                 int(float(rgb_pct_match.group(3)) * 255 / 100)
             )
 
+        # HSL function: hsl(h, s%, l%)
+        hsl_match = re.match(r"hsl\s*\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*\)", color_str)
+        if hsl_match:
+            h = float(hsl_match.group(1)) / 360.0
+            s = float(hsl_match.group(2)) / 100.0
+            l = float(hsl_match.group(3)) / 100.0
+            return self._hsl_to_rgb(h, s, l)
+
+        # HSLA function: hsla(h, s%, l%, a)
+        hsla_match = re.match(r"hsla\s*\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*,\s*([\d.]+)\s*\)", color_str)
+        if hsla_match:
+            h = float(hsla_match.group(1)) / 360.0
+            s = float(hsla_match.group(2)) / 100.0
+            l = float(hsla_match.group(3)) / 100.0
+            # Alpha is handled separately by stop-opacity, ignore here
+            return self._hsl_to_rgb(h, s, l)
+
         return None
+
+    def _parse_color_with_alpha(self, color_str: str) -> Optional[tuple[tuple[int, int, int], float]]:
+        """Parse color string and return (RGB, alpha) tuple. Alpha is 0-1."""
+        if not color_str or color_str == "none":
+            return None
+
+        color_str = color_str.strip().lower()
+
+        # Extract alpha from various formats
+        alpha = 1.0
+
+        # Hex colors with alpha
+        if color_str.startswith("#"):
+            hex_str = color_str[1:]
+            try:
+                if len(hex_str) == 4:
+                    # Short form #RGBA
+                    r = int(hex_str[0] * 2, 16)
+                    g = int(hex_str[1] * 2, 16)
+                    b = int(hex_str[2] * 2, 16)
+                    alpha = int(hex_str[3] * 2, 16) / 255.0
+                    return ((r, g, b), alpha)
+                elif len(hex_str) == 8:
+                    # Full form #RRGGBBAA
+                    r = int(hex_str[0:2], 16)
+                    g = int(hex_str[2:4], 16)
+                    b = int(hex_str[4:6], 16)
+                    alpha = int(hex_str[6:8], 16) / 255.0
+                    return ((r, g, b), alpha)
+            except ValueError:
+                pass
+
+        # RGBA function
+        rgba_match = re.match(r"rgba\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+)\s*\)", color_str)
+        if rgba_match:
+            a = float(rgba_match.group(4))
+            if a > 1:
+                a = a / 255.0  # Some use 0-255 for alpha
+            return ((int(rgba_match.group(1)), int(rgba_match.group(2)), int(rgba_match.group(3))), a)
+
+        # RGBA with percentages
+        rgba_pct_match = re.match(r"rgba\s*\(\s*([\d.]+)%\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*,\s*([\d.]+%?)\s*\)", color_str)
+        if rgba_pct_match:
+            a_str = rgba_pct_match.group(4)
+            if a_str.endswith('%'):
+                a = float(a_str[:-1]) / 100.0
+            else:
+                a = float(a_str)
+            return ((
+                int(float(rgba_pct_match.group(1)) * 255 / 100),
+                int(float(rgba_pct_match.group(2)) * 255 / 100),
+                int(float(rgba_pct_match.group(3)) * 255 / 100)
+            ), a)
+
+        # HSLA function: hsla(h, s%, l%, a)
+        hsla_match = re.match(r"hsla\s*\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*,\s*([\d.]+)\s*\)", color_str)
+        if hsla_match:
+            h = float(hsla_match.group(1)) / 360.0
+            s = float(hsla_match.group(2)) / 100.0
+            l = float(hsla_match.group(3)) / 100.0
+            a = float(hsla_match.group(4))
+            return (self._hsl_to_rgb(h, s, l), a)
+
+        # Fall back to regular color parsing (no alpha)
+        rgb = self._parse_color(color_str)
+        if rgb:
+            return (rgb, 1.0)
+        return None
+
+    def _hsl_to_rgb(self, h: float, s: float, l: float) -> tuple[int, int, int]:
+        """Convert HSL to RGB."""
+        if s == 0:
+            # Achromatic (gray)
+            v = int(l * 255)
+            return (v, v, v)
+
+        def hue_to_rgb(p, q, t):
+            if t < 0:
+                t += 1
+            if t > 1:
+                t -= 1
+            if t < 1/6:
+                return p + (q - p) * 6 * t
+            if t < 1/2:
+                return q
+            if t < 2/3:
+                return p + (q - p) * (2/3 - t) * 6
+            return p
+
+        q = l * (1 + s) if l < 0.5 else l + s - l * s
+        p = 2 * l - q
+
+        r = hue_to_rgb(p, q, h + 1/3)
+        g = hue_to_rgb(p, q, h)
+        b = hue_to_rgb(p, q, h - 1/3)
+
+        return (int(r * 255), int(g * 255), int(b * 255))
 
     def _parse_length(self, length_str: str, ref_dim: float = None) -> float:
         """Parse SVG length value.
@@ -1117,11 +1392,26 @@ class SVGParser:
             "in": 96.0,
             "em": 16.0,
             "ex": 8.0,
+            "rem": 16.0,  # Assuming root font size of 16px
+            "ch": 8.0,  # Width of '0' character, approximate
+            "vw": 10.0,  # Viewport width unit, approximate
+            "vh": 10.0,  # Viewport height unit, approximate
+            "vmin": 10.0,  # Viewport min, approximate
+            "vmax": 10.0,  # Viewport max, approximate
+            "vm": 10.0,  # Old viewport min syntax
+            "q": 0.945,  # Quarter-millimeter (96/25.4/4)
+            "r": 16.0,  # Typo for rem, handle gracefully
+            "rlh": 16.0,  # Root line height, approximate
+            "lh": 16.0,  # Line height, approximate
         }
 
-        for unit, factor in units.items():
+        # Sort by length (longest first) to match "vmin" before "in"
+        for unit, factor in sorted(units.items(), key=lambda x: -len(x[0])):
             if length_str.endswith(unit):
-                return float(length_str[:-len(unit)]) * factor
+                try:
+                    return float(length_str[:-len(unit)]) * factor
+                except ValueError:
+                    return 0
 
         # Plain number
         try:
@@ -1277,6 +1567,21 @@ class SVGParser:
         )
         return group
 
+    def _parse_symbol(self, elem: ET.Element, style: Style, transform: Transform,
+                      parent_style: Style, text_anchor: str = "start",
+                      font_family: str = "Arial", font_size: float = 16,
+                      depth: int = 0) -> GroupElement:
+        """Parse symbol element - similar to group but may have viewBox."""
+        # Symbol is like a group, but it can have its own viewBox
+        # For now, treat it as a simple group
+        group = GroupElement(
+            tag="symbol",
+            style=style,
+            transform=transform,
+            children=self._parse_children(elem, transform, style, text_anchor, font_family, font_size, depth=depth)
+        )
+        return group
+
     def _parse_nested_svg(self, elem: ET.Element, style: Style, transform: Transform,
                           parent_style: Style, text_anchor: str = "start",
                           font_family: str = "Arial", font_size: float = 16,
@@ -1411,6 +1716,23 @@ class SVGParser:
             font_family=font_family,
             font_size=font_size,
             text_anchor=text_anchor
+        )
+
+    def _parse_image(self, elem: ET.Element, style: Style, transform: Transform) -> ImageElement:
+        """Parse image element."""
+        # Get href from xlink:href or href attribute
+        href = elem.get(f"{self.XLINK_NS}href") or elem.get("href") or ""
+
+        return ImageElement(
+            tag="image",
+            style=style,
+            transform=transform,
+            x=self._parse_length(elem.get("x", "0")),
+            y=self._parse_length(elem.get("y", "0")),
+            width=self._parse_length(elem.get("width", "0")),
+            height=self._parse_length(elem.get("height", "0")),
+            href=href,
+            preserveAspectRatio=elem.get("preserveAspectRatio", "xMidYMid meet")
         )
 
     def _parse_use(self, elem: ET.Element, style: Style, transform: Transform,
