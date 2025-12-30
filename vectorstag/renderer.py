@@ -178,11 +178,12 @@ class SVGRenderer:
                           clip_x2 < render_width or clip_y2 < render_height))
 
             if needs_clip:
-                # Zero out alpha outside clip bounds
-                img_arr[:clip_y1, :, 3] = 0  # Top
-                img_arr[clip_y2:, :, 3] = 0  # Bottom
-                img_arr[:, :clip_x1, 3] = 0  # Left
-                img_arr[:, clip_x2:, 3] = 0  # Right
+                # Set letterbox areas to background color
+                # (previous code zeroed alpha, making them transparent even with solid background)
+                img_arr[:clip_y1, :] = self.background  # Top
+                img_arr[clip_y2:, :] = self.background  # Bottom
+                img_arr[:, :clip_x1] = self.background  # Left
+                img_arr[:, clip_x2:] = self.background  # Right
 
         # Downscale for anti-aliasing effect
         if aa > 1:
@@ -247,29 +248,15 @@ class SVGRenderer:
         temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
         temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.filters)
 
-        # Render the element without clipping to the temp image
-        element_copy = element
-        element_copy.clip_path_id = None  # Temporarily remove clip path
+        # Temporarily remove clip path to render to temp image
+        old_clip_path_id = element.clip_path_id
+        element.clip_path_id = None
 
-        if isinstance(element, GroupElement):
-            for child in element.children:
-                self._render_element(temp_ctx, child, depth + 1)
-        elif isinstance(element, RectElement):
-            self._render_rect(temp_ctx, element)
-        elif isinstance(element, CircleElement):
-            self._render_circle(temp_ctx, element)
-        elif isinstance(element, EllipseElement):
-            self._render_ellipse(temp_ctx, element)
-        elif isinstance(element, LineElement):
-            self._render_line(temp_ctx, element)
-        elif isinstance(element, PolylineElement):
-            self._render_polyline(temp_ctx, element)
-        elif isinstance(element, PolygonElement):
-            self._render_polygon(temp_ctx, element)
-        elif isinstance(element, PathElement):
-            self._render_path(temp_ctx, element)
-        elif isinstance(element, TextElement):
-            self._render_text(temp_ctx, element)
+        # Render the element (which will handle filter if present)
+        self._render_element(temp_ctx, element, depth + 1)
+
+        # Restore clip path
+        element.clip_path_id = old_clip_path_id
 
         # Create clip mask from clip path shapes
         mask = self._create_clip_mask(ctx, clip_path, element.transform)
@@ -282,9 +269,10 @@ class SVGRenderer:
         """Render an element with a filter (e.g., Gaussian blur) applied."""
         filter_def = ctx.filters[element.style.filter_id]
 
-        # Calculate blur radius first to determine region padding
-        scale = math.sqrt(abs(ctx.base_transform.a * ctx.base_transform.d -
-                              ctx.base_transform.b * ctx.base_transform.c))
+        # Calculate blur radius - stdDeviation is in user space
+        # Scale by combined transform (base + element) to convert to screen pixels
+        combined = ctx.base_transform.multiply(element.transform)
+        scale = math.sqrt(abs(combined.a * combined.d - combined.b * combined.c))
         blur_radius = filter_def.std_deviation * scale
 
         # Get element bounding box in screen coordinates
@@ -350,29 +338,50 @@ class SVGRenderer:
         # Restore filter_id
         element.style.filter_id = old_filter_id
 
-        # Apply Gaussian blur filter
-        # PIL GaussianBlur radius - at least 1 pixel
+        # Apply Gaussian blur filter per SVG spec
+        # SVG spec: use three box-blurs to approximate Gaussian
+        # d = floor(s * 3 * sqrt(2*pi) / 4 + 0.5) where s is stdDeviation
         if blur_radius >= 0.5:
+            # Calculate box blur size per SVG spec
+            # d = floor(s * 3 * sqrt(2*pi) / 4 + 0.5)
+            # 3 * sqrt(2*pi) / 4 ≈ 1.8799
+            d = int(blur_radius * 1.8799 + 0.5)
+            if d < 1:
+                d = 1
+
+            # PIL BoxBlur uses radius, where kernel size = 2*radius + 1
+            # For kernel size d, we need radius = (d - 1) / 2
+            # But for even d, we need to handle it differently
+            box_radius = max(0.5, (d - 1) / 2.0)
+
             # Use premultiplied alpha to avoid blending with black from transparent pixels
-            # Memory-optimized: work with uint8 arrays, avoid float32 where possible
             arr = np.array(temp_image, dtype=np.uint8)
             alpha = arr[:, :, 3].astype(np.float32)
 
-            # Create premultiplied channels and blur them
-            blur = ImageFilter.GaussianBlur(radius=blur_radius)
+            # Apply three box-blurs to approximate Gaussian (per SVG spec)
+            box_blur = ImageFilter.BoxBlur(radius=box_radius)
+
             blurred_channels = []
 
-            # Premultiply and blur RGB channels
+            # Premultiply and apply triple box-blur to RGB channels
             for c in range(3):
                 channel = arr[:, :, c].astype(np.float32)
                 premult = (channel * alpha / 255.0).astype(np.uint8)
-                blurred = np.array(Image.fromarray(premult, mode='L').filter(blur), dtype=np.float32)
-                blurred_channels.append(blurred)
-                del channel, premult
+                img = Image.fromarray(premult, mode='L')
+                # Apply three passes of box blur (SVG spec approximation)
+                img = img.filter(box_blur)
+                img = img.filter(box_blur)
+                img = img.filter(box_blur)
+                blurred_channels.append(np.array(img, dtype=np.float32))
+                del channel, premult, img
 
-            # Blur alpha channel
-            alpha_blurred = np.array(Image.fromarray(arr[:, :, 3], mode='L').filter(blur), dtype=np.float32)
-            del arr, alpha
+            # Apply triple box-blur to alpha channel
+            alpha_img = Image.fromarray(arr[:, :, 3], mode='L')
+            alpha_img = alpha_img.filter(box_blur)
+            alpha_img = alpha_img.filter(box_blur)
+            alpha_img = alpha_img.filter(box_blur)
+            alpha_blurred = np.array(alpha_img, dtype=np.float32)
+            del arr, alpha, alpha_img
 
             # Un-premultiply: R = R' * 255 / A (avoid division by zero)
             alpha_safe = np.maximum(alpha_blurred, 1.0)
@@ -1316,7 +1325,9 @@ class SVGRenderer:
                 has_reflex = True
                 break
 
-        if has_reflex:
+        # For round/bevel joins, use segmented approach to get correct per-edge perpendicular offsets
+        # The outline approach with averaged perpendiculars creates gaps at 90° corners
+        if has_reflex or linejoin in ("round", "bevel"):
             self._stroke_closed_polygon_segmented(ctx, points, stroke, half_width, miterlimit, linejoin)
         else:
             self._stroke_closed_polygon_outline(ctx, points, stroke, half_width, miterlimit, linejoin)
@@ -1346,7 +1357,7 @@ class SVGRenderer:
         # Use Rust implementation if available
         if HAS_RUST:
             mask = vectorstag_rust.render_stroke_closed_polygon(
-                points, half_width, miterlimit, width, height, min_x, min_y
+                points, half_width, miterlimit, width, height, min_x, min_y, linejoin
             )
             mask_img = Image.fromarray(mask, "L")
 
@@ -1463,51 +1474,89 @@ class SVGRenderer:
             ]
             draw.polygon(quad, fill=stroke)
 
-        # Fill corners with miter triangles
-        for i in range(n):
-            p_prev = points[(i - 1) % n]
-            p_curr = points[i]
-            p_next = points[(i + 1) % n]
+        # Fill corners with miter triangles (only for miter/bevel joins, not round)
+        if linejoin != "round":
+            for i in range(n):
+                p_prev = points[(i - 1) % n]
+                p_curr = points[i]
+                p_next = points[(i + 1) % n]
 
-            d1 = self._normalize(self._subtract(p_curr, p_prev))
-            d2 = self._normalize(self._subtract(p_next, p_curr))
+                d1 = self._normalize(self._subtract(p_curr, p_prev))
+                d2 = self._normalize(self._subtract(p_next, p_curr))
 
-            perp1 = (-d1[1], d1[0])
-            perp2 = (-d2[1], d2[0])
+                perp1 = (-d1[1], d1[0])
+                perp2 = (-d2[1], d2[0])
 
-            cross = d1[0] * d2[1] - d1[1] * d2[0]
-            if abs(cross) < 0.001:
-                continue
+                cross = d1[0] * d2[1] - d1[1] * d2[0]
+                if abs(cross) < 0.001:
+                    continue
 
-            # Compute miter point
-            left_p1 = (p_curr[0] + perp1[0] * half_width, p_curr[1] + perp1[1] * half_width)
-            left_p2 = (p_curr[0] + perp2[0] * half_width, p_curr[1] + perp2[1] * half_width)
-            right_p1 = (p_curr[0] - perp1[0] * half_width, p_curr[1] - perp1[1] * half_width)
-            right_p2 = (p_curr[0] - perp2[0] * half_width, p_curr[1] - perp2[1] * half_width)
+                # Compute miter point
+                left_p1 = (p_curr[0] + perp1[0] * half_width, p_curr[1] + perp1[1] * half_width)
+                left_p2 = (p_curr[0] + perp2[0] * half_width, p_curr[1] + perp2[1] * half_width)
+                right_p1 = (p_curr[0] - perp1[0] * half_width, p_curr[1] - perp1[1] * half_width)
+                right_p2 = (p_curr[0] - perp2[0] * half_width, p_curr[1] - perp2[1] * half_width)
 
-            if cross > 0:
-                # Left turn - miter on inside (right)
-                miter_pt = self._line_intersection(right_p1, d1, right_p2, d2)
-                if miter_pt:
-                    miter_dist = math.sqrt((miter_pt[0] - p_curr[0])**2 + (miter_pt[1] - p_curr[1])**2)
-                    if miter_dist <= miterlimit * half_width:
-                        tri = [right_p1, miter_pt, right_p2]
-                        draw.polygon(tri, fill=stroke)
-            else:
-                # Right turn - miter on inside (left)
-                miter_pt = self._line_intersection(left_p1, d1, left_p2, d2)
-                if miter_pt:
-                    miter_dist = math.sqrt((miter_pt[0] - p_curr[0])**2 + (miter_pt[1] - p_curr[1])**2)
-                    if miter_dist <= miterlimit * half_width:
-                        tri = [left_p1, miter_pt, left_p2]
-                        draw.polygon(tri, fill=stroke)
+                if cross > 0:
+                    # Left turn - miter on inside (right)
+                    miter_pt = self._line_intersection(right_p1, d1, right_p2, d2)
+                    if miter_pt:
+                        miter_dist = math.sqrt((miter_pt[0] - p_curr[0])**2 + (miter_pt[1] - p_curr[1])**2)
+                        if miter_dist <= miterlimit * half_width:
+                            tri = [right_p1, miter_pt, right_p2]
+                            draw.polygon(tri, fill=stroke)
+                else:
+                    # Right turn - miter on inside (left)
+                    miter_pt = self._line_intersection(left_p1, d1, left_p2, d2)
+                    if miter_pt:
+                        miter_dist = math.sqrt((miter_pt[0] - p_curr[0])**2 + (miter_pt[1] - p_curr[1])**2)
+                        if miter_dist <= miterlimit * half_width:
+                            tri = [left_p1, miter_pt, left_p2]
+                            draw.polygon(tri, fill=stroke)
 
         # Draw round joins at corners if linejoin is "round"
+        # Use pie slices (arcs) instead of full circles to avoid over-filling
         if linejoin == "round":
             for i in range(n):
-                x, y = points[i]
-                draw.ellipse([x - half_width, y - half_width,
-                              x + half_width, y + half_width], fill=stroke)
+                p_prev = points[(i - 1) % n]
+                p_curr = points[i]
+                p_next = points[(i + 1) % n]
+
+                # Direction vectors for adjacent edges
+                d1 = self._normalize(self._subtract(p_curr, p_prev))
+                d2 = self._normalize(self._subtract(p_next, p_curr))
+
+                # Cross product to determine turn direction
+                cross = d1[0] * d2[1] - d1[1] * d2[0]
+
+                # Only draw round join on outside of corner (convex turn)
+                # For a closed polygon, outside corners have cross product with sign
+                # matching the polygon's winding direction
+                if abs(cross) < 0.001:
+                    continue  # Collinear edges, no join needed
+
+                # Perpendicular directions (pointing outward from stroke)
+                perp1 = (-d1[1], d1[0])  # Perpendicular to incoming edge
+                perp2 = (-d2[1], d2[0])  # Perpendicular to outgoing edge
+
+                # Calculate angles for the arc
+                # perp1/perp2 point in the "left" direction relative to edge direction
+                # For the round join, we need the arc on the OUTSIDE of the corner
+                # PIL angles: 0=right, 90=down, 180=left, 270=up (counterclockwise)
+                angle1 = math.degrees(math.atan2(perp1[1], perp1[0]))
+                angle2 = math.degrees(math.atan2(perp2[1], perp2[0]))
+
+                x, y = p_curr
+                bbox = [x - half_width, y - half_width, x + half_width, y + half_width]
+
+                # For right turn (cross < 0), outside is where we draw the arc
+                # The arc connects the outer ends of the two edge strokes
+                if cross < 0:
+                    # Right turn - arc goes from perp2 angle to perp1 angle (counterclockwise)
+                    draw.pieslice(bbox, angle2, angle1, fill=stroke)
+                else:
+                    # Left turn - arc goes from perp1 angle to perp2 angle (counterclockwise)
+                    draw.pieslice(bbox, angle1, angle2, fill=stroke)
 
         self._alpha_composite(ctx, temp, 0, 0)
 
@@ -2736,43 +2785,51 @@ class SVGRenderer:
     FONT_PATHS = {
         # Serif fonts
         "serif": [
+            "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
             "/System/Library/Fonts/Times.ttc",
             "times.ttf",
         ],
         "times": [
+            "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
             "/System/Library/Fonts/Times.ttc",
         ],
         "times new roman": [
+            "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
             "/System/Library/Fonts/Times.ttc",
         ],
         # Sans-serif fonts
         "sans-serif": [
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
             "/System/Library/Fonts/Helvetica.ttc",
             "arial.ttf",
         ],
         "arial": [
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/System/Library/Fonts/Helvetica.ttc",
             "arial.ttf",
         ],
         "helvetica": [
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/System/Library/Fonts/Helvetica.ttc",
         ],
         # Monospace fonts
         "monospace": [
+            "/usr/share/fonts/truetype/noto/NotoMono-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
             "/System/Library/Fonts/Courier.ttc",
             "cour.ttf",
         ],
         "courier": [
+            "/usr/share/fonts/truetype/noto/NotoMono-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
             "/System/Library/Fonts/Courier.ttc",
         ],
@@ -2792,8 +2849,10 @@ class SVGRenderer:
             except (OSError, IOError):
                 continue
 
-        # Final fallback to any available DejaVu font
+        # Final fallback to any available font
         fallbacks = [
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
         ]

@@ -40,16 +40,17 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 - **<95%**: 0.0% (0 files)
 
 ### Lucide Icons (200 files)
-- **Average Accuracy**: 98.6%
-- **99%+ Accuracy**: 39.5% (79 files)
-- **95-99%**: 60.5% (121 files)
+- **Average Accuracy**: 98.7%
+- **99%+ Accuracy**: 44.0% (88 files)
+- **95-99%**: 56.0% (112 files)
 - **<95%**: 0.0% (0 files)
 
 ### W3C SVG Samples (30 files)
-- **Average Accuracy**: 99.6% (vs resvg)
-- **99%+ Accuracy**: 90.0% (27 files)
-- **95-99%**: 10.0% (3 files)
-- **<95%**: 0.0% (0 files)
+- **Average Accuracy**: 99.3% (vs resvg)
+- **99%+ Accuracy**: 80.0% (24 files)
+- **95-99%**: 16.7% (5 files)
+- **90-95%**: 3.3% (1 file)
+- **Note**: Lower scores are primarily due to text rendering differences (different fonts)
 
 ### Comparison Images
 Comparison grids (VectorStag | resvg | diff) saved to:
@@ -86,6 +87,31 @@ Comparison grids (VectorStag | resvg | diff) saved to:
 1. **Recursion protection** - Added MAX_PARSE_DEPTH and MAX_RENDER_DEPTH limits to prevent stack overflow
 2. **Circular `<use>` detection** - Track `_use_stack` to prevent infinite loops on circular references
 3. **Arc-to-bezier control point fix** - Fixed Rust `arc_to_bezier` using `half_d.sin()` instead of `d_theta.sin()` for control point calculation. This was causing ~21 pixel errors for large arcs (FontAwesome 97.3% → 100%)
+4. **Stroke round/bevel linejoin** - Added `linejoin` parameter to Rust `render_stroke_closed_polygon` for proper round/bevel corner handling (Android logo fix)
+5. **Premultiplied alpha resize** - Fixed `resize_rgba` to use proper premultiplied alpha averaging instead of independent channel averaging, eliminating dark edges on anti-aliased shapes
+6. **Gaussian blur SVG spec** - Implemented triple box-blur approximation per SVG spec (`d = floor(s * 3 * sqrt(2*pi) / 4 + 0.5)`), proper stdDeviation scaling with combined element+base transform (W3C 90% → 93.3% at 99%+)
+7. **Font path fallbacks** - Added Noto fonts (NotoSerif, NotoSans, NotoMono) to font path fallbacks for systems without DejaVu fonts
+8. **Filter + clip-path combination** - Fixed `_render_element_with_clip` to properly handle elements with both clip-path AND filter (gaussian blur now works inside clip regions)
+9. **Round/bevel stroke segmented approach** - Use segmented stroke rendering for round/bevel joins to get correct per-edge perpendicular offsets (fixes Android belly cutout)
+10. **Letterbox background color** - Fixed viewBox clipping to set letterbox areas to background color instead of transparent (was causing 8% similarity drop)
+11. **Round join pie slices** - Changed round join corners from full circles to pie slice arcs, preventing over-fill at corners
+12. **Skip miter triangles for round joins** - Miter triangles were filling corners with square shapes even when linejoin="round", overriding the pieslice arcs (Android 99.72% → 99.85%)
+
+### Notes
+- **Text Rendering**: Now working well - use CairoSVG as reference for text comparisons
+- **Gaussian Blur**: Significantly improved, but slight color differences remain due to blending/blur algorithm differences - investigate resvg source code for exact implementation
+- **Debugging**: Always create comparison images with `svg_compare.py compare --save` to verify fixes visually.
+  - Thin pink outlines around ALL edges: Normal - PIL vs resvg rasterization difference (~0.25px)
+  - Large solid pink areas inside shapes: Real rendering bug - investigate
+  - Pink text: Expected - different font rendering between renderers
+
+### Completed: Android Logo (99.85% similarity)
+**Fixed**: Round corners now render correctly
+- Changed from full circles to pie slice arcs for round joins
+- Arc angles calculated from perpendicular directions of adjacent edges
+- Segmented stroke rendering for round/bevel joins
+- Skip miter triangles for round joins (was filling corners square instead of round)
+- Remaining ~0.15% difference is due to PIL vs resvg rasterization (~0.25px edge variance)
 
 ### Bug Fixes (2025-12-29)
 1. **Gradient alpha compositing** - Fixed `paste` → `alpha_composite` for proper transparency

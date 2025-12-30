@@ -535,13 +535,16 @@ fn render_stroke_closed_polygon<'py>(
     height: usize,
     min_x: i32,
     min_y: i32,
+    linejoin: &str,
 ) -> Bound<'py, PyArray2<u8>> {
     let n = points.len();
     if n < 3 {
         return Array2::<u8>::zeros((height, width)).into_pyarray(py);
     }
 
-    // Compute left and right edge points with miter joins
+    let use_bevel = linejoin == "round" || linejoin == "bevel";
+
+    // Compute left and right edge points
     let mut left_points: Vec<(f64, f64)> = Vec::with_capacity(n);
     let mut right_points: Vec<(f64, f64)> = Vec::with_capacity(n);
 
@@ -561,30 +564,38 @@ fn render_stroke_closed_polygon<'py>(
         let cross = d1.0 * d2.1 - d1.1 * d2.0;
 
         let (left_pt, right_pt) = if cross.abs() > 0.001 {
-            // Compute miter intersection
-            let left_p1 = (p_curr.0 + perp1.0 * half_width, p_curr.1 + perp1.1 * half_width);
-            let left_p2 = (p_curr.0 + perp2.0 * half_width, p_curr.1 + perp2.1 * half_width);
-            let right_p1 = (p_curr.0 - perp1.0 * half_width, p_curr.1 - perp1.1 * half_width);
-            let right_p2 = (p_curr.0 - perp2.0 * half_width, p_curr.1 - perp2.1 * half_width);
-
-            let mut left_pt = line_intersection(left_p1, d1, left_p2, d2).unwrap_or(left_p1);
-            let mut right_pt = line_intersection(right_p1, d1, right_p2, d2).unwrap_or(right_p1);
-
-            // Apply miterlimit
-            let max_miter = miterlimit * half_width;
-            let left_dist = ((left_pt.0 - p_curr.0).powi(2) + (left_pt.1 - p_curr.1).powi(2)).sqrt();
-            let right_dist = ((right_pt.0 - p_curr.0).powi(2) + (right_pt.1 - p_curr.1).powi(2)).sqrt();
-
-            if left_dist > max_miter {
+            if use_bevel {
+                // For round/bevel joins, use the average perpendicular (shorter corner)
                 let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
-                left_pt = (p_curr.0 + avg_perp.0 * half_width, p_curr.1 + avg_perp.1 * half_width);
-            }
-            if right_dist > max_miter {
-                let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
-                right_pt = (p_curr.0 - avg_perp.0 * half_width, p_curr.1 - avg_perp.1 * half_width);
-            }
+                let left_pt = (p_curr.0 + avg_perp.0 * half_width, p_curr.1 + avg_perp.1 * half_width);
+                let right_pt = (p_curr.0 - avg_perp.0 * half_width, p_curr.1 - avg_perp.1 * half_width);
+                (left_pt, right_pt)
+            } else {
+                // Compute miter intersection
+                let left_p1 = (p_curr.0 + perp1.0 * half_width, p_curr.1 + perp1.1 * half_width);
+                let left_p2 = (p_curr.0 + perp2.0 * half_width, p_curr.1 + perp2.1 * half_width);
+                let right_p1 = (p_curr.0 - perp1.0 * half_width, p_curr.1 - perp1.1 * half_width);
+                let right_p2 = (p_curr.0 - perp2.0 * half_width, p_curr.1 - perp2.1 * half_width);
 
-            (left_pt, right_pt)
+                let mut left_pt = line_intersection(left_p1, d1, left_p2, d2).unwrap_or(left_p1);
+                let mut right_pt = line_intersection(right_p1, d1, right_p2, d2).unwrap_or(right_p1);
+
+                // Apply miterlimit
+                let max_miter = miterlimit * half_width;
+                let left_dist = ((left_pt.0 - p_curr.0).powi(2) + (left_pt.1 - p_curr.1).powi(2)).sqrt();
+                let right_dist = ((right_pt.0 - p_curr.0).powi(2) + (right_pt.1 - p_curr.1).powi(2)).sqrt();
+
+                if left_dist > max_miter {
+                    let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
+                    left_pt = (p_curr.0 + avg_perp.0 * half_width, p_curr.1 + avg_perp.1 * half_width);
+                }
+                if right_dist > max_miter {
+                    let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
+                    right_pt = (p_curr.0 - avg_perp.0 * half_width, p_curr.1 - avg_perp.1 * half_width);
+                }
+
+                (left_pt, right_pt)
+            }
         } else {
             // Nearly collinear
             let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
@@ -1837,7 +1848,11 @@ fn resize_rgba<'py>(
 
     let mut dst = Array3::<u8>::zeros((new_height, new_width, 4));
 
-    // Simple box filter (area averaging)
+    // Box filter with proper alpha handling (premultiplied alpha averaging)
+    // To correctly blend partially transparent pixels, we:
+    // 1. Multiply RGB by alpha (premultiply)
+    // 2. Average the premultiplied values
+    // 3. Divide by the averaged alpha to get correct RGB
     let scale_x = src_w as f32 / new_width as f32;
     let scale_y = src_h as f32 / new_height as f32;
 
@@ -1849,24 +1864,41 @@ fn resize_rgba<'py>(
             let sx_start = (dx as f32 * scale_x) as usize;
             let sx_end = (((dx + 1) as f32 * scale_x) as usize).min(src_w);
 
-            let mut sum = [0u32; 4];
-            let mut count = 0u32;
+            // Sum premultiplied RGBA (using larger type to avoid overflow)
+            let mut sum_r = 0u64;
+            let mut sum_g = 0u64;
+            let mut sum_b = 0u64;
+            let mut sum_a = 0u64;
+            let mut count = 0u64;
 
             for sy in sy_start..sy_end {
                 for sx in sx_start..sx_end {
-                    sum[0] += src_arr[[sy, sx, 0]] as u32;
-                    sum[1] += src_arr[[sy, sx, 1]] as u32;
-                    sum[2] += src_arr[[sy, sx, 2]] as u32;
-                    sum[3] += src_arr[[sy, sx, 3]] as u32;
+                    let a = src_arr[[sy, sx, 3]] as u64;
+                    // Premultiply: store R*A, G*A, B*A
+                    sum_r += src_arr[[sy, sx, 0]] as u64 * a;
+                    sum_g += src_arr[[sy, sx, 1]] as u64 * a;
+                    sum_b += src_arr[[sy, sx, 2]] as u64 * a;
+                    sum_a += a;
                     count += 1;
                 }
             }
 
             if count > 0 {
-                dst[[dy, dx, 0]] = (sum[0] / count) as u8;
-                dst[[dy, dx, 1]] = (sum[1] / count) as u8;
-                dst[[dy, dx, 2]] = (sum[2] / count) as u8;
-                dst[[dy, dx, 3]] = (sum[3] / count) as u8;
+                // Average alpha
+                let avg_a = sum_a / count;
+                dst[[dy, dx, 3]] = avg_a as u8;
+
+                if avg_a > 0 {
+                    // Un-premultiply: divide by total alpha, then divide by count
+                    // RGB = (sum_r / sum_a) = weighted average of RGB by alpha
+                    dst[[dy, dx, 0]] = ((sum_r / sum_a).min(255)) as u8;
+                    dst[[dy, dx, 1]] = ((sum_g / sum_a).min(255)) as u8;
+                    dst[[dy, dx, 2]] = ((sum_b / sum_a).min(255)) as u8;
+                } else {
+                    dst[[dy, dx, 0]] = 0;
+                    dst[[dy, dx, 1]] = 0;
+                    dst[[dy, dx, 2]] = 0;
+                }
             }
         }
     }
