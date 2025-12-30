@@ -28,13 +28,17 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass
-from multiprocessing import Pool, cpu_count
+from multiprocessing import cpu_count
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
 import numpy as np
 from PIL import Image
+
+# Worker timeout in seconds (prevent infinite loops)
+WORKER_TIMEOUT = 30
 
 # Optional imports - fail gracefully
 try:
@@ -387,17 +391,20 @@ def prerender_worker(args):
     cairo_ok = False
     resvg_ok = False
 
-    if cairo_dir:
-        img = render_with_cairo(svg_path, size)
-        if img:
-            img.save(cairo_dir / f"{name}.png")
-            cairo_ok = True
+    try:
+        if cairo_dir:
+            img = render_with_cairo(svg_path, size)
+            if img:
+                img.save(cairo_dir / f"{name}.png")
+                cairo_ok = True
 
-    if resvg_dir:
-        img = render_with_resvg(svg_path, size)
-        if img:
-            img.save(resvg_dir / f"{name}.png")
-            resvg_ok = True
+        if resvg_dir:
+            img = render_with_resvg(svg_path, size)
+            if img:
+                img.save(resvg_dir / f"{name}.png")
+                resvg_ok = True
+    except Exception:
+        pass
 
     return name, cairo_ok, resvg_ok
 
@@ -437,12 +444,21 @@ def prerender_collection(collection: Collection, num_workers: int = None,
     start_time = time.time()
     cairo_ok = resvg_ok = 0
 
-    with Pool(num_workers) as pool:
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        future_to_task = {executor.submit(prerender_worker, task): task for task in tasks}
+
         completed = 0
-        for name, c_ok, r_ok in pool.imap_unordered(prerender_worker, tasks):
+        for future in as_completed(future_to_task):
             completed += 1
-            cairo_ok += c_ok
-            resvg_ok += r_ok
+
+            try:
+                name, c_ok, r_ok = future.result(timeout=WORKER_TIMEOUT)
+                cairo_ok += c_ok
+                resvg_ok += r_ok
+            except FuturesTimeoutError:
+                pass  # Timeout, skip this file
+            except Exception:
+                pass  # Error, skip this file
 
             if completed % 500 == 0 or completed == len(svg_files):
                 elapsed = time.time() - start_time
@@ -572,28 +588,41 @@ def compare_collection(collection: Collection, num_workers: int = None,
 
     start_time = time.time()
 
-    with Pool(num_workers) as pool:
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks
+        future_to_task = {executor.submit(compare_worker, task): task for task in tasks}
+
         completed = 0
-        for result in pool.imap_unordered(compare_worker, tasks):
+        for future in as_completed(future_to_task):
             completed += 1
+            task = future_to_task[future]
+            name = get_unique_name(task[0], task[1])
 
-            if "error" in result:
-                errors.append((result["name"], result["error"]))
-            else:
-                name = result["name"]
-                sim = result["sim"]
-                results.append((name, sim, result["sim_cairo"], result["sim_resvg"]))
+            try:
+                result = future.result(timeout=WORKER_TIMEOUT)
 
-                if sim >= 0.99:
-                    buckets["99-100%"].append(name)
-                elif sim >= 0.95:
-                    buckets["95-99%"].append(name)
-                elif sim >= 0.90:
-                    buckets["90-95%"].append(name)
-                elif sim >= 0.80:
-                    buckets["80-90%"].append(name)
+                if "error" in result:
+                    errors.append((result["name"], result["error"]))
                 else:
-                    buckets["<80%"].append(name)
+                    name = result["name"]
+                    sim = result["sim"]
+                    results.append((name, sim, result["sim_cairo"], result["sim_resvg"]))
+
+                    if sim >= 0.99:
+                        buckets["99-100%"].append(name)
+                    elif sim >= 0.95:
+                        buckets["95-99%"].append(name)
+                    elif sim >= 0.90:
+                        buckets["90-95%"].append(name)
+                    elif sim >= 0.80:
+                        buckets["80-90%"].append(name)
+                    else:
+                        buckets["<80%"].append(name)
+
+            except FuturesTimeoutError:
+                errors.append((name, "timeout"))
+            except Exception as e:
+                errors.append((name, str(e)[:50]))
 
             if completed % 500 == 0 or completed == len(svg_files):
                 elapsed = time.time() - start_time

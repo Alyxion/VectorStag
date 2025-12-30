@@ -62,7 +62,14 @@ When in doubt, use resvg as the reference renderer.
 - MX-SON.svg: triangle in center top should be white, not black
 - NP.svg: blue/white triangle on center left where it doesn't belong
 
-## Comparison Scripts
-- `compare_render.py` - Compare vs CairoSVG (98.9% average)
-- `compare_render_corrected.py` - Excludes CairoSVG bugs (99.4% true accuracy)
-- `compare_render_resvg.py` - Compare vs resvg (different sizing/fonts)
+## Tools (Consolidated)
+- `svg_compare.py` - Main comparison tool (prerender, compare, list)
+- `benchmark.py` - Performance benchmarking and profiling
+- `render.py` - Simple single-file rendering
+
+## Development Guidelines
+- Use 8 workers for batch operations to avoid memory pressure: `-j 8`
+- Use `ProcessPoolExecutor` with `as_completed()` for timeout support
+- Worker timeout is 30 seconds (WORKER_TIMEOUT in svg_compare.py)
+- Parser/renderer have MAX_PARSE_DEPTH=100 and MAX_RENDER_DEPTH=100 limits
+- Circular `<use>` references are detected and prevented via `_use_stack`

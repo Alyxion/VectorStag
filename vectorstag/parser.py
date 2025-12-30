@@ -403,6 +403,9 @@ class SVGParser:
         "palevioletred": (219, 112, 147),
     }
 
+    # Maximum recursion depth for parsing (prevents infinite loops)
+    MAX_PARSE_DEPTH = 100
+
     def __init__(self):
         self.gradients: dict[str, Union[LinearGradient, RadialGradient]] = {}
         self.clip_paths: dict[str, ClipPath] = {}
@@ -414,6 +417,8 @@ class SVGParser:
         self.viewbox_height = 0
         # CSS classes from <style> blocks
         self.css_classes: dict[str, dict[str, str]] = {}
+        # Track <use> references being parsed to detect circular references
+        self._use_stack: set[str] = set()
 
     def parse(self, svg_content: str) -> SVGDocument:
         """Parse SVG content string into SVGDocument."""
@@ -594,7 +599,7 @@ class SVGParser:
                     for child in elem:
                         child_tag = self._strip_ns(child.tag)
                         parsed = self._parse_element(
-                            child, Transform.identity(), Style()
+                            child, Transform.identity(), Style(), depth=1
                         )
                         if parsed:
                             clip_elements.append(parsed)
@@ -789,7 +794,8 @@ class SVGParser:
 
     def _parse_children(self, parent: ET.Element, parent_transform: Transform,
                         parent_style: Style, parent_text_anchor: str = "start",
-                        parent_font_family: str = "Arial", parent_font_size: float = 16) -> list[SVGElement]:
+                        parent_font_family: str = "Arial", parent_font_size: float = 16,
+                        depth: int = 0) -> list[SVGElement]:
         """Parse child elements."""
         elements = []
 
@@ -803,7 +809,7 @@ class SVGParser:
                 continue
 
             elem = self._parse_element(child, parent_transform, parent_style, parent_text_anchor,
-                                       parent_font_family, parent_font_size)
+                                       parent_font_family, parent_font_size, depth=depth)
             if elem:
                 elements.append(elem)
 
@@ -811,8 +817,13 @@ class SVGParser:
 
     def _parse_element(self, elem: ET.Element, parent_transform: Transform,
                        parent_style: Style, parent_text_anchor: str = "start",
-                       parent_font_family: str = "Arial", parent_font_size: float = 16) -> Optional[SVGElement]:
+                       parent_font_family: str = "Arial", parent_font_size: float = 16,
+                       depth: int = 0) -> Optional[SVGElement]:
         """Parse a single SVG element."""
+        # Prevent infinite recursion
+        if depth > self.MAX_PARSE_DEPTH:
+            return None
+
         tag = self._strip_ns(elem.tag)
 
         # Parse style (inheriting from parent)
@@ -876,15 +887,15 @@ class SVGParser:
         elif tag == "path":
             result = self._parse_path(elem, style, transform)
         elif tag == "g":
-            result = self._parse_group(elem, style, transform, parent_style, text_anchor, font_family, font_size)
+            result = self._parse_group(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
         elif tag == "switch":
-            result = self._parse_switch(elem, style, transform, parent_style, text_anchor, font_family, font_size)
+            result = self._parse_switch(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
         elif tag == "text":
             result = self._parse_text(elem, style, transform, text_anchor, font_family, font_size)
         elif tag == "use":
-            result = self._parse_use(elem, style, transform, parent_style)
+            result = self._parse_use(elem, style, transform, parent_style, depth + 1)
         elif tag == "svg":
-            result = self._parse_nested_svg(elem, style, transform, parent_style, text_anchor, font_family, font_size)
+            result = self._parse_nested_svg(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
 
         # Set clip path on the parsed element
         if result and clip_path_id:
@@ -1236,10 +1247,15 @@ class SVGParser:
 
     def _parse_path(self, elem: ET.Element, style: Style, transform: Transform) -> PathElement:
         """Parse path element."""
-        from .path_parser import parse_path
+        # Use Rust path parser if available for ~10x speedup
+        try:
+            import vectorstag_rust
+            parse_path = vectorstag_rust.parse_path
+        except ImportError:
+            from .path_parser import parse_path
 
         d = elem.get("d", "")
-        commands = parse_path(d)
+        commands = list(parse_path(d))
 
         return PathElement(
             tag="path",
@@ -1250,19 +1266,21 @@ class SVGParser:
 
     def _parse_group(self, elem: ET.Element, style: Style, transform: Transform,
                      parent_style: Style, text_anchor: str = "start",
-                     font_family: str = "Arial", font_size: float = 16) -> GroupElement:
+                     font_family: str = "Arial", font_size: float = 16,
+                     depth: int = 0) -> GroupElement:
         """Parse g (group) element."""
         group = GroupElement(
             tag="g",
             style=style,
             transform=transform,
-            children=self._parse_children(elem, transform, style, text_anchor, font_family, font_size)
+            children=self._parse_children(elem, transform, style, text_anchor, font_family, font_size, depth=depth)
         )
         return group
 
     def _parse_nested_svg(self, elem: ET.Element, style: Style, transform: Transform,
                           parent_style: Style, text_anchor: str = "start",
-                          font_family: str = "Arial", font_size: float = 16) -> GroupElement:
+                          font_family: str = "Arial", font_size: float = 16,
+                          depth: int = 0) -> GroupElement:
         """Parse nested svg element - treated as a group with its own coordinate system."""
         # Get position offset
         x = self._parse_length(elem.get("x", "0"))
@@ -1303,13 +1321,14 @@ class SVGParser:
             tag="svg",
             style=style,
             transform=nested_transform,
-            children=self._parse_children(elem, nested_transform, style, text_anchor, font_family, font_size)
+            children=self._parse_children(elem, nested_transform, style, text_anchor, font_family, font_size, depth=depth)
         )
         return group
 
     def _parse_switch(self, elem: ET.Element, style: Style, transform: Transform,
                       parent_style: Style, text_anchor: str = "start",
-                      font_family: str = "Arial", font_size: float = 16) -> Optional[SVGElement]:
+                      font_family: str = "Arial", font_size: float = 16,
+                      depth: int = 0) -> Optional[SVGElement]:
         """Parse switch element - returns first supported child."""
         # The switch element evaluates children in order and renders the first
         # one whose requiredExtensions/requiredFeatures are supported.
@@ -1326,7 +1345,7 @@ class SVGParser:
                 # We don't support any extensions
                 continue
             # This child is supported - parse and return it
-            result = self._parse_element(child, transform, style, text_anchor, font_family, font_size)
+            result = self._parse_element(child, transform, style, text_anchor, font_family, font_size, depth=depth)
             if result:
                 return result
         return None
@@ -1395,7 +1414,7 @@ class SVGParser:
         )
 
     def _parse_use(self, elem: ET.Element, style: Style, transform: Transform,
-                   parent_style: Style) -> Optional[SVGElement]:
+                   parent_style: Style, depth: int = 0) -> Optional[SVGElement]:
         """Parse use element (reference to another element)."""
         # Get the referenced element ID
         href = elem.get(f"{self.XLINK_NS}href") or elem.get("href")
@@ -1404,6 +1423,10 @@ class SVGParser:
 
         if href.startswith("#"):
             href = href[1:]
+
+        # Detect circular references - if we're already parsing this element, skip
+        if href in self._use_stack:
+            return None
 
         # Find the referenced element in defs
         ref_elem = self.defs.get(href)
@@ -1420,8 +1443,13 @@ class SVGParser:
         else:
             use_transform = transform
 
-        # Parse the referenced element with the combined transform
-        return self._parse_element(ref_elem, use_transform, style)
+        # Track this reference to detect circular dependencies
+        self._use_stack.add(href)
+        try:
+            # Parse the referenced element with the combined transform
+            return self._parse_element(ref_elem, use_transform, style, depth=depth)
+        finally:
+            self._use_stack.discard(href)
 
     def _compute_elements_bbox(self, elements: list) -> Optional[tuple[float, float, float, float]]:
         """Compute bounding box of all elements."""

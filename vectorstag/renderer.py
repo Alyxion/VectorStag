@@ -5,6 +5,13 @@ from typing import Optional, Union, List, Tuple
 from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageFilter
 import numpy as np
 
+# Try to import Rust extension for performance
+try:
+    import vectorstag_rust
+    HAS_RUST = True
+except ImportError:
+    HAS_RUST = False
+
 from .parser import (
     SVGParser, SVGDocument, SVGElement, Transform, Style,
     RectElement, CircleElement, EllipseElement, LineElement,
@@ -16,6 +23,9 @@ from .parser import (
 
 class SVGRenderer:
     """Render SVG documents to PIL Images."""
+
+    # Maximum recursion depth for rendering (prevents infinite loops)
+    MAX_RENDER_DEPTH = 100
 
     def __init__(self, scale: float = 1.0, background: Optional[tuple[int, int, int, int]] = None,
                  antialias: int = 2, preserve_aspect_ratio: bool = False):
@@ -165,25 +175,29 @@ class SVGRenderer:
 
         return image
 
-    def _render_element(self, ctx: "RenderContext", element: SVGElement):
+    def _render_element(self, ctx: "RenderContext", element: SVGElement, depth: int = 0):
         """Render a single element."""
+        # Prevent infinite recursion
+        if depth > self.MAX_RENDER_DEPTH:
+            return
+
         # Skip elements with display: none
         if element.style.display == "none":
             return
 
         # Check if element has a clip path
         if element.clip_path_id and element.clip_path_id in ctx.clip_paths:
-            self._render_element_with_clip(ctx, element)
+            self._render_element_with_clip(ctx, element, depth)
             return
 
         # Apply Gaussian blur filter if present
         if element.style.filter_id and element.style.filter_id in ctx.filters:
-            self._render_element_with_filter(ctx, element)
+            self._render_element_with_filter(ctx, element, depth)
             return
 
         if isinstance(element, GroupElement):
             for child in element.children:
-                self._render_element(ctx, child)
+                self._render_element(ctx, child, depth + 1)
         elif isinstance(element, RectElement):
             self._render_rect(ctx, element)
         elif isinstance(element, CircleElement):
@@ -201,7 +215,7 @@ class SVGRenderer:
         elif isinstance(element, TextElement):
             self._render_text(ctx, element)
 
-    def _render_element_with_clip(self, ctx: "RenderContext", element: SVGElement):
+    def _render_element_with_clip(self, ctx: "RenderContext", element: SVGElement, depth: int = 0):
         """Render an element with a clip path applied."""
         clip_path = ctx.clip_paths[element.clip_path_id]
 
@@ -215,7 +229,7 @@ class SVGRenderer:
 
         if isinstance(element, GroupElement):
             for child in element.children:
-                self._render_element(temp_ctx, child)
+                self._render_element(temp_ctx, child, depth + 1)
         elif isinstance(element, RectElement):
             self._render_rect(temp_ctx, element)
         elif isinstance(element, CircleElement):
@@ -240,7 +254,7 @@ class SVGRenderer:
         temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], mask))
         ctx.image.alpha_composite(temp_image)
 
-    def _render_element_with_filter(self, ctx: "RenderContext", element: SVGElement):
+    def _render_element_with_filter(self, ctx: "RenderContext", element: SVGElement, depth: int = 0):
         """Render an element with a filter (e.g., Gaussian blur) applied."""
         filter_def = ctx.filters[element.style.filter_id]
 
@@ -291,7 +305,7 @@ class SVGRenderer:
 
         if isinstance(element, GroupElement):
             for child in element.children:
-                self._render_element(temp_ctx, child)
+                self._render_element(temp_ctx, child, depth + 1)
         elif isinstance(element, RectElement):
             self._render_rect(temp_ctx, element)
         elif isinstance(element, CircleElement):
@@ -859,7 +873,7 @@ class SVGRenderer:
                 # Cubic bezier - sample it
                 if not current_polygon:
                     current_polygon = [(subpath_start_x, subpath_start_y)]
-                x1, y1, x2, y2, x, y = cmd[1:]
+                x1, y1, x2, y2, x, y = cmd[1], cmd[2], cmd[3], cmd[4], cmd[5], cmd[6]
                 bezier_points = self._sample_cubic_bezier(
                     current_x, current_y, x1, y1, x2, y2, x, y
                 )
@@ -870,7 +884,7 @@ class SVGRenderer:
                 # Quadratic bezier - sample it
                 if not current_polygon:
                     current_polygon = [(subpath_start_x, subpath_start_y)]
-                x1, y1, x, y = cmd[1:]
+                x1, y1, x, y = cmd[1], cmd[2], cmd[3], cmd[4]
                 bezier_points = self._sample_quadratic_bezier(
                     current_x, current_y, x1, y1, x, y
                 )
@@ -897,6 +911,10 @@ class SVGRenderer:
                              x3: float, y3: float,
                              n_samples: int = 16) -> list[tuple[float, float]]:
         """Sample points along a cubic bezier curve."""
+        # Use Rust implementation if available
+        if HAS_RUST:
+            return vectorstag_rust.sample_cubic_bezier(x0, y0, x1, y1, x2, y2, x3, y3, n_samples)
+        # Fallback to Python implementation
         points = []
         for i in range(1, n_samples + 1):
             t = i / n_samples
@@ -917,6 +935,10 @@ class SVGRenderer:
                                  x2: float, y2: float,
                                  n_samples: int = 12) -> list[tuple[float, float]]:
         """Sample points along a quadratic bezier curve."""
+        # Use Rust implementation if available
+        if HAS_RUST:
+            return vectorstag_rust.sample_quadratic_bezier(x0, y0, x1, y1, x2, y2, n_samples)
+        # Fallback to Python implementation
         points = []
         for i in range(1, n_samples + 1):
             t = i / n_samples
@@ -1745,6 +1767,10 @@ class SVGRenderer:
 
     def _is_self_intersecting(self, points: list[tuple[float, float]]) -> bool:
         """Check if a polygon has self-intersecting edges (optimized)."""
+        # Use Rust implementation if available (140x faster)
+        if HAS_RUST:
+            return vectorstag_rust.is_self_intersecting(points)
+
         n = len(points)
         if n < 4:
             return False
@@ -1820,69 +1846,75 @@ class SVGRenderer:
         crop_width = max_x - min_x
         crop_height = max_y - min_y
 
-        # Create mask using nonzero winding rule
-        mask_arr = np.zeros((crop_height, crop_width), dtype=np.uint8)
+        # Use Rust implementation if available (much faster)
+        if HAS_RUST:
+            mask_arr = vectorstag_rust.fill_polygon_nonzero(
+                points, crop_width, crop_height, min_x, min_y
+            )
+        else:
+            # Create mask using nonzero winding rule
+            mask_arr = np.zeros((crop_height, crop_width), dtype=np.uint8)
 
-        # Close the polygon
-        pts = np.vstack([pts_arr, pts_arr[0:1]]) if not np.allclose(pts_arr[0], pts_arr[-1]) else pts_arr
+            # Close the polygon
+            pts = np.vstack([pts_arr, pts_arr[0:1]]) if not np.allclose(pts_arr[0], pts_arr[-1]) else pts_arr
 
-        # Build edge arrays for vectorized processing
-        p1 = pts[:-1]
-        p2 = pts[1:]
+            # Build edge arrays for vectorized processing
+            p1 = pts[:-1]
+            p2 = pts[1:]
 
-        # Filter non-horizontal edges
-        non_horiz = p1[:, 1] != p2[:, 1]
-        if not np.any(non_horiz):
-            return
+            # Filter non-horizontal edges
+            non_horiz = p1[:, 1] != p2[:, 1]
+            if not np.any(non_horiz):
+                return
 
-        p1_f = p1[non_horiz]
-        p2_f = p2[non_horiz]
+            p1_f = p1[non_horiz]
+            p2_f = p2[non_horiz]
 
-        # Determine direction and sort so p1.y < p2.y
-        swap = p1_f[:, 1] > p2_f[:, 1]
-        p1_f[swap], p2_f[swap] = p2_f[swap].copy(), p1_f[swap].copy()
-        directions = np.where(swap, -1, 1)
+            # Determine direction and sort so p1.y < p2.y
+            swap = p1_f[:, 1] > p2_f[:, 1]
+            p1_f[swap], p2_f[swap] = p2_f[swap].copy(), p1_f[swap].copy()
+            directions = np.where(swap, -1, 1)
 
-        # Extract edge data
-        x1 = p1_f[:, 0]
-        y1 = p1_f[:, 1]
-        x2 = p2_f[:, 0]
-        y2 = p2_f[:, 1]
-        dy = y2 - y1
-        dx = x2 - x1
+            # Extract edge data
+            x1 = p1_f[:, 0]
+            y1 = p1_f[:, 1]
+            x2 = p2_f[:, 0]
+            y2 = p2_f[:, 1]
+            dy = y2 - y1
+            dx = x2 - x1
 
-        # Vectorized scanline fill
-        for y in range(crop_height):
-            screen_y = y + min_y + 0.5
+            # Vectorized scanline fill
+            for y in range(crop_height):
+                screen_y = y + min_y + 0.5
 
-            # Find edges that cross this scanline
-            active = (y1 <= screen_y) & (screen_y < y2)
-            if not np.any(active):
-                continue
+                # Find edges that cross this scanline
+                active = (y1 <= screen_y) & (screen_y < y2)
+                if not np.any(active):
+                    continue
 
-            # Compute x intersections for active edges
-            t = (screen_y - y1[active]) / dy[active]
-            x_intersects = x1[active] + t * dx[active]
-            dirs = directions[active]
+                # Compute x intersections for active edges
+                t = (screen_y - y1[active]) / dy[active]
+                x_intersects = x1[active] + t * dx[active]
+                dirs = directions[active]
 
-            # Sort by x
-            sort_idx = np.argsort(x_intersects)
-            x_sorted = x_intersects[sort_idx]
-            dirs_sorted = dirs[sort_idx]
+                # Sort by x
+                sort_idx = np.argsort(x_intersects)
+                x_sorted = x_intersects[sort_idx]
+                dirs_sorted = dirs[sort_idx]
 
-            # Fill using winding count (nonzero rule)
-            winding = 0
-            prev_x = None
-            for i in range(len(x_sorted)):
-                x_int = x_sorted[i]
-                direction = dirs_sorted[i]
-                if winding != 0 and prev_x is not None:
-                    x_start = max(0, int(prev_x - min_x))
-                    x_end = min(crop_width, int(x_int - min_x))
-                    if x_start < x_end:
-                        mask_arr[y, x_start:x_end] = 255
-                winding += direction
-                prev_x = x_int
+                # Fill using winding count (nonzero rule)
+                winding = 0
+                prev_x = None
+                for i in range(len(x_sorted)):
+                    x_int = x_sorted[i]
+                    direction = dirs_sorted[i]
+                    if winding != 0 and prev_x is not None:
+                        x_start = max(0, int(prev_x - min_x))
+                        x_end = min(crop_width, int(x_int - min_x))
+                        if x_start < x_end:
+                            mask_arr[y, x_start:x_end] = 255
+                    winding += direction
+                    prev_x = x_int
 
         # Apply fill using mask
         mask_img = Image.fromarray(mask_arr, "L")

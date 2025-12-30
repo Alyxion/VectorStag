@@ -201,11 +201,12 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 
 ---
 
-## Scripts
+## Tools
 
+Three CLI tools for testing and rendering:
+
+### 1. svg_compare.py - Comparison & Testing
 ```bash
-# Unified comparison tool - svg_compare.py
-
 # List available collections
 python svg_compare.py list
 
@@ -213,16 +214,48 @@ python svg_compare.py list
 python svg_compare.py prerender --emojis --flags --material -j 16
 python svg_compare.py prerender --all -j 16
 
-# Fast comparison (no PNG output)
+# Compare VectorStag against references
 python svg_compare.py compare --emojis --flags -j 16
 python svg_compare.py compare --all -j 16
 
-# Generate comparison grid PNGs (VectorStag | resvg | diff)
+# Save comparison grid PNGs (VectorStag | resvg | diff)
 python svg_compare.py compare --emojis --save -j 16
-
-# Benchmark VectorStag performance
-python benchmark_vectorstag.py --emojis --profile
 ```
+
+### 2. benchmark.py - Performance Testing
+```bash
+# Benchmark a collection
+python benchmark.py --emojis -j 16
+python benchmark.py --all --limit 500
+
+# Profile a single file
+python benchmark.py --file samples/svg/tiger.svg --profile
+
+# Check Rust extension status
+python benchmark.py --check-rust
+```
+
+### 3. render.py - Simple Rendering
+```bash
+# Render SVG to PNG
+python render.py input.svg output.png
+
+# Render at specific size
+python render.py input.svg output.png --width 800 --height 600
+
+# Render with options
+python render.py input.svg output.png --antialias 8 --background white
+```
+
+### Collection Flags
+All tools support the same collection flags:
+- `--emojis` - Noto Color Emojis (3427 files)
+- `--flags` - Noto Flags (358 files)
+- `--material` - Material Design Icons (336 files)
+- `--fontawesome` - FontAwesome Icons (2028 files)
+- `--lucide` - Lucide Icons (200 files)
+- `--w3c` - W3C SVG Samples (30 files)
+- `--all` - All collections
 
 ---
 
