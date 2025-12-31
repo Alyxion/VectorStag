@@ -99,7 +99,9 @@ python benchmark_resvg_tests.py --category masking/mask
 ```
 
 ## Development Guidelines
-- Use 8 workers for batch operations to avoid memory pressure: `-j 8`
+- **ALWAYS use 4x antialiasing**: The quality difference between 2x and 4x is massive. DO NOT CHANGE this default under any circumstances.
+- **ALWAYS use at least 8 workers, preferably 16**: `-j 16` (never run single-threaded benchmarks)
+- Use 4-8 workers if memory pressure occurs on complex SVGs: `-j 4` or `-j 8`
 - Use `ProcessPoolExecutor` with `as_completed()` for timeout support
 - Worker timeout is 30 seconds (WORKER_TIMEOUT in svg_compare.py)
 - Parser/renderer have MAX_PARSE_DEPTH=100 and MAX_RENDER_DEPTH=100 limits

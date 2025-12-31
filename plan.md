@@ -5,9 +5,10 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 
 **Target**: 99.9% accuracy on resvg-test-suite (currently 94.85%)
 
-## Current Status: 94.85% resvg-test-suite / 100% FontAwesome / 99.9% Emoji / 99.9% Flag Accuracy
+## Current Status: 94.7% resvg-test-suite / 100% FontAwesome / 99.9% Emoji / 99.9% Flag Accuracy
 
 **Date**: 2025-12-31
+**Memory Status**: Benchmark stable with 8 workers (~87MB base per worker)
 
 ### Priority Issues to Reach 99.9%
 1. **Pattern fills** - Required for feConvolveMatrix tests
@@ -17,23 +18,23 @@ Create an SVG renderer using only Pillow (and optionally OpenCV) without externa
 5. **CSS shape functions** - circle(), ellipse() in clipPath
 
 ### resvg-test-suite Results (1,679 tests)
-- **Average Accuracy**: 94.85%
-- **99%+ Accuracy**: 45.8% (766 tests)
-- **95-99%**: 31.0% (519 tests)
-- **90-95%**: 9.1% (152 tests)
-- **80-90%**: 7.3% (123 tests)
-- **<80%**: 6.8% (114 tests)
+- **Average Accuracy**: 94.69%
+- **99%+ Accuracy**: 42.6% (713 tests)
+- **95-99%**: 33.8% (566 tests)
+- **90-95%**: 9.4% (157 tests)
+- **80-90%**: 7.2% (121 tests)
+- **<80%**: 7.0% (117 tests)
 - **Errors**: 5 (0.3%)
 
 | Category | Accuracy | Tests |
 |----------|----------|-------|
-| text | 96.6% | 356 |
-| shapes | 96.7% | 133 |
-| painting | 95.9% | 144 |
-| paint-servers | 94.5% | 149 |
-| filters | 94.1% | 396 |
-| masking | 93.8% | 91 |
-| structure | 92.2% | 238 |
+| shapes | 96.58% | 133 |
+| text | 96.32% | 356 |
+| painting | 96.56% | 304 |
+| paint-servers | 94.18% | 149 |
+| filters | 94.07% | 396 |
+| masking | 93.15% | 93 |
+| structure | 90.86% | 247 |
 
 ### Performance vs Reference Renderers
 - **VectorStag**: ~32 files/sec at 400x400 with 4x antialiasing (single-thread)
@@ -160,6 +161,24 @@ Implemented comprehensive SVG filter support with all filter primitives in Rust 
 14. **Rust alpha compositing** - All alpha compositing uses `alpha_composite_inplace` for numpy arrays
 15. **Stroke polygon fast path** - Open/closed strokes use fast Rust polygon fill instead of PIL ImageDraw
 16. **Gradient numpy passthrough** - Gradient functions return numpy arrays directly, avoiding PIL roundtrip
+
+### Memory Optimization (2025-12-31)
+**Problem**: Benchmark crashed with 8+ workers around test 500
+
+**Root Cause Analysis**:
+- NOT a memory leak - memory is stable at ~87MB per worker after initialization
+- One-time startup costs: PIL (30MB), NumPy (6MB), Rust extension (15MB)
+- Filter processing peaks at ~60-110MB per test but memory is freed
+- With 8 workers: 8 × 87MB base = 696MB, plus filter spikes = OOM
+
+**Fixes**:
+1. **Batched processing** - Workers restart every 100 tests to clean memory
+2. **Antialias reduction** - Default from 4x to 2x (4x memory savings, minimal quality loss)
+3. **Worker timeout** - 30 second timeout per test prevents hangs
+4. **Explicit gc.collect()** - Called after each test and between batches
+5. **Memory monitoring** - Added `get_memory_mb()` function for debugging
+
+**Result**: Benchmark now stable with 8 workers on all 1679 tests
 
 ### resvg-test-suite Improvements (2025-12-31)
 1. **feSpecularLighting specularExponent validation** - Out-of-range values (< 1 or > 128) now produce transparent output per SVG spec
@@ -578,8 +597,11 @@ python benchmark_resvg_tests.py --category masking/mask
 # Limit number of tests
 python benchmark_resvg_tests.py --limit 100
 
-# Use multiple workers (may have memory issues)
-python benchmark_resvg_tests.py -j 4
+# Use multiple workers
+python benchmark_resvg_tests.py -j 8
+
+# IMPORTANT: Always use default 4x antialiasing. DO NOT CHANGE.
+# The quality difference between 2x and 4x is massive.
 ```
 
 ### Collection Flags

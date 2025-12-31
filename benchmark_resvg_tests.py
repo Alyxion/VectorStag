@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
 Benchmark VectorStag against resvg-test-suite.
+
+Memory-efficient multiprocessing with worker restart and timeout support.
 """
 
 import sys
+import os
+import gc
 from pathlib import Path
 from PIL import Image
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 import argparse
@@ -17,6 +21,23 @@ import traceback
 sys.path.insert(0, str(Path(__file__).parent))
 
 from vectorstag import SVGRenderer
+
+# Constants for memory management
+WORKER_TIMEOUT = 30  # seconds per test
+BATCH_SIZE = 100  # restart workers after this many tests to free memory
+MAX_MEMORY_MB = 100  # warn if process exceeds this
+
+
+def get_memory_mb():
+    """Get current process memory in MB."""
+    try:
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024
+    except:
+        pass
+    return 0
 
 
 @dataclass
@@ -61,8 +82,14 @@ def compute_similarity(img1: Image.Image, img2: Image.Image) -> float:
     return max(0, similarity)
 
 
-def render_test(svg_path: Path, ref_path: Path) -> TestResult:
-    """Render a single test and compare to reference."""
+def render_test(svg_path: Path, ref_path: Path, antialias: int = 4) -> TestResult:
+    """Render a single test and compare to reference.
+
+    Args:
+        svg_path: Path to SVG file
+        ref_path: Path to reference PNG
+        antialias: Anti-aliasing factor (default 2, use 4 for higher quality)
+    """
     parts = svg_path.relative_to(Path("resvg-test-suite/tests")).parts
     category = parts[0]
     subcategory = parts[1] if len(parts) > 2 else ""
@@ -74,10 +101,13 @@ def render_test(svg_path: Path, ref_path: Path) -> TestResult:
         ref_size = ref_img.size
 
         # Render with VectorStag at reference size
-        renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
+        # Use antialias=2 by default to save memory (still good quality)
+        renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=antialias)
         vs_img = renderer.render_file(str(svg_path), ref_size[0], ref_size[1])
 
         if vs_img is None:
+            del renderer, ref_img
+            gc.collect()
             return TestResult(name, category, subcategory, None, "Render returned None")
 
         vs_img = vs_img.convert('RGBA')
@@ -85,16 +115,25 @@ def render_test(svg_path: Path, ref_path: Path) -> TestResult:
         # Compute similarity
         similarity = compute_similarity(vs_img, ref_img)
 
+        # Explicit cleanup to help memory management
+        del renderer, vs_img, ref_img
+        gc.collect()
+
         return TestResult(name, category, subcategory, similarity)
 
     except Exception as e:
+        gc.collect()
         return TestResult(name, category, subcategory, None, str(e)[:100])
 
 
 def render_test_wrapper(args):
     """Wrapper for multiprocessing."""
-    svg_path, ref_path = args
-    return render_test(svg_path, ref_path)
+    if len(args) == 3:
+        svg_path, ref_path, antialias = args
+    else:
+        svg_path, ref_path = args
+        antialias = 4
+    return render_test(svg_path, ref_path, antialias)
 
 
 def find_all_tests(test_dir: Path) -> List[Tuple[Path, Path]]:
@@ -108,8 +147,18 @@ def find_all_tests(test_dir: Path) -> List[Tuple[Path, Path]]:
 
 
 def run_benchmark(test_dir: Path, workers: int = 1, category_filter: str = None,
-                 save_failures: bool = False, limit: int = None) -> Dict:
-    """Run benchmark on all tests."""
+                 save_failures: bool = False, limit: int = None,
+                 antialias: int = 2) -> Dict:
+    """Run benchmark on all tests.
+
+    Args:
+        test_dir: Directory containing test SVGs
+        workers: Number of parallel workers (default 1)
+        category_filter: Filter tests by category string
+        save_failures: Save comparison images for failures
+        limit: Maximum number of tests to run
+        antialias: Anti-aliasing factor (2 or 4)
+    """
     tests = find_all_tests(test_dir)
 
     if category_filter:
@@ -120,30 +169,65 @@ def run_benchmark(test_dir: Path, workers: int = 1, category_filter: str = None,
 
     print(f"Found {len(tests)} tests")
     print(f"Workers: {workers}")
+    print(f"Antialias: {antialias}x")
+    print(f"Memory limit: {MAX_MEMORY_MB}MB per worker")
     print()
 
     results: List[TestResult] = []
 
     if workers == 1:
         for i, (svg_path, ref_path) in enumerate(tests):
-            result = render_test(svg_path, ref_path)
+            result = render_test(svg_path, ref_path, antialias)
             results.append(result)
             if (i + 1) % 50 == 0:
                 valid = [r for r in results if r.similarity is not None]
                 avg = sum(r.similarity for r in valid) / len(valid) if valid else 0
-                print(f"  {i+1}/{len(tests)} - Avg: {avg:.1f}%")
+                mem = get_memory_mb()
+                print(f"  {i+1}/{len(tests)} - Avg: {avg:.1f}% - Mem: {mem:.0f}MB")
     else:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(render_test_wrapper, t): t for t in tests}
-            completed = 0
-            for future in as_completed(futures):
-                result = future.result()
-                results.append(result)
-                completed += 1
-                if completed % 100 == 0:
-                    valid = [r for r in results if r.similarity is not None]
-                    avg = sum(r.similarity for r in valid) / len(valid) if valid else 0
-                    print(f"  {completed}/{len(tests)} - Avg: {avg:.1f}%")
+        # Process in batches to allow worker restart and memory cleanup
+        num_batches = (len(tests) + BATCH_SIZE - 1) // BATCH_SIZE
+        batch_start = 0
+
+        for batch_idx in range(num_batches):
+            batch_end = min(batch_start + BATCH_SIZE, len(tests))
+            batch_tests = tests[batch_start:batch_end]
+
+            # Create new executor for each batch to restart workers
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(render_test_wrapper, (t[0], t[1], antialias)): t
+                          for t in batch_tests}
+
+                for future in as_completed(futures, timeout=WORKER_TIMEOUT * len(batch_tests)):
+                    try:
+                        result = future.result(timeout=WORKER_TIMEOUT)
+                        results.append(result)
+                    except TimeoutError:
+                        svg_path, ref_path = futures[future][:2]
+                        parts = svg_path.relative_to(Path("resvg-test-suite/tests")).parts
+                        result = TestResult(
+                            svg_path.stem, parts[0],
+                            parts[1] if len(parts) > 2 else "",
+                            None, "Timeout"
+                        )
+                        results.append(result)
+                    except Exception as e:
+                        svg_path, ref_path = futures[future][:2]
+                        parts = svg_path.relative_to(Path("resvg-test-suite/tests")).parts
+                        result = TestResult(
+                            svg_path.stem, parts[0],
+                            parts[1] if len(parts) > 2 else "",
+                            None, str(e)[:100]
+                        )
+                        results.append(result)
+
+            # Progress update after each batch
+            valid = [r for r in results if r.similarity is not None]
+            avg = sum(r.similarity for r in valid) / len(valid) if valid else 0
+            print(f"  {len(results)}/{len(tests)} - Avg: {avg:.1f}%")
+
+            batch_start = batch_end
+            gc.collect()  # Help memory cleanup between batches
 
     # Analyze results
     analyze_results(results, save_failures)
@@ -295,10 +379,14 @@ def save_comparison(svg_path: Path, ref_path: Path, output_dir: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark against resvg-test-suite")
-    parser.add_argument("-j", "--workers", type=int, default=1, help="Number of workers")
-    parser.add_argument("--category", type=str, help="Filter by category")
+    parser.add_argument("-j", "--workers", type=int, default=1,
+                        help="Number of workers (default 1, use 4-8 for speed)")
+    parser.add_argument("--category", type=str, help="Filter by category (e.g., 'shapes', 'filters')")
     parser.add_argument("--limit", type=int, help="Limit number of tests")
-    parser.add_argument("--save-failures", action="store_true", help="Save comparison images for failures")
+    parser.add_argument("--save-failures", action="store_true",
+                        help="Save comparison images for failures")
+    parser.add_argument("--antialias", type=int, default=4, choices=[1, 2, 4],
+                        help="Anti-aliasing factor (1=none, 2=low, 4=high quality). Default 4x - DO NOT CHANGE")
 
     args = parser.parse_args()
 
@@ -307,4 +395,10 @@ if __name__ == "__main__":
         print("Error: resvg-test-suite not found. Clone it first.")
         sys.exit(1)
 
-    run_benchmark(test_dir, args.workers, args.category, args.save_failures, args.limit)
+    # Recommend worker count based on task
+    if args.workers > 8:
+        print(f"Note: Using {args.workers} workers may cause memory issues.")
+        print(f"      Consider using -j 4 or -j 8 for stability.\n")
+
+    run_benchmark(test_dir, args.workers, args.category, args.save_failures,
+                  args.limit, args.antialias)

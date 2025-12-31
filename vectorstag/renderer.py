@@ -3718,6 +3718,7 @@ class SVGRenderer:
         """Render image element (embedded or external images)."""
         import base64
         import io
+        import gzip
 
         href = img_elem.href
         if not href:
@@ -3730,6 +3731,18 @@ class SVGRenderer:
                 # Remove newlines and whitespace that may be in the data URL
                 href = href.replace("\n", "").replace("\r", "").replace(" ", "")
 
+                # Extract MIME type
+                mime_type = ""
+                if href.startswith("data:") and ("," in href or ";" in href):
+                    end = href.find(",")
+                    if end == -1:
+                        end = len(href)
+                    header = href[5:end]
+                    if ";base64" in header:
+                        mime_type = header.split(";")[0]
+                    else:
+                        mime_type = header
+
                 if ";base64," in href:
                     data_start = href.index(";base64,") + 8
                     data = base64.b64decode(href[data_start:])
@@ -3740,10 +3753,77 @@ class SVGRenderer:
                 else:
                     return
 
-                img = Image.open(io.BytesIO(data)).convert("RGBA")
+                # Handle SVG data URLs
+                is_svg = False
+                is_svgz = False
+
+                # Check for gzip magic bytes (0x1f 0x8b)
+                if len(data) >= 2 and data[0] == 0x1f and data[1] == 0x8b:
+                    is_svgz = True
+                elif mime_type in ("image/svg+xml", "image/svg+xml;charset=utf-8", ""):
+                    # Try to detect SVG by content
+                    try:
+                        svg_content = data.decode('utf-8')
+                        if '<svg' in svg_content or '<?xml' in svg_content:
+                            is_svg = True
+                    except:
+                        pass
+
+                if is_svgz:
+                    # Decompress gzipped SVG
+                    try:
+                        svg_content = gzip.decompress(data).decode('utf-8')
+                        self._render_embedded_svg_direct(ctx, img_elem, svg_content)
+                        return
+                    except:
+                        pass
+                elif is_svg:
+                    svg_content = data.decode('utf-8')
+                    self._render_embedded_svg_direct(ctx, img_elem, svg_content)
+                    return
+                # Handle SVGZ (gzipped SVG) by MIME type
+                elif mime_type == "image/svg+xml-compressed":
+                    svg_content = gzip.decompress(data).decode('utf-8')
+                    self._render_embedded_svg_direct(ctx, img_elem, svg_content)
+                    return
+                else:
+                    # Raster image (PNG, JPEG, GIF, etc.)
+                    img = Image.open(io.BytesIO(data)).convert("RGBA")
             else:
-                # External file reference - not supported for security
-                return
+                # External file reference - resolve relative path if base_path is available
+                import os
+
+                if img_elem.base_path:
+                    # Resolve relative path against base path
+                    if not os.path.isabs(href):
+                        href = os.path.normpath(os.path.join(img_elem.base_path, href))
+
+                    if os.path.exists(href):
+                        # Determine file type by extension
+                        ext = os.path.splitext(href)[1].lower()
+                        if ext in ('.svg', '.svgz'):
+                            # External SVG/SVGZ file
+                            try:
+                                if ext == '.svgz':
+                                    with gzip.open(href, 'rt', encoding='utf-8') as f:
+                                        svg_content = f.read()
+                                else:
+                                    with open(href, 'r', encoding='utf-8') as f:
+                                        svg_content = f.read()
+                                self._render_embedded_svg_direct(ctx, img_elem, svg_content)
+                                return
+                            except:
+                                pass
+                        else:
+                            # Raster image (PNG, JPEG, GIF, etc.)
+                            try:
+                                img = Image.open(href).convert("RGBA")
+                            except:
+                                return
+                    else:
+                        return
+                else:
+                    return
 
             # Get target dimensions
             transform = ctx.base_transform.multiply(img_elem.transform)
@@ -3825,6 +3905,62 @@ class SVGRenderer:
 
         except Exception:
             # Silently fail for invalid images
+            pass
+
+    def _render_embedded_svg_direct(self, ctx: "RenderContext", img_elem: ImageElement, svg_content: str):
+        """Render embedded SVG content directly to the context.
+
+        Args:
+            ctx: Current render context
+            img_elem: The image element containing the SVG
+            svg_content: SVG content as string
+        """
+        try:
+            # Get target dimensions
+            transform = ctx.base_transform.multiply(img_elem.transform)
+
+            # Calculate target size
+            x = img_elem.x
+            y = img_elem.y
+            width = img_elem.width if img_elem.width > 0 else 100
+            height = img_elem.height if img_elem.height > 0 else 100
+
+            # Apply transform to get final position and size
+            x1, y1 = transform.apply(x, y)
+            x2, y2 = transform.apply(x + width, y + height)
+            final_width = max(1, int(abs(x2 - x1)))
+            final_height = max(1, int(abs(y2 - y1)))
+            final_x = int(min(x1, x2))
+            final_y = int(min(y1, y2))
+
+            # Create a new renderer for the embedded SVG
+            # Use the same antialias setting but transparent background
+            embedded_renderer = SVGRenderer(
+                background=(0, 0, 0, 0),
+                antialias=self.antialias
+            )
+
+            # Parse and render the embedded SVG
+            doc = embedded_renderer.parser.parse(svg_content)
+            if doc is None:
+                return
+
+            # Render at target dimensions
+            img = embedded_renderer.render_document(doc, final_width, final_height)
+            if img is None:
+                return
+
+            img = img.convert("RGBA")
+
+            # Apply opacity if needed
+            if img_elem.style.opacity < 1.0:
+                alpha = img.getchannel("A")
+                alpha = alpha.point(lambda a: int(a * img_elem.style.opacity))
+                img.putalpha(alpha)
+
+            # Composite onto canvas
+            self._alpha_composite(ctx, img, final_x, final_y)
+        except Exception:
             pass
 
     def _get_scale(self, ctx: "RenderContext", element_transform: Transform) -> float:

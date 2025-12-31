@@ -265,6 +265,7 @@ class ImageElement(SVGElement):
     height: float = 0
     href: str = ""  # Data URL or external reference
     preserveAspectRatio: str = "xMidYMid meet"
+    base_path: str = ""  # Base path for resolving relative URLs
 
 
 @dataclass
@@ -753,6 +754,9 @@ class SVGParser:
         self.filters = {}
         self.defs = {}
         self.css_classes = {}
+        self.css_ids = {}  # ID selector CSS rules
+        self.css_types = {}  # Type selector CSS rules
+        self.css_attr_selectors = {}  # Attribute selector CSS rules [attr] or [attr=value]
         self.elements_by_id = {}  # For feImage element references
 
         # Parse CSS from <style> blocks
@@ -813,6 +817,9 @@ class SVGParser:
 
     def parse_file(self, filepath: str) -> SVGDocument:
         """Parse SVG file."""
+        import os
+        # Store base path for resolving relative URLs
+        self.base_path = os.path.dirname(os.path.abspath(filepath))
         with open(filepath, "r", encoding="utf-8") as f:
             return self.parse(f.read())
 
@@ -833,15 +840,15 @@ class SVGParser:
                 self._parse_css_text(css_text)
 
     def _parse_css_text(self, css_text: str):
-        """Parse CSS text and extract class rules."""
-        # Simple CSS parser for class rules: .classname { property: value; }
+        """Parse CSS text and extract class, ID, type, and attribute rules."""
         # Remove comments
         css_text = re.sub(r'/\*.*?\*/', '', css_text, flags=re.DOTALL)
 
-        # Find class rules
-        pattern = r'\.([a-zA-Z_][a-zA-Z0-9_-]*)\s*\{([^}]*)\}'
+        # Find all rule blocks: selector { properties }
+        # Match class (.name), ID (#name), type (name), or attribute [attr] selectors
+        pattern = r'(\[[^\]]+\]|[.#]?[a-zA-Z_][a-zA-Z0-9_-]*)\s*\{([^}]*)\}'
         for match in re.finditer(pattern, css_text):
-            class_name = match.group(1)
+            selector = match.group(1)
             properties_str = match.group(2)
 
             # Parse properties
@@ -852,7 +859,54 @@ class SVGParser:
                     key, value = prop.split(':', 1)
                     properties[key.strip()] = value.strip()
 
-            self.css_classes[class_name] = properties
+            # Store by selector type
+            if selector.startswith('[') and selector.endswith(']'):
+                # Attribute selector: [attr] or [attr=value] or [attr~=value] etc.
+                attr_content = selector[1:-1]
+                self.css_attr_selectors[attr_content] = properties
+            elif selector.startswith('.'):
+                self.css_classes[selector[1:]] = properties
+            elif selector.startswith('#'):
+                self.css_ids[selector[1:]] = properties
+            else:
+                self.css_types[selector] = properties
+
+    def _get_css_transform(self, elem: ET.Element) -> Optional[str]:
+        """Get CSS transform property for an element.
+
+        Checks style attribute, ID selector, class selector, and type selector.
+        """
+        # Check style attribute first (highest priority)
+        style_str = elem.get("style", "")
+        if "transform" in style_str:
+            style_dict = self._parse_style_string(style_str)
+            if "transform" in style_dict:
+                return style_dict["transform"]
+
+        # Check CSS ID selector
+        elem_id = elem.get("id", "")
+        if elem_id and elem_id in self.css_ids:
+            css_props = self.css_ids[elem_id]
+            if "transform" in css_props:
+                return css_props["transform"]
+
+        # Check CSS class selector
+        class_attr = elem.get("class", "")
+        if class_attr:
+            for class_name in class_attr.split():
+                if class_name in self.css_classes:
+                    css_props = self.css_classes[class_name]
+                    if "transform" in css_props:
+                        return css_props["transform"]
+
+        # Check CSS type selector
+        tag_name = self._strip_ns(elem.tag)
+        if tag_name in self.css_types:
+            css_props = self.css_types[tag_name]
+            if "transform" in css_props:
+                return css_props["transform"]
+
+        return None
 
     def _collect_defs(self, root: ET.Element):
         """Collect all definitions (gradients, filters, etc.)."""
@@ -1598,8 +1652,21 @@ class SVGParser:
                     if key.strip() == "font-size":
                         font_size = self._parse_length(value.strip())
 
-        # Parse transform
-        transform_str = elem.get("transform", "")
+        # Parse transform from attribute and CSS
+        # Note: SVG 1.1 doesn't allow transform on symbol elements, so skip it
+        if tag == "symbol":
+            transform_str = ""
+        else:
+            transform_str = elem.get("transform", "")
+
+            # Also check CSS for transform property
+            css_transform_str = self._get_css_transform(elem)
+            if css_transform_str and not transform_str:
+                transform_str = css_transform_str
+            elif css_transform_str and transform_str:
+                # CSS transform is applied after attribute transform (CSS takes precedence per SVG2)
+                transform_str = css_transform_str
+
         local_transform = self._parse_transform(transform_str) if transform_str else Transform.identity()
         transform = parent_transform.multiply(local_transform)
 
@@ -1622,7 +1689,8 @@ class SVGParser:
             result = self._parse_polygon(elem, style, transform)
         elif tag == "path":
             result = self._parse_path(elem, style, transform)
-        elif tag == "g":
+        elif tag == "g" or tag == "a":
+            # Both g (group) and a (anchor) elements render children as a group
             result = self._parse_group(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
         elif tag == "symbol":
             # Symbol is like a group but may have viewBox
@@ -1691,13 +1759,51 @@ class SVGParser:
             visibility=parent_style.visibility
         )
 
-        # First apply CSS classes (lowest priority)
+        # First apply CSS type selectors (lowest priority)
         style_dict = {}
+        tag_name = self._strip_ns(elem.tag)
+        if tag_name in self.css_types:
+            style_dict.update(self.css_types[tag_name])
+
+        # Apply CSS attribute selectors
+        for attr_selector, props in self.css_attr_selectors.items():
+            # Handle [attr] (presence), [attr=value], [attr~=value], etc.
+            if '=' in attr_selector:
+                # Has value comparison
+                if '~=' in attr_selector:
+                    attr_name, attr_value = attr_selector.split('~=', 1)
+                    attr_value = attr_value.strip('"\'')
+                    elem_value = elem.get(attr_name.strip(), "")
+                    if attr_value in elem_value.split():
+                        style_dict.update(props)
+                elif '|=' in attr_selector:
+                    attr_name, attr_value = attr_selector.split('|=', 1)
+                    attr_value = attr_value.strip('"\'')
+                    elem_value = elem.get(attr_name.strip(), "")
+                    if elem_value == attr_value or elem_value.startswith(attr_value + '-'):
+                        style_dict.update(props)
+                else:
+                    # Simple equality: [attr=value]
+                    attr_name, attr_value = attr_selector.split('=', 1)
+                    attr_value = attr_value.strip('"\'')
+                    if elem.get(attr_name.strip()) == attr_value:
+                        style_dict.update(props)
+            else:
+                # Just presence check: [attr]
+                if elem.get(attr_selector) is not None:
+                    style_dict.update(props)
+
+        # Apply CSS class selectors
         class_attr = elem.get("class", "")
         if class_attr:
             for class_name in class_attr.split():
                 if class_name in self.css_classes:
                     style_dict.update(self.css_classes[class_name])
+
+        # Apply CSS ID selectors (higher priority than class)
+        elem_id = elem.get("id", "")
+        if elem_id and elem_id in self.css_ids:
+            style_dict.update(self.css_ids[elem_id])
 
         # Parse style attribute (higher priority - overrides CSS classes)
         style_str = elem.get("style", "")
@@ -2116,13 +2222,24 @@ class SVGParser:
 
     def _parse_circle(self, elem: ET.Element, style: Style, transform: Transform) -> CircleElement:
         """Parse circle element."""
+        # Get viewport dimensions for percentage resolution
+        vb_width = getattr(self, 'viewbox_width', 100) or 100
+        vb_height = getattr(self, 'viewbox_height', 100) or 100
+        # For radius percentage, use sqrt(vw^2 + vh^2)/sqrt(2) per SVG spec
+        import math
+        r_ref = math.sqrt(vb_width**2 + vb_height**2) / math.sqrt(2)
+
+        cx_str = elem.get("cx", "0")
+        cy_str = elem.get("cy", "0")
+        r_str = elem.get("r", "0")
+
         return CircleElement(
             tag="circle",
             style=style,
             transform=transform,
-            cx=self._parse_length(elem.get("cx", "0")),
-            cy=self._parse_length(elem.get("cy", "0")),
-            r=self._parse_length(elem.get("r", "0"))
+            cx=self._parse_length(cx_str, vb_width if "%" in cx_str else None),
+            cy=self._parse_length(cy_str, vb_height if "%" in cy_str else None),
+            r=self._parse_length(r_str, r_ref if "%" in r_str else None)
         )
 
     def _parse_ellipse(self, elem: ET.Element, style: Style, transform: Transform) -> EllipseElement:
@@ -2233,16 +2350,41 @@ class SVGParser:
                           font_family: str = "Arial", font_size: float = 16,
                           depth: int = 0) -> GroupElement:
         """Parse nested svg element - treated as a group with its own coordinate system."""
-        # Get position offset
-        x = self._parse_length(elem.get("x", "0"))
-        y = self._parse_length(elem.get("y", "0"))
+        # Get parent viewport dimensions for percentage resolution
+        parent_vb_width = getattr(self, 'viewbox_width', 100) or 100
+        parent_vb_height = getattr(self, 'viewbox_height', 100) or 100
 
-        # Get dimensions
-        width = self._parse_length(elem.get("width", "0"))
-        height = self._parse_length(elem.get("height", "0"))
+        # Get position offset - percentages relative to parent viewport
+        x_str = elem.get("x", "0")
+        y_str = elem.get("y", "0")
+        x = self._parse_length(x_str, parent_vb_width if "%" in x_str else None)
+        y = self._parse_length(y_str, parent_vb_height if "%" in y_str else None)
+
+        # Get dimensions - percentages relative to parent viewport
+        # Track whether explicit dimensions were given (for clipping decision)
+        width_str = elem.get("width")
+        height_str = elem.get("height")
+        has_explicit_width = width_str is not None
+        has_explicit_height = height_str is not None
+        if width_str:
+            width = self._parse_length(width_str, parent_vb_width if "%" in width_str else None)
+        else:
+            width = 0
+        if height_str:
+            height = self._parse_length(height_str, parent_vb_height if "%" in height_str else None)
+        else:
+            height = 0
 
         # Get viewBox if present
         viewbox_str = elem.get("viewBox", "")
+
+        # Check overflow property - default is hidden for nested SVG
+        overflow = elem.get("overflow", "hidden")
+        style_str = elem.get("style", "")
+        if "overflow" in style_str:
+            style_dict = self._parse_style_string(style_str)
+            if "overflow" in style_dict:
+                overflow = style_dict["overflow"]
 
         # Build the transform for the nested SVG coordinate system
         nested_transform = transform
@@ -2251,29 +2393,138 @@ class SVGParser:
         if x != 0 or y != 0:
             nested_transform = nested_transform.multiply(Transform.translate(x, y))
 
+        # Determine viewport dimensions for clipping
+        clip_width = width
+        clip_height = height
+
         # If there's a viewBox, compute scaling to map viewBox to width/height
-        if viewbox_str and width > 0 and height > 0:
+        if viewbox_str:
             parts = viewbox_str.replace(",", " ").split()
             if len(parts) >= 4:
                 vb_x, vb_y, vb_w, vb_h = map(float, parts[:4])
                 if vb_w > 0 and vb_h > 0:
-                    # Scale to fit viewBox into width/height
-                    scale_x = width / vb_w
-                    scale_y = height / vb_h
-                    # Apply scaling and viewBox offset
-                    nested_transform = nested_transform.multiply(
-                        Transform.scale(scale_x, scale_y)
-                    ).multiply(
-                        Transform.translate(-vb_x, -vb_y)
-                    )
+                    # If no explicit dimensions, use PARENT's viewport (not viewBox)
+                    # Per SVG spec: nested svg without width/height fills 100% of parent
+                    if width <= 0:
+                        width = parent_vb_width
+                        clip_width = parent_vb_width
+                    if height <= 0:
+                        height = parent_vb_height
+                        clip_height = parent_vb_height
+
+                    if width > 0 and height > 0:
+                        # Apply preserveAspectRatio (default: xMidYMid meet)
+                        par = elem.get("preserveAspectRatio", "xMidYMid meet")
+                        scale_x = width / vb_w
+                        scale_y = height / vb_h
+
+                        if "none" in par.lower():
+                            # Non-uniform scaling
+                            scale = None
+                            offset_x, offset_y = 0, 0
+                        else:
+                            # Uniform scaling with alignment
+                            if "meet" in par.lower():
+                                scale = min(scale_x, scale_y)
+                            else:  # slice
+                                scale = max(scale_x, scale_y)
+
+                            # Calculate the scaled content dimensions
+                            scaled_w = vb_w * scale
+                            scaled_h = vb_h * scale
+
+                            # Calculate alignment offset
+                            offset_x, offset_y = 0, 0
+                            if "xmid" in par.lower():
+                                offset_x = (width - scaled_w) / 2
+                            elif "xmax" in par.lower():
+                                offset_x = width - scaled_w
+
+                            if "ymid" in par.lower():
+                                offset_y = (height - scaled_h) / 2
+                            elif "ymax" in par.lower():
+                                offset_y = height - scaled_h
+
+                            scale_x = scale_y = scale
+
+                        # Apply transform: first offset for alignment, then scale, then viewBox origin
+                        if offset_x != 0 or offset_y != 0:
+                            nested_transform = nested_transform.multiply(
+                                Transform.translate(offset_x, offset_y)
+                            )
+                        nested_transform = nested_transform.multiply(
+                            Transform.scale(scale_x, scale_y)
+                        ).multiply(
+                            Transform.translate(-vb_x, -vb_y)
+                        )
+
+        # Create clip path for nested SVG viewport (default overflow:hidden)
+        # Only clip if explicit width/height were provided (not just viewBox)
+        # Per SVG spec: nested svg with only viewBox does NOT create a clipping viewport
+        svg_clip_id = None
+        should_clip = (overflow in ("hidden", "scroll") and
+                       clip_width > 0 and clip_height > 0 and
+                       has_explicit_width and has_explicit_height)
+        if should_clip:
+            # Create a synthetic clip path in nested SVG's coordinate system
+            # The clip rect is at (0, 0) in nested coords, with viewport dimensions
+            clip_id = f"_nested_svg_clip_{id(elem)}_{x}_{y}_{clip_width}_{clip_height}"
+            if clip_id not in self.clip_paths:
+                # Clip rect at origin in nested coordinate space
+                # (the group's transform already positions content correctly)
+                clip_rect = RectElement(
+                    tag="rect",
+                    style=Style(),
+                    transform=Transform(),  # Identity - coords are in nested space
+                    x=0,
+                    y=0,
+                    width=clip_width,
+                    height=clip_height,
+                    rx=0.0,
+                    ry=0.0
+                )
+                self.clip_paths[clip_id] = ClipPath(
+                    id=clip_id,
+                    elements=[clip_rect]
+                )
+            svg_clip_id = clip_id
+
+        # Determine the nested SVG's viewport for children's percentage resolution
+        # If viewBox is specified, use viewBox dimensions; otherwise use width/height
+        nested_vb_width = clip_width if clip_width > 0 else parent_vb_width
+        nested_vb_height = clip_height if clip_height > 0 else parent_vb_height
+
+        # If there's a viewBox, children's percentages should be relative to viewBox
+        if viewbox_str:
+            parts = viewbox_str.replace(",", " ").split()
+            if len(parts) >= 4:
+                nested_vb_width = float(parts[2])
+                nested_vb_height = float(parts[3])
+
+        # Temporarily update viewport context for children
+        old_vb_width = getattr(self, 'viewbox_width', None)
+        old_vb_height = getattr(self, 'viewbox_height', None)
+        self.viewbox_width = nested_vb_width
+        self.viewbox_height = nested_vb_height
 
         # Parse children with the nested transform
+        children = self._parse_children(elem, nested_transform, style, text_anchor, font_family, font_size, depth=depth)
+
+        # Restore parent viewport context
+        self.viewbox_width = old_vb_width
+        self.viewbox_height = old_vb_height
+
         group = GroupElement(
             tag="svg",
             style=style,
             transform=nested_transform,
-            children=self._parse_children(elem, nested_transform, style, text_anchor, font_family, font_size, depth=depth)
+            children=children
         )
+
+        # Apply clip path to the group
+        if svg_clip_id:
+            group.clip_path_id = svg_clip_id
+
         return group
 
     def _parse_switch(self, elem: ET.Element, style: Style, transform: Transform,
@@ -2378,7 +2629,8 @@ class SVGParser:
             width=self._parse_length(elem.get("width", "0")),
             height=self._parse_length(elem.get("height", "0")),
             href=href,
-            preserveAspectRatio=elem.get("preserveAspectRatio", "xMidYMid meet")
+            preserveAspectRatio=elem.get("preserveAspectRatio", "xMidYMid meet"),
+            base_path=getattr(self, 'base_path', '')
         )
 
     def _parse_use(self, elem: ET.Element, style: Style, transform: Transform,
@@ -2405,17 +2657,159 @@ class SVGParser:
         x = self._parse_length(elem.get("x", "0"))
         y = self._parse_length(elem.get("y", "0"))
 
+        # Get use element's width/height (for symbol viewBox)
+        use_width_str = elem.get("width")
+        use_height_str = elem.get("height")
+        use_width = self._parse_length(use_width_str) if use_width_str else None
+        use_height = self._parse_length(use_height_str) if use_height_str else None
+
         # Apply translation for x, y
         if x != 0 or y != 0:
             use_transform = transform.multiply(Transform.translate(x, y))
         else:
             use_transform = transform
 
+        # Check if referenced element is a symbol or svg element
+        ref_tag = self._strip_ns(ref_elem.tag)
+        symbol_clip_id = None
+        if ref_tag == "symbol" or ref_tag == "svg":
+            viewbox_str = ref_elem.get("viewBox", "")
+            if viewbox_str:
+                # Symbol with viewBox - scale content to fit
+                parts = viewbox_str.replace(",", " ").split()
+                if len(parts) >= 4:
+                    vb_x, vb_y, vb_w, vb_h = map(float, parts[:4])
+                    if vb_w > 0 and vb_h > 0:
+                        # Determine target size
+                        # If use has width/height, use those
+                        # Otherwise, use the parent SVG dimensions
+                        target_w = use_width if use_width is not None else self.viewbox_width
+                        target_h = use_height if use_height is not None else self.viewbox_height
+
+                        # Fall back to viewBox dimensions if still no size
+                        if target_w <= 0:
+                            target_w = vb_w
+                        if target_h <= 0:
+                            target_h = vb_h
+
+                        # Handle preserveAspectRatio
+                        par = ref_elem.get("preserveAspectRatio", "xMidYMid meet")
+                        if par == "none":
+                            scale_x = target_w / vb_w
+                            scale_y = target_h / vb_h
+                            offset_x = -vb_x * scale_x
+                            offset_y = -vb_y * scale_y
+                        else:
+                            # Calculate aspect-ratio-preserving scale
+                            aspect_vb = vb_w / vb_h
+                            aspect_target = target_w / target_h
+
+                            if "meet" in par or ("slice" not in par and "meet" not in par):
+                                # meet: scale to fit within bounds
+                                if aspect_vb > aspect_target:
+                                    scale = target_w / vb_w
+                                else:
+                                    scale = target_h / vb_h
+                            else:
+                                # slice: scale to cover bounds
+                                if aspect_vb > aspect_target:
+                                    scale = target_h / vb_h
+                                else:
+                                    scale = target_w / vb_w
+
+                            scale_x = scale
+                            scale_y = scale
+                            scaled_w = vb_w * scale
+                            scaled_h = vb_h * scale
+
+                            # Calculate alignment offset
+                            x_offset = 0
+                            y_offset = 0
+
+                            if "xMid" in par:
+                                x_offset = (target_w - scaled_w) / 2
+                            elif "xMax" in par:
+                                x_offset = target_w - scaled_w
+
+                            if "YMid" in par:
+                                y_offset = (target_h - scaled_h) / 2
+                            elif "YMax" in par:
+                                y_offset = target_h - scaled_h
+
+                            offset_x = x_offset - vb_x * scale
+                            offset_y = y_offset - vb_y * scale
+
+                        # Apply viewBox transform
+                        # Order: first scale, then translate (for correct viewBox mapping)
+                        use_transform = use_transform.multiply(
+                            Transform.scale(scale_x, scale_y)
+                        ).multiply(
+                            Transform.translate(-vb_x, -vb_y)
+                        )
+                        # Apply alignment offset
+                        if "xMid" in par:
+                            align_x = (target_w - vb_w * scale_x) / 2
+                            use_transform = use_transform.multiply(Transform.translate(align_x / scale_x, 0))
+                        elif "xMax" in par:
+                            align_x = target_w - vb_w * scale_x
+                            use_transform = use_transform.multiply(Transform.translate(align_x / scale_x, 0))
+                        if "YMid" in par:
+                            align_y = (target_h - vb_h * scale_y) / 2
+                            use_transform = use_transform.multiply(Transform.translate(0, align_y / scale_y))
+                        elif "YMax" in par:
+                            align_y = target_h - vb_h * scale_y
+                            use_transform = use_transform.multiply(Transform.translate(0, align_y / scale_y))
+
+                        # Symbols clip content to the use dimensions (overflow:hidden by default)
+                        overflow = ref_elem.get("overflow", "hidden")
+                        if overflow == "hidden" or overflow == "scroll":
+                            clip_id = f"_symbol_clip_{id(ref_elem)}_{target_w}_{target_h}"
+                            if clip_id not in self.clip_paths:
+                                clip_rect = RectElement(
+                                    tag="rect",
+                                    style=Style(),
+                                    transform=Transform.identity(),
+                                    x=0, y=0,
+                                    width=target_w, height=target_h,
+                                    rx=0, ry=0
+                                )
+                                self.clip_paths[clip_id] = ClipPath(
+                                    id=clip_id,
+                                    elements=[clip_rect]
+                                )
+                            symbol_clip_id = clip_id
+            elif use_width is not None and use_height is not None:
+                # Symbol without viewBox but use has width/height
+                # Content is clipped (not scaled) to use dimensions
+                # Check overflow property (default is hidden for symbols)
+                overflow = ref_elem.get("overflow", "hidden")
+                if overflow in ("hidden", "scroll"):
+                    # Create a synthetic clip path
+                    clip_id = f"_symbol_clip_{id(ref_elem)}_{use_width}_{use_height}"
+                    if clip_id not in self.clip_paths:
+                        clip_rect = RectElement(
+                            tag="rect",
+                            style=Style(),
+                            transform=Transform.identity(),
+                            x=0, y=0,
+                            width=use_width, height=use_height,
+                            rx=0, ry=0
+                        )
+                        self.clip_paths[clip_id] = ClipPath(
+                            id=clip_id,
+                            elements=[clip_rect]
+                        )
+                    symbol_clip_id = clip_id
+
         # Track this reference to detect circular dependencies
         self._use_stack.add(href)
         try:
             # Parse the referenced element with the combined transform
-            return self._parse_element(ref_elem, use_transform, style, depth=depth)
+            result = self._parse_element(ref_elem, use_transform, style, depth=depth)
+            # Apply symbol clip path if needed
+            if result and symbol_clip_id:
+                result.clip_path_id = symbol_clip_id
+            return result
         finally:
             self._use_stack.discard(href)
 
