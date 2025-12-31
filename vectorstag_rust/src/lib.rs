@@ -1848,11 +1848,78 @@ fn resize_rgba<'py>(
 
     let mut dst = Array3::<u8>::zeros((new_height, new_width, 4));
 
-    // Box filter with proper alpha handling (premultiplied alpha averaging)
-    // To correctly blend partially transparent pixels, we:
-    // 1. Multiply RGB by alpha (premultiply)
-    // 2. Average the premultiplied values
-    // 3. Divide by the averaged alpha to get correct RGB
+    // Fast path: exact 4x downscale (most common for antialias=4)
+    if src_w == new_width * 4 && src_h == new_height * 4 {
+        for dy in 0..new_height {
+            let sy = dy * 4;
+            for dx in 0..new_width {
+                let sx = dx * 4;
+
+                // Sum 16 pixels (4x4 block) with premultiplied alpha
+                let mut sum_r = 0u32;
+                let mut sum_g = 0u32;
+                let mut sum_b = 0u32;
+                let mut sum_a = 0u32;
+
+                for oy in 0..4 {
+                    for ox in 0..4 {
+                        let a = src_arr[[sy + oy, sx + ox, 3]] as u32;
+                        sum_r += src_arr[[sy + oy, sx + ox, 0]] as u32 * a;
+                        sum_g += src_arr[[sy + oy, sx + ox, 1]] as u32 * a;
+                        sum_b += src_arr[[sy + oy, sx + ox, 2]] as u32 * a;
+                        sum_a += a;
+                    }
+                }
+
+                if sum_a > 0 {
+                    dst[[dy, dx, 0]] = (sum_r / sum_a).min(255) as u8;
+                    dst[[dy, dx, 1]] = (sum_g / sum_a).min(255) as u8;
+                    dst[[dy, dx, 2]] = (sum_b / sum_a).min(255) as u8;
+                    dst[[dy, dx, 3]] = (sum_a / 16) as u8;
+                }
+            }
+        }
+        return dst.into_pyarray(py);
+    }
+
+    // Fast path: exact 2x downscale (for antialias=2)
+    if src_w == new_width * 2 && src_h == new_height * 2 {
+        for dy in 0..new_height {
+            let sy = dy * 2;
+            for dx in 0..new_width {
+                let sx = dx * 2;
+
+                let a00 = src_arr[[sy, sx, 3]] as u32;
+                let a01 = src_arr[[sy, sx + 1, 3]] as u32;
+                let a10 = src_arr[[sy + 1, sx, 3]] as u32;
+                let a11 = src_arr[[sy + 1, sx + 1, 3]] as u32;
+                let sum_a = a00 + a01 + a10 + a11;
+
+                if sum_a > 0 {
+                    let sum_r = src_arr[[sy, sx, 0]] as u32 * a00
+                              + src_arr[[sy, sx + 1, 0]] as u32 * a01
+                              + src_arr[[sy + 1, sx, 0]] as u32 * a10
+                              + src_arr[[sy + 1, sx + 1, 0]] as u32 * a11;
+                    let sum_g = src_arr[[sy, sx, 1]] as u32 * a00
+                              + src_arr[[sy, sx + 1, 1]] as u32 * a01
+                              + src_arr[[sy + 1, sx, 1]] as u32 * a10
+                              + src_arr[[sy + 1, sx + 1, 1]] as u32 * a11;
+                    let sum_b = src_arr[[sy, sx, 2]] as u32 * a00
+                              + src_arr[[sy, sx + 1, 2]] as u32 * a01
+                              + src_arr[[sy + 1, sx, 2]] as u32 * a10
+                              + src_arr[[sy + 1, sx + 1, 2]] as u32 * a11;
+
+                    dst[[dy, dx, 0]] = (sum_r / sum_a).min(255) as u8;
+                    dst[[dy, dx, 1]] = (sum_g / sum_a).min(255) as u8;
+                    dst[[dy, dx, 2]] = (sum_b / sum_a).min(255) as u8;
+                    dst[[dy, dx, 3]] = (sum_a / 4) as u8;
+                }
+            }
+        }
+        return dst.into_pyarray(py);
+    }
+
+    // General case: box filter
     let scale_x = src_w as f32 / new_width as f32;
     let scale_y = src_h as f32 / new_height as f32;
 
@@ -1864,7 +1931,6 @@ fn resize_rgba<'py>(
             let sx_start = (dx as f32 * scale_x) as usize;
             let sx_end = (((dx + 1) as f32 * scale_x) as usize).min(src_w);
 
-            // Sum premultiplied RGBA (using larger type to avoid overflow)
             let mut sum_r = 0u64;
             let mut sum_g = 0u64;
             let mut sum_b = 0u64;
@@ -1874,7 +1940,6 @@ fn resize_rgba<'py>(
             for sy in sy_start..sy_end {
                 for sx in sx_start..sx_end {
                     let a = src_arr[[sy, sx, 3]] as u64;
-                    // Premultiply: store R*A, G*A, B*A
                     sum_r += src_arr[[sy, sx, 0]] as u64 * a;
                     sum_g += src_arr[[sy, sx, 1]] as u64 * a;
                     sum_b += src_arr[[sy, sx, 2]] as u64 * a;
@@ -1884,20 +1949,13 @@ fn resize_rgba<'py>(
             }
 
             if count > 0 {
-                // Average alpha
                 let avg_a = sum_a / count;
                 dst[[dy, dx, 3]] = avg_a as u8;
 
                 if avg_a > 0 {
-                    // Un-premultiply: divide by total alpha, then divide by count
-                    // RGB = (sum_r / sum_a) = weighted average of RGB by alpha
                     dst[[dy, dx, 0]] = ((sum_r / sum_a).min(255)) as u8;
                     dst[[dy, dx, 1]] = ((sum_g / sum_a).min(255)) as u8;
                     dst[[dy, dx, 2]] = ((sum_b / sum_a).min(255)) as u8;
-                } else {
-                    dst[[dy, dx, 0]] = 0;
-                    dst[[dy, dx, 1]] = 0;
-                    dst[[dy, dx, 2]] = 0;
                 }
             }
         }
@@ -2434,7 +2492,80 @@ fn fe_component_transfer<'py>(
     dst.into_pyarray(py)
 }
 
-/// feMorphology - erode or dilate
+/// Van Herk-Gil-Werman algorithm for 1D sliding window min/max
+/// Achieves O(1) per element instead of O(r) per element
+#[inline]
+fn vhg_sliding_minmax(data: &[u8], radius: usize, is_min: bool) -> Vec<u8> {
+    let n = data.len();
+    if n == 0 {
+        return vec![];
+    }
+
+    let window = 2 * radius + 1;
+
+    // Edge case: window larger than data
+    if window >= n {
+        let result_val = if is_min {
+            *data.iter().min().unwrap_or(&0)
+        } else {
+            *data.iter().max().unwrap_or(&0)
+        };
+        return vec![result_val; n];
+    }
+
+    let mut result = vec![0u8; n];
+
+    // Allocate prefix and suffix arrays
+    let num_blocks = (n + window - 1) / window;
+    let mut prefix = vec![0u8; n];
+    let mut suffix = vec![0u8; n];
+
+    // Compute prefix and suffix min/max for each block
+    for block in 0..num_blocks {
+        let block_start = block * window;
+        let block_end = ((block + 1) * window).min(n);
+
+        // Suffix: scan backward from block_end
+        let mut val = if is_min { 255u8 } else { 0u8 };
+        for i in (block_start..block_end).rev() {
+            if is_min {
+                val = val.min(data[i]);
+            } else {
+                val = val.max(data[i]);
+            }
+            suffix[i] = val;
+        }
+
+        // Prefix: scan forward from block_start
+        val = if is_min { 255u8 } else { 0u8 };
+        for i in block_start..block_end {
+            if is_min {
+                val = val.min(data[i]);
+            } else {
+                val = val.max(data[i]);
+            }
+            prefix[i] = val;
+        }
+    }
+
+    // Compute result using suffix and prefix
+    for i in 0..n {
+        let left = if i >= radius { i - radius } else { 0 };
+        let right = if i + radius < n { i + radius } else { n - 1 };
+
+        // The answer for window [left, right] is combine(suffix[left], prefix[right])
+        // But we need to be careful when they span block boundaries
+        if is_min {
+            result[i] = suffix[left].min(prefix[right]);
+        } else {
+            result[i] = suffix[left].max(prefix[right]);
+        }
+    }
+
+    result
+}
+
+/// feMorphology - erode or dilate using separable VHG algorithm
 /// operator: 0=erode, 1=dilate
 #[pyfunction]
 fn fe_morphology<'py>(
@@ -2447,14 +2578,14 @@ fn fe_morphology<'py>(
     use ndarray::Array3;
     let arr = src.as_array();
     let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
-    let mut dst = Array3::<u8>::zeros((h, w, 4));
 
-    // Clamp radius to prevent extremely slow operations (max 20 for reasonable speed)
-    let rx = (radius_x.round() as i32).min(20);
-    let ry = (radius_y.round() as i32).min(20);
+    let rx = radius_x.round() as usize;
+    let ry = radius_y.round() as usize;
+    let is_erode = operator == 0;
 
-    if rx <= 0 && ry <= 0 {
+    if rx == 0 && ry == 0 {
         // No morphology - just copy
+        let mut dst = Array3::<u8>::zeros((h, w, 4));
         for y in 0..h {
             for x in 0..w {
                 for c in 0..4 {
@@ -2465,31 +2596,55 @@ fn fe_morphology<'py>(
         return dst.into_pyarray(py);
     }
 
-    for y in 0..h {
-        for x in 0..w {
-            let mut best = if operator == 0 { [255u8; 4] } else { [0u8; 4] };
+    // Separable morphology: horizontal pass then vertical pass
+    // This reduces O(w*h*rx*ry) to O(w*h*(rx+ry)) with VHG giving O(w*h)
 
-            for dy in -ry..=ry {
-                let ny = y as i32 + dy;
-                if ny < 0 || ny >= h as i32 { continue; }
+    // Horizontal pass (process each row)
+    let mut temp = Array3::<u8>::zeros((h, w, 4));
 
-                for dx in -rx..=rx {
-                    let nx = x as i32 + dx;
-                    if nx < 0 || nx >= w as i32 { continue; }
-
-                    for c in 0..4 {
-                        let val = arr[[ny as usize, nx as usize, c]];
-                        if operator == 0 {
-                            best[c] = best[c].min(val);
-                        } else {
-                            best[c] = best[c].max(val);
-                        }
-                    }
+    if rx > 0 {
+        for y in 0..h {
+            for c in 0..4 {
+                // Extract row for this channel
+                let row: Vec<u8> = (0..w).map(|x| arr[[y, x, c]]).collect();
+                let result = vhg_sliding_minmax(&row, rx, is_erode);
+                for x in 0..w {
+                    temp[[y, x, c]] = result[x];
                 }
             }
+        }
+    } else {
+        // No horizontal morphology, just copy
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..4 {
+                    temp[[y, x, c]] = arr[[y, x, c]];
+                }
+            }
+        }
+    }
 
+    // Vertical pass (process each column)
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    if ry > 0 {
+        for x in 0..w {
             for c in 0..4 {
-                dst[[y, x, c]] = best[c];
+                // Extract column for this channel
+                let col: Vec<u8> = (0..h).map(|y| temp[[y, x, c]]).collect();
+                let result = vhg_sliding_minmax(&col, ry, is_erode);
+                for y in 0..h {
+                    dst[[y, x, c]] = result[y];
+                }
+            }
+        }
+    } else {
+        // No vertical morphology, just copy from temp
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..4 {
+                    dst[[y, x, c]] = temp[[y, x, c]];
+                }
             }
         }
     }
@@ -2497,7 +2652,7 @@ fn fe_morphology<'py>(
     dst.into_pyarray(py)
 }
 
-/// feConvolveMatrix - apply convolution kernel
+/// feConvolveMatrix - apply convolution kernel (optimized)
 #[pyfunction]
 fn fe_convolve_matrix<'py>(
     py: Python<'py>,
@@ -2517,45 +2672,102 @@ fn fe_convolve_matrix<'py>(
     let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
     let mut dst = Array3::<u8>::zeros((h, w, 4));
 
+    // Precompute: kernel / divisor and bias * 255
     let div = if divisor.abs() < 1e-10 { 1.0 } else { divisor };
+    let scaled_kernel: Vec<f32> = kernel.iter().map(|k| k / div).collect();
+    let bias_255 = bias * 255.0;
 
-    for y in 0..h {
-        for x in 0..w {
-            let channels = if preserve_alpha { 3 } else { 4 };
+    let h_i = h as i32;
+    let w_i = w as i32;
+    let target_y_i = target_y as i32;
+    let target_x_i = target_x as i32;
 
-            for c in 0..channels {
-                let mut sum = 0.0f32;
+    let channels = if preserve_alpha { 3 } else { 4 };
+
+    // Check for empty kernel
+    if scaled_kernel.is_empty() || order_x == 0 || order_y == 0 {
+        // Just copy source to destination
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..4 {
+                    dst[[y, x, c]] = arr[[y, x, c]];
+                }
+            }
+        }
+        return dst.into_pyarray(py);
+    }
+
+    // Edge mode 0 (duplicate) is most common - optimize separately
+    if edge_mode == 0 {
+        for y in 0..h {
+            let y_i = y as i32;
+            for x in 0..w {
+                let x_i = x as i32;
+                let mut sum = [0.0f32; 4];
+
+                for ky in 0..order_y {
+                    let sy = (y_i + ky as i32 - target_y_i).clamp(0, h_i - 1) as usize;
+
+                    for kx in 0..order_x {
+                        let kernel_idx = ky * order_x + kx;
+                        if kernel_idx >= scaled_kernel.len() { continue; }
+                        let sx = (x_i + kx as i32 - target_x_i).clamp(0, w_i - 1) as usize;
+                        let kernel_val = scaled_kernel[kernel_idx];
+
+                        // Process all channels together for better cache usage
+                        for c in 0..channels {
+                            sum[c] += arr[[sy, sx, c]] as f32 * kernel_val;
+                        }
+                    }
+                }
+
+                for c in 0..channels {
+                    dst[[y, x, c]] = (sum[c] + bias_255).clamp(0.0, 255.0) as u8;
+                }
+                if preserve_alpha {
+                    dst[[y, x, 3]] = arr[[y, x, 3]];
+                }
+            }
+        }
+    } else {
+        // General case for wrap and none edge modes
+        for y in 0..h {
+            let y_i = y as i32;
+            for x in 0..w {
+                let x_i = x as i32;
+                let mut sum = [0.0f32; 4];
 
                 for ky in 0..order_y {
                     for kx in 0..order_x {
-                        let sy = y as i32 + ky as i32 - target_y as i32;
-                        let sx = x as i32 + kx as i32 - target_x as i32;
+                        let kernel_idx = ky * order_x + kx;
+                        if kernel_idx >= scaled_kernel.len() { continue; }
+
+                        let sy = y_i + ky as i32 - target_y_i;
+                        let sx = x_i + kx as i32 - target_x_i;
 
                         let (sy, sx) = match edge_mode {
-                            0 => (sy.clamp(0, h as i32 - 1), sx.clamp(0, w as i32 - 1)),  // duplicate
-                            1 => (sy.rem_euclid(h as i32), sx.rem_euclid(w as i32)),  // wrap
+                            1 => (sy.rem_euclid(h_i), sx.rem_euclid(w_i)),  // wrap
                             _ => {
-                                if sy < 0 || sy >= h as i32 || sx < 0 || sx >= w as i32 {
+                                if sy < 0 || sy >= h_i || sx < 0 || sx >= w_i {
                                     continue;
                                 }
                                 (sy, sx)
                             }
                         };
 
-                        let kernel_idx = ky * order_x + kx;
-                        if kernel_idx < kernel.len() {
-                            let val = arr[[sy as usize, sx as usize, c]] as f32 / 255.0;
-                            sum += val * kernel[kernel_idx];
+                        let kernel_val = scaled_kernel[kernel_idx];
+                        for c in 0..channels {
+                            sum[c] += arr[[sy as usize, sx as usize, c]] as f32 * kernel_val;
                         }
                     }
                 }
 
-                let out = sum / div + bias;
-                dst[[y, x, c]] = (out * 255.0).clamp(0.0, 255.0) as u8;
-            }
-
-            if preserve_alpha {
-                dst[[y, x, 3]] = arr[[y, x, 3]];
+                for c in 0..channels {
+                    dst[[y, x, c]] = (sum[c] + bias_255).clamp(0.0, 255.0) as u8;
+                }
+                if preserve_alpha {
+                    dst[[y, x, 3]] = arr[[y, x, 3]];
+                }
             }
         }
     }
@@ -2997,6 +3209,63 @@ fn fe_specular_lighting<'py>(
     dst.into_pyarray(py)
 }
 
+/// Compute integral image (summed area table) for a single channel
+#[inline]
+fn compute_integral_image(src: &[f32], w: usize, h: usize, channel: usize) -> Vec<f64> {
+    let mut integral = vec![0.0f64; (w + 1) * (h + 1)];
+    let iw = w + 1;
+
+    for y in 0..h {
+        let mut row_sum = 0.0f64;
+        for x in 0..w {
+            row_sum += src[(y * w + x) * 4 + channel] as f64;
+            integral[(y + 1) * iw + (x + 1)] = row_sum + integral[y * iw + (x + 1)];
+        }
+    }
+    integral
+}
+
+/// Query sum of rectangle using integral image
+#[inline]
+fn integral_query(integral: &[f64], iw: usize, x1: usize, y1: usize, x2: usize, y2: usize) -> f64 {
+    integral[y2 * iw + x2] - integral[y1 * iw + x2] - integral[y2 * iw + x1] + integral[y1 * iw + x1]
+}
+
+/// Single-pass box blur using integral images (true O(1) per pixel)
+#[inline]
+fn box_blur_integral(src: &[f32], dst: &mut [f32], w: usize, h: usize, rx: usize, ry: usize) {
+    if w == 0 || h == 0 { return; }
+
+    // Compute integral images for each channel
+    let integral_r = compute_integral_image(src, w, h, 0);
+    let integral_g = compute_integral_image(src, w, h, 1);
+    let integral_b = compute_integral_image(src, w, h, 2);
+    let integral_a = compute_integral_image(src, w, h, 3);
+
+    let iw = w + 1;
+
+    for y in 0..h {
+        // Clamp vertical bounds
+        let y1 = if y >= ry { y - ry } else { 0 };
+        let y2 = (y + ry + 1).min(h);
+
+        for x in 0..w {
+            // Clamp horizontal bounds
+            let x1 = if x >= rx { x - rx } else { 0 };
+            let x2 = (x + rx + 1).min(w);
+
+            let area = ((x2 - x1) * (y2 - y1)) as f64;
+            let inv_area = if area > 0.0 { 1.0 / area } else { 0.0 };
+
+            let idx = (y * w + x) * 4;
+            dst[idx]     = (integral_query(&integral_r, iw, x1, y1, x2, y2) * inv_area) as f32;
+            dst[idx + 1] = (integral_query(&integral_g, iw, x1, y1, x2, y2) * inv_area) as f32;
+            dst[idx + 2] = (integral_query(&integral_b, iw, x1, y1, x2, y2) * inv_area) as f32;
+            dst[idx + 3] = (integral_query(&integral_a, iw, x1, y1, x2, y2) * inv_area) as f32;
+        }
+    }
+}
+
 /// feGaussianBlur - optimized Gaussian blur using box blur approximation
 #[pyfunction]
 fn fe_gaussian_blur<'py>(
@@ -3022,110 +3291,39 @@ fn fe_gaussian_blur<'py>(
         return dst.into_pyarray(py);
     }
 
-    // Clamp stdDev to reasonable range to prevent huge blur radii
+    // Clamp stdDev to reasonable range
     let std_dev_x = std_dev_x.min(100.0);
     let std_dev_y = std_dev_y.min(100.0);
 
-    // Box blur radius approximation for Gaussian (3 passes)
+    // Box blur radius for Gaussian approximation (3 passes)
     let box_radius_x = ((12.0 * std_dev_x * std_dev_x / 3.0).sqrt() + 0.5).floor() as usize;
     let box_radius_y = ((12.0 * std_dev_y * std_dev_y / 3.0).sqrt() + 0.5).floor() as usize;
 
-    // Premultiply alpha for correct blending
-    let mut data = vec![0.0f32; h * w * 4];
+    let total_pixels = h * w * 4;
+
+    // Premultiply alpha - use two buffers for ping-pong
+    let mut buf_a = vec![0.0f32; total_pixels];
+    let mut buf_b = vec![0.0f32; total_pixels];
+
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) * 4;
             let a = arr[[y, x, 3]] as f32 / 255.0;
-            data[idx] = arr[[y, x, 0]] as f32 * a;
-            data[idx + 1] = arr[[y, x, 1]] as f32 * a;
-            data[idx + 2] = arr[[y, x, 2]] as f32 * a;
-            data[idx + 3] = arr[[y, x, 3]] as f32;
+            buf_a[idx] = arr[[y, x, 0]] as f32 * a;
+            buf_a[idx + 1] = arr[[y, x, 1]] as f32 * a;
+            buf_a[idx + 2] = arr[[y, x, 2]] as f32 * a;
+            buf_a[idx + 3] = arr[[y, x, 3]] as f32;
         }
     }
 
-    // Apply 3 passes of box blur using O(1) sliding window
-    for _ in 0..3 {
-        // Horizontal pass with sliding window
-        if box_radius_x > 0 {
-            let mut next = vec![0.0f32; h * w * 4];
-            for y in 0..h {
-                let mut sum = [0.0f32; 4];
-                // Initialize window
-                let window_size = (box_radius_x * 2 + 1).min(w);
-                for i in 0..window_size.min(box_radius_x + 1) {
-                    let idx = (y * w + i) * 4;
-                    for c in 0..4 { sum[c] += data[idx + c]; }
-                }
-                let mut left = 0i32 - box_radius_x as i32;
-                let mut right = box_radius_x as i32;
+    // Apply 3 passes of box blur using integral images (O(1) per pixel)
+    let mut current = &mut buf_a;
+    let mut next = &mut buf_b;
 
-                for x in 0..w {
-                    // Add right pixel
-                    if right < w as i32 && right > x as i32 {
-                        let idx = (y * w + right as usize) * 4;
-                        for c in 0..4 { sum[c] += data[idx + c]; }
-                    }
-
-                    // Compute count (pixels in window)
-                    let count = (right.min(w as i32 - 1) - left.max(0) + 1) as f32;
-
-                    let idx = (y * w + x) * 4;
-                    for c in 0..4 {
-                        next[idx + c] = sum[c] / count;
-                    }
-
-                    // Remove left pixel
-                    if left >= 0 {
-                        let idx = (y * w + left as usize) * 4;
-                        for c in 0..4 { sum[c] -= data[idx + c]; }
-                    }
-
-                    left += 1;
-                    right += 1;
-                }
-            }
-            data = next;
-        }
-
-        // Vertical pass with sliding window
-        if box_radius_y > 0 {
-            let mut next = vec![0.0f32; h * w * 4];
-            for x in 0..w {
-                let mut sum = [0.0f32; 4];
-                // Initialize window
-                for i in 0..box_radius_y.min(h) + 1 {
-                    let idx = (i * w + x) * 4;
-                    for c in 0..4 { sum[c] += data[idx + c]; }
-                }
-                let mut top = 0i32 - box_radius_y as i32;
-                let mut bottom = box_radius_y as i32;
-
-                for y in 0..h {
-                    // Add bottom pixel
-                    if bottom < h as i32 && bottom > y as i32 {
-                        let idx = (bottom as usize * w + x) * 4;
-                        for c in 0..4 { sum[c] += data[idx + c]; }
-                    }
-
-                    // Compute count
-                    let count = (bottom.min(h as i32 - 1) - top.max(0) + 1) as f32;
-
-                    let idx = (y * w + x) * 4;
-                    for c in 0..4 {
-                        next[idx + c] = sum[c] / count;
-                    }
-
-                    // Remove top pixel
-                    if top >= 0 {
-                        let idx = (top as usize * w + x) * 4;
-                        for c in 0..4 { sum[c] -= data[idx + c]; }
-                    }
-
-                    top += 1;
-                    bottom += 1;
-                }
-            }
-            data = next;
+    if box_radius_x > 0 || box_radius_y > 0 {
+        for _ in 0..3 {
+            box_blur_integral(current, next, w, h, box_radius_x, box_radius_y);
+            std::mem::swap(&mut current, &mut next);
         }
     }
 
@@ -3134,12 +3332,13 @@ fn fe_gaussian_blur<'py>(
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) * 4;
-            let a = data[idx + 3];
+            let a = current[idx + 3];
 
             if a > 0.0 {
-                dst[[y, x, 0]] = (data[idx] * 255.0 / a).clamp(0.0, 255.0) as u8;
-                dst[[y, x, 1]] = (data[idx + 1] * 255.0 / a).clamp(0.0, 255.0) as u8;
-                dst[[y, x, 2]] = (data[idx + 2] * 255.0 / a).clamp(0.0, 255.0) as u8;
+                let inv_a = 255.0 / a;
+                dst[[y, x, 0]] = (current[idx] * inv_a).clamp(0.0, 255.0) as u8;
+                dst[[y, x, 1]] = (current[idx + 1] * inv_a).clamp(0.0, 255.0) as u8;
+                dst[[y, x, 2]] = (current[idx + 2] * inv_a).clamp(0.0, 255.0) as u8;
                 dst[[y, x, 3]] = a.clamp(0.0, 255.0) as u8;
             }
         }
