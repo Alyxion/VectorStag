@@ -3239,6 +3239,33 @@ class SVGRenderer:
 
         return Image.fromarray(mask, "L")
 
+    def _resolve_gradient_stops(self, ctx: "RenderContext",
+                                gradient: Union[LinearGradient, RadialGradient],
+                                visited: set = None) -> list:
+        """Resolve gradient stops by following href chain.
+
+        Per SVG spec, gradients can inherit stops from referenced gradients
+        via xlink:href. This method follows the chain to find the stops.
+        """
+        if visited is None:
+            visited = set()
+
+        # Prevent infinite loops
+        if gradient.id in visited:
+            return []
+        visited.add(gradient.id)
+
+        # If this gradient has stops, return them
+        if gradient.stops:
+            return gradient.stops
+
+        # Otherwise, follow the href chain
+        if gradient.href and gradient.href in ctx.gradients:
+            ref_gradient = ctx.gradients[gradient.href]
+            return self._resolve_gradient_stops(ctx, ref_gradient, visited)
+
+        return []
+
     def _create_linear_gradient_image(self, ctx: "RenderContext",
                                       gradient: LinearGradient,
                                       width: int, height: int,
@@ -3247,8 +3274,11 @@ class SVGRenderer:
                                       opacity: float,
                                       element_transform: Transform = None) -> Image.Image:
         """Create an image filled with a linear gradient (memory-optimized)."""
-        # Check for invalid gradient (invalid gradientUnits)
-        if gradient.units == "invalid" or not gradient.stops:
+        # Resolve stops from href chain if needed
+        stops = self._resolve_gradient_stops(ctx, gradient)
+
+        # Check for invalid gradient (invalid gradientUnits or no stops)
+        if gradient.units == "invalid" or not stops:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
         # Get gradient vector in gradient space
@@ -3298,8 +3328,8 @@ class SVGRenderer:
 
         # Use Rust implementation if available (much faster)
         if HAS_RUST:
-            offsets = [float(s.offset) for s in gradient.stops]
-            colors = [tuple(s.color) for s in gradient.stops]
+            offsets = [float(s.offset) for s in stops]
+            colors = [tuple(s.color) for s in stops]
             pixels = vectorstag_rust.create_linear_gradient_image(
                 width, height, offset_x, offset_y,
                 float(x1), float(y1), float(dx), float(dy), float(length),
@@ -3326,7 +3356,7 @@ class SVGRenderer:
         else:
             np.clip(t, 0, 1, out=t)
 
-        pixels = self._interpolate_gradient_colors_vectorized(gradient.stops, t, opacity)
+        pixels = self._interpolate_gradient_colors_vectorized(stops, t, opacity)
         return Image.fromarray(pixels, "RGBA")
 
     def _create_radial_gradient_image(self, ctx: "RenderContext",
@@ -3337,8 +3367,11 @@ class SVGRenderer:
                                       opacity: float,
                                       element_transform: Transform = None) -> Image.Image:
         """Create an image filled with a radial gradient (memory-optimized)."""
-        # Check for invalid gradient (invalid gradientUnits)
-        if gradient.units == "invalid" or not gradient.stops:
+        # Resolve stops from href chain if needed
+        stops = self._resolve_gradient_stops(ctx, gradient)
+
+        # Check for invalid gradient (invalid gradientUnits or no stops)
+        if gradient.units == "invalid" or not stops:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
         # Get gradient parameters in gradient space
@@ -3389,8 +3422,8 @@ class SVGRenderer:
 
         # Use Rust implementation if available (much faster)
         if HAS_RUST:
-            offsets = [float(s.offset) for s in gradient.stops]
-            colors = [tuple(s.color) for s in gradient.stops]
+            offsets = [float(s.offset) for s in stops]
+            colors = [tuple(s.color) for s in stops]
             pixels = vectorstag_rust.create_radial_gradient_image(
                 width, height, offset_x, offset_y,
                 float(cx), float(cy), float(r),
@@ -3426,7 +3459,7 @@ class SVGRenderer:
         else:
             np.clip(t, 0, 1, out=t)
 
-        pixels = self._interpolate_gradient_colors_vectorized(gradient.stops, t, opacity)
+        pixels = self._interpolate_gradient_colors_vectorized(stops, t, opacity)
         return Image.fromarray(pixels, "RGBA")
 
     def _interpolate_gradient_colors_vectorized(self, stops: list[GradientStop],

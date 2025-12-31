@@ -1931,8 +1931,14 @@ class SVGParser:
         # Parse filter reference
         if "filter" in style_dict:
             filter_val = style_dict["filter"]
-            if filter_val.startswith("url(#") and filter_val.endswith(")"):
-                style.filter_id = filter_val[5:-1]
+            # Handle single url(#id) or multiple urls (SVG 2)
+            # For multiple urls like "url(#f1) url(#f2)", use the first one
+            if "url(#" in filter_val:
+                # Extract first url reference
+                import re
+                match = re.search(r'url\(#([^)]+)\)', filter_val)
+                if match:
+                    style.filter_id = match.group(1)
 
         return style
 
@@ -2131,11 +2137,23 @@ class SVGParser:
         Args:
             length_str: The length string (e.g., "100", "50%", "10px")
             ref_dim: Reference dimension for percentage values (e.g., viewBox width/height)
+
+        Note: For space-separated lists (e.g., "100 120"), returns the first value.
+              This handles SVG text coordinate lists where each value applies to a character.
         """
         if not length_str:
             return 0
 
         length_str = length_str.strip()
+
+        # Handle space-separated lists (common in text x/y coordinates)
+        # Take the first value as the starting position
+        if ' ' in length_str or '\t' in length_str or ',' in length_str:
+            parts = length_str.replace(',', ' ').split()
+            if parts:
+                length_str = parts[0]
+            else:
+                return 0
 
         # Handle percentages
         if length_str.endswith("%"):
