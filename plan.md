@@ -3,36 +3,36 @@
 ## Project Goal
 Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG and resvg.
 
-**Target**: 99.9% accuracy on resvg-test-suite (currently 94.3%)
+**Target**: 99.9% accuracy on resvg-test-suite (currently 94.85%)
 
-## Current Status: 94.3% resvg-test-suite / 100% FontAwesome / 99.9% Emoji / 99.9% Flag Accuracy
+## Current Status: 94.85% resvg-test-suite / 100% FontAwesome / 99.9% Emoji / 99.9% Flag Accuracy
 
 **Date**: 2025-12-31
 
 ### Priority Issues to Reach 99.9%
-1. **feSpecularLighting** (70.4%) - Complex lighting calculations need improvement
-2. **feImage** (80.3%) - Embedded SVG images not supported
-3. **feConvolveMatrix** (80.6%) - Pattern support needed
-4. **structure/image** (~81%) - External/embedded image handling
-5. **Filter subregion calculations** - Incomplete implementation
-6. **Text rendering differences** - Font metrics/positioning
+1. **Pattern fills** - Required for feConvolveMatrix tests
+2. **Embedded/External SVG images** - image element with SVG content
+3. **textPath** - Text along path rendering
+4. **Multiple filter URLs (SVG 2)** - Chaining filters
+5. **CSS shape functions** - circle(), ellipse() in clipPath
 
-### resvg-test-suite Results (1,295 tests)
-- **Average Accuracy**: 94.3%
-- **99%+ Accuracy**: 51.9% (672 tests)
-- **95-99%**: 20.8% (270 tests)
-- **90-95%**: 9.4% (121 tests)
-- **80-90%**: 9.0% (117 tests)
-- **<80%**: 8.9% (115 tests)
-- **Errors**: 4 (0.3%)
+### resvg-test-suite Results (1,679 tests)
+- **Average Accuracy**: 94.85%
+- **99%+ Accuracy**: 45.8% (766 tests)
+- **95-99%**: 31.0% (519 tests)
+- **90-95%**: 9.1% (152 tests)
+- **80-90%**: 7.3% (123 tests)
+- **<80%**: 6.8% (114 tests)
+- **Errors**: 5 (0.3%)
 
 | Category | Accuracy | Tests |
 |----------|----------|-------|
+| text | 96.6% | 356 |
 | shapes | 96.7% | 133 |
 | painting | 95.9% | 144 |
 | paint-servers | 94.5% | 149 |
-| masking | 93.3% | 91 |
-| filters | 93.1% | 396 |
+| filters | 94.1% | 396 |
+| masking | 93.8% | 91 |
 | structure | 92.2% | 238 |
 
 ### Performance vs Reference Renderers
@@ -160,6 +160,16 @@ Implemented comprehensive SVG filter support with all filter primitives in Rust 
 14. **Rust alpha compositing** - All alpha compositing uses `alpha_composite_inplace` for numpy arrays
 15. **Stroke polygon fast path** - Open/closed strokes use fast Rust polygon fill instead of PIL ImageDraw
 16. **Gradient numpy passthrough** - Gradient functions return numpy arrays directly, avoiding PIL roundtrip
+
+### resvg-test-suite Improvements (2025-12-31)
+1. **feSpecularLighting specularExponent validation** - Out-of-range values (< 1 or > 128) now produce transparent output per SVG spec
+2. **feColorMatrix saturate validation** - Saturate values outside [0, 1] produce transparent output
+3. **feColorMatrix matrix value validation** - Invalid matrix (not exactly 20 values) passes through source
+4. **feMorphology huge-radius handling** - Erode with radius >= image dimension produces transparent output
+5. **Filter primitive subregion** - Proper masking of filter output to subregion bounds
+6. **Invalid filter reference** - Elements with invalid filter references (non-existent filters) are not rendered
+7. **Empty feMerge** - feMerge with no nodes produces transparent output
+8. **Invalid gradientUnits** - Gradients with invalid gradientUnits values produce transparent fill
 
 ### resvg-test-suite Improvements (2025-12-30)
 1. **`<mask>` element** - Implemented SVG masking with luminance-based alpha (mask elements render content, convert to luminance, apply as alpha mask)

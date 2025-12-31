@@ -230,9 +230,11 @@ class SVGRenderer:
             self._render_element_with_mask(ctx, element, depth)
             return
 
-        # Apply Gaussian blur filter if present
-        if element.style.filter_id and element.style.filter_id in ctx.filters:
-            self._render_element_with_filter(ctx, element, depth)
+        # Apply filter if present
+        if element.style.filter_id:
+            if element.style.filter_id in ctx.filters:
+                self._render_element_with_filter(ctx, element, depth)
+            # If filter reference is invalid (doesn't exist), element is not rendered
             return
 
         if isinstance(element, GroupElement):
@@ -510,10 +512,45 @@ class SVGRenderer:
         result[:, :, 3] = src[:, :, 3]
         return result
 
+    def _apply_subregion(self, result: np.ndarray, prim: FilterPrimitive,
+                          elem_bbox: tuple, scale: float) -> np.ndarray:
+        """Apply primitive subregion - pixels outside are transparent."""
+        # If no subregion is specified, return as-is
+        if prim.x is None and prim.y is None and prim.width is None and prim.height is None:
+            return result
+
+        h, w = result.shape[:2]
+        # Default subregion to full filter region
+        x = prim.x if prim.x is not None else 0
+        y = prim.y if prim.y is not None else 0
+        sr_w = prim.width if prim.width is not None else w / scale
+        sr_h = prim.height if prim.height is not None else h / scale
+
+        # Convert to pixel coordinates (subregion is in element space)
+        # For objectBoundingBox units, coordinates are relative to element bbox
+        x1 = int(x * scale)
+        y1 = int(y * scale)
+        x2 = int((x + sr_w) * scale)
+        y2 = int((y + sr_h) * scale)
+
+        # Clamp to buffer bounds
+        x1 = max(0, min(w, x1))
+        y1 = max(0, min(h, y1))
+        x2 = max(0, min(w, x2))
+        y2 = max(0, min(h, y2))
+
+        # Create output with only the subregion visible
+        output = np.zeros_like(result)
+        if x2 > x1 and y2 > y1:
+            output[y1:y2, x1:x2] = result[y1:y2, x1:x2]
+        return output
+
     def _execute_filter_primitive(self, prim: FilterPrimitive, in1: np.ndarray,
                                     in2: Optional[np.ndarray], width: int, height: int,
-                                    scale: float, render_ctx: "RenderContext" = None) -> np.ndarray:
+                                    scale: float, render_ctx: "RenderContext" = None,
+                                    elem_bbox: tuple = None) -> np.ndarray:
         """Execute a single filter primitive."""
+        result = None
         if isinstance(prim, FeGaussianBlur):
             std_x = prim.std_deviation_x * scale
             std_y = prim.std_deviation_y * scale
@@ -578,6 +615,15 @@ class SVGRenderer:
         elif isinstance(prim, FeColorMatrix):
             type_map = {"matrix": 0, "saturate": 1, "hueRotate": 2, "luminanceToAlpha": 3}
             mt = type_map.get(prim.type, 0)
+            # Validate saturate value - must be in [0, 1] range
+            # Out of range values are undefined behavior, resvg returns transparent
+            if prim.type == "saturate" and prim.values:
+                sat_val = prim.values[0]
+                if sat_val < 0.0 or sat_val > 1.0:
+                    return np.zeros_like(in1)
+            # For matrix type with invalid values (empty or wrong count), pass through source
+            if prim.type == "matrix" and len(prim.values) != 20:
+                return in1  # Pass through source for invalid matrix
             if HAS_RUST:
                 return vectorstag_rust.fe_color_matrix(in1, mt, prim.values)
             return in1
@@ -596,6 +642,11 @@ class SVGRenderer:
         elif isinstance(prim, FeMorphology):
             rx = prim.radius_x * scale
             ry = prim.radius_y * scale
+            h, w = in1.shape[:2]
+            # For erode with huge radius (>= image dimension), result is transparent
+            # because the kernel extends into transparent padding
+            if prim.operator == "erode" and (rx >= w or ry >= h):
+                return np.zeros_like(in1)
             op = 0 if prim.operator == "erode" else 1
             if HAS_RUST:
                 return vectorstag_rust.fe_morphology(in1, op, rx, ry)
@@ -671,6 +722,10 @@ class SVGRenderer:
 
         elif isinstance(prim, FeSpecularLighting):
             if HAS_RUST:
+                # specularExponent must be in [1, 128] range per SVG spec
+                # Values outside this range produce no output (transparent)
+                if prim.specular_exponent < 1.0 or prim.specular_exponent > 128.0:
+                    return np.zeros_like(in1)
                 light = prim.light_source
                 if light is None:
                     # No light source = no lighting effect (transparent output)
@@ -818,7 +873,10 @@ class SVGRenderer:
 
             if isinstance(prim, FeMerge):
                 # Handle merge specially - collect all node inputs
-                if HAS_RUST and prim.nodes:
+                # Empty feMerge produces transparent output
+                if not prim.nodes:
+                    result = np.zeros_like(source_graphic)
+                elif HAS_RUST:
                     layers = []
                     for node in prim.nodes:
                         node_in = buffers.get(node.input1, last_result)
@@ -826,7 +884,7 @@ class SVGRenderer:
                     if layers:
                         result = vectorstag_rust.fe_merge(layers)
                     else:
-                        result = in1
+                        result = np.zeros_like(source_graphic)
                 else:
                     result = in1
             else:
@@ -941,8 +999,19 @@ class SVGRenderer:
                 return full_noise
             return np.random.randint(0, 256, (height, width, 4), dtype=np.uint8)
 
-        # For other primitives, use the standard execution
-        return self._execute_filter_primitive(prim, in1, in2, width, height, scale, render_ctx)
+        # For other primitives, execute normally then apply subregion mask
+        result = self._execute_filter_primitive(prim, in1, in2, width, height, scale, render_ctx)
+
+        # Apply subregion mask - only show output within the subregion
+        log_x, log_y, log_w, log_h, clip_x, clip_y, clip_w, clip_h = subregion
+        has_subregion = (prim.x is not None or prim.y is not None or
+                         prim.width is not None or prim.height is not None)
+        if has_subregion and (clip_w < width or clip_h < height or clip_x > 0 or clip_y > 0):
+            masked = np.zeros_like(result)
+            if clip_w > 0 and clip_h > 0:
+                masked[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w] = result[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w]
+            return masked
+        return result
 
     def _get_element_bbox(self, element: SVGElement, transform: Transform) -> Optional[tuple]:
         """Get element bounding box in screen coordinates."""
@@ -3178,7 +3247,8 @@ class SVGRenderer:
                                       opacity: float,
                                       element_transform: Transform = None) -> Image.Image:
         """Create an image filled with a linear gradient (memory-optimized)."""
-        if not gradient.stops:
+        # Check for invalid gradient (invalid gradientUnits)
+        if gradient.units == "invalid" or not gradient.stops:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
         # Get gradient vector in gradient space
@@ -3267,7 +3337,8 @@ class SVGRenderer:
                                       opacity: float,
                                       element_transform: Transform = None) -> Image.Image:
         """Create an image filled with a radial gradient (memory-optimized)."""
-        if not gradient.stops:
+        # Check for invalid gradient (invalid gradientUnits)
+        if gradient.units == "invalid" or not gradient.stops:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
 
         # Get gradient parameters in gradient space

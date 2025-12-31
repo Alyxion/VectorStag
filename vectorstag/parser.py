@@ -1298,10 +1298,12 @@ class SVGParser:
         if href and href.startswith("#"):
             href = href[1:]
 
-        # Validate gradientUnits - fall back to default for invalid values
-        units = elem.get("gradientUnits", "objectBoundingBox")
-        if units not in ("objectBoundingBox", "userSpaceOnUse"):
-            units = "objectBoundingBox"
+        # Validate gradientUnits - mark as invalid if not valid value
+        units_raw = elem.get("gradientUnits")
+        if units_raw is not None and units_raw not in ("objectBoundingBox", "userSpaceOnUse"):
+            units = "invalid"  # Mark as invalid - renderer should not use this gradient
+        else:
+            units = units_raw or "objectBoundingBox"
 
         # Parse spreadMethod - default is "pad"
         spread_method = elem.get("spreadMethod", "pad")
@@ -1339,10 +1341,12 @@ class SVGParser:
         if href and href.startswith("#"):
             href = href[1:]
 
-        # Validate gradientUnits - fall back to default for invalid values
-        units = elem.get("gradientUnits", "objectBoundingBox")
-        if units not in ("objectBoundingBox", "userSpaceOnUse"):
-            units = "objectBoundingBox"
+        # Validate gradientUnits - mark as invalid if not valid value
+        units_raw = elem.get("gradientUnits")
+        if units_raw is not None and units_raw not in ("objectBoundingBox", "userSpaceOnUse"):
+            units = "invalid"  # Mark as invalid - renderer should not use this gradient
+        else:
+            units = units_raw or "objectBoundingBox"
 
         # Parse spreadMethod - default is "pad"
         spread_method = elem.get("spreadMethod", "pad")
