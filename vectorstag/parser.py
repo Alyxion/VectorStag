@@ -254,6 +254,10 @@ class TextElement(SVGElement):
     font_family: str = "Arial"
     font_size: float = 16
     text_anchor: str = "start"  # start, middle, end
+    # textPath support
+    text_path_href: str = None  # Reference to path element for textPath
+    text_path_start_offset: float = 0  # Starting offset along path (0-1 for percentage)
+    text_path_data: str = None  # Direct path data (SVG 2 path attribute)
 
 
 @dataclass
@@ -525,6 +529,7 @@ class SVGDocument:
     masks: dict[str, Mask] = field(default_factory=dict)
     filters: dict[str, Filter] = field(default_factory=dict)
     elements_by_id: dict[str, SVGElement] = field(default_factory=dict)  # For feImage references
+    path_data_by_id: dict[str, str] = field(default_factory=dict)  # For textPath references
     preserve_aspect_ratio: str = "xMidYMid"  # SVG default
 
 
@@ -757,7 +762,10 @@ class SVGParser:
         self.css_ids = {}  # ID selector CSS rules
         self.css_types = {}  # Type selector CSS rules
         self.css_attr_selectors = {}  # Attribute selector CSS rules [attr] or [attr=value]
+        self.css_rules = []  # Complex CSS rules: (selector, properties, specificity, order)
+        self.css_rule_order = 0  # For stable ordering of rules with equal specificity
         self.elements_by_id = {}  # For feImage element references
+        self.path_data_by_id = {}  # For textPath references
 
         # Parse CSS from <style> blocks
         self._parse_css_styles(root)
@@ -812,6 +820,7 @@ class SVGParser:
             masks=self.masks,
             filters=self.filters,
             elements_by_id=self.elements_by_id,
+            path_data_by_id=self.path_data_by_id,
             preserve_aspect_ratio=preserve_aspect_ratio
         )
 
@@ -845,11 +854,14 @@ class SVGParser:
         css_text = re.sub(r'/\*.*?\*/', '', css_text, flags=re.DOTALL)
 
         # Find all rule blocks: selector { properties }
-        # Match class (.name), ID (#name), type (name), or attribute [attr] selectors
-        pattern = r'(\[[^\]]+\]|[.#]?[a-zA-Z_][a-zA-Z0-9_-]*)\s*\{([^}]*)\}'
+        # Handle complex selectors including descendant combinators
+        pattern = r'([^{]+)\{([^}]*)\}'
         for match in re.finditer(pattern, css_text):
-            selector = match.group(1)
+            selector = match.group(1).strip()
             properties_str = match.group(2)
+
+            if not selector:
+                continue
 
             # Parse properties
             properties = {}
@@ -859,17 +871,141 @@ class SVGParser:
                     key, value = prop.split(':', 1)
                     properties[key.strip()] = value.strip()
 
-            # Store by selector type
-            if selector.startswith('[') and selector.endswith(']'):
-                # Attribute selector: [attr] or [attr=value] or [attr~=value] etc.
-                attr_content = selector[1:-1]
-                self.css_attr_selectors[attr_content] = properties
-            elif selector.startswith('.'):
-                self.css_classes[selector[1:]] = properties
-            elif selector.startswith('#'):
-                self.css_ids[selector[1:]] = properties
+            if not properties:
+                continue
+
+            # Calculate specificity: (ids, classes+attrs, elements)
+            specificity = self._calculate_specificity(selector)
+
+            # Store rule with specificity and order
+            self.css_rules.append((selector, properties, specificity, self.css_rule_order))
+            self.css_rule_order += 1
+
+            # Also store simple selectors for fast lookup
+            if ' ' not in selector and '>' not in selector and '+' not in selector and '~' not in selector:
+                # Simple selector
+                if selector.startswith('[') and selector.endswith(']'):
+                    attr_content = selector[1:-1]
+                    self.css_attr_selectors[attr_content] = properties
+                elif selector.startswith('.'):
+                    self.css_classes[selector[1:]] = properties
+                elif selector.startswith('#'):
+                    self.css_ids[selector[1:]] = properties
+                elif selector.isalpha() or selector == '*':
+                    self.css_types[selector] = properties
+
+    def _calculate_specificity(self, selector: str) -> tuple:
+        """Calculate CSS specificity as (ids, classes+attrs, elements)."""
+        # Split selector into parts
+        parts = selector.replace('>', ' ').replace('+', ' ').replace('~', ' ').split()
+
+        ids = 0
+        classes_attrs = 0
+        elements = 0
+
+        for part in parts:
+            # Count IDs (#name)
+            ids += part.count('#')
+            # Count classes (.name)
+            classes_attrs += part.count('.')
+            # Count attribute selectors [...]
+            classes_attrs += part.count('[')
+            # Count element types (letters only, excluding *)
+            # Remove #id, .class, [attr] parts
+            clean = re.sub(r'#[a-zA-Z0-9_-]+', '', part)
+            clean = re.sub(r'\.[a-zA-Z0-9_-]+', '', clean)
+            clean = re.sub(r'\[[^\]]+\]', '', clean)
+            if clean and clean != '*' and clean[0].isalpha():
+                elements += 1
+
+        return (ids, classes_attrs, elements)
+
+    def _selector_matches(self, selector: str, elem: ET.Element, ancestors: list) -> bool:
+        """Check if a CSS selector matches an element."""
+        # Split selector into parts (descendant combinator)
+        parts = selector.split()
+        if not parts:
+            return False
+
+        # The last part must match the current element
+        if not self._simple_selector_matches(parts[-1], elem):
+            return False
+
+        if len(parts) == 1:
+            return True
+
+        # Check ancestor chain for remaining parts (right to left)
+        remaining_parts = parts[:-1]
+        ancestor_idx = 0
+
+        for part in reversed(remaining_parts):
+            matched = False
+            while ancestor_idx < len(ancestors):
+                if self._simple_selector_matches(part, ancestors[ancestor_idx]):
+                    matched = True
+                    ancestor_idx += 1
+                    break
+                ancestor_idx += 1
+
+            if not matched:
+                return False
+
+        return True
+
+    def _simple_selector_matches(self, selector: str, elem: ET.Element) -> bool:
+        """Check if a simple selector (no combinators) matches an element."""
+        if selector == '*':
+            return True
+
+        tag = self._strip_ns(elem.tag)
+        elem_id = elem.get('id', '')
+        elem_classes = elem.get('class', '').split()
+
+        # Parse selector parts
+        # e.g., "g#id.class" -> tag=g, id=id, class=class
+        remaining = selector
+
+        # Extract ID
+        id_match = re.search(r'#([a-zA-Z0-9_-]+)', remaining)
+        required_id = id_match.group(1) if id_match else None
+        remaining = re.sub(r'#[a-zA-Z0-9_-]+', '', remaining)
+
+        # Extract classes
+        required_classes = re.findall(r'\.([a-zA-Z0-9_-]+)', remaining)
+        remaining = re.sub(r'\.[a-zA-Z0-9_-]+', '', remaining)
+
+        # Extract attribute selectors
+        required_attrs = re.findall(r'\[([^\]]+)\]', remaining)
+        remaining = re.sub(r'\[[^\]]+\]', '', remaining)
+
+        # Remaining should be the tag name
+        required_tag = remaining.strip() if remaining.strip() else None
+
+        # Check tag
+        if required_tag and required_tag != '*' and required_tag != tag:
+            return False
+
+        # Check ID
+        if required_id and required_id != elem_id:
+            return False
+
+        # Check classes
+        for req_class in required_classes:
+            if req_class not in elem_classes:
+                return False
+
+        # Check attributes
+        for attr_sel in required_attrs:
+            if '=' in attr_sel:
+                attr_name, attr_val = attr_sel.split('=', 1)
+                attr_val = attr_val.strip('"\'')
+                if elem.get(attr_name) != attr_val:
+                    return False
             else:
-                self.css_types[selector] = properties
+                if elem.get(attr_sel) is None:
+                    return False
+
+        return True
 
     def _get_css_transform(self, elem: ET.Element) -> Optional[str]:
         """Get CSS transform property for an element.
@@ -924,6 +1060,11 @@ class SVGParser:
                     parsed = self._parse_element(elem, Transform.identity(), Style(), depth=1)
                     if parsed:
                         self.elements_by_id[elem_id] = parsed
+                # Store path data for textPath references
+                if tag == "path":
+                    d = elem.get("d", "")
+                    if d:
+                        self.path_data_by_id[elem_id] = d
 
             if tag == "linearGradient":
                 self._parse_linear_gradient(elem)
@@ -1583,9 +1724,15 @@ class SVGParser:
     def _parse_children(self, parent: ET.Element, parent_transform: Transform,
                         parent_style: Style, parent_text_anchor: str = "start",
                         parent_font_family: str = "Arial", parent_font_size: float = 16,
-                        depth: int = 0) -> list[SVGElement]:
+                        depth: int = 0, ancestors: list = None) -> list[SVGElement]:
         """Parse child elements."""
+        if ancestors is None:
+            ancestors = []
+
         elements = []
+        # Children will have parent as their closest ancestor
+        # ancestors is already in closest-first order
+        child_ancestors = [parent] + list(ancestors)
 
         for child in parent:
             tag = self._strip_ns(child.tag)
@@ -1598,7 +1745,8 @@ class SVGParser:
                 continue
 
             elem = self._parse_element(child, parent_transform, parent_style, parent_text_anchor,
-                                       parent_font_family, parent_font_size, depth=depth)
+                                       parent_font_family, parent_font_size, depth=depth,
+                                       ancestors=child_ancestors)
             if elem:
                 elements.append(elem)
 
@@ -1607,16 +1755,19 @@ class SVGParser:
     def _parse_element(self, elem: ET.Element, parent_transform: Transform,
                        parent_style: Style, parent_text_anchor: str = "start",
                        parent_font_family: str = "Arial", parent_font_size: float = 16,
-                       depth: int = 0) -> Optional[SVGElement]:
+                       depth: int = 0, ancestors: list = None) -> Optional[SVGElement]:
         """Parse a single SVG element."""
         # Prevent infinite recursion
         if depth > self.MAX_PARSE_DEPTH:
             return None
 
+        if ancestors is None:
+            ancestors = []
+
         tag = self._strip_ns(elem.tag)
 
-        # Parse style (inheriting from parent)
-        style = self._parse_style(elem, parent_style)
+        # Parse style (inheriting from parent, using ancestors for CSS matching)
+        style = self._parse_style(elem, parent_style, ancestors)
 
         # Extract text properties from this element (for inheritance to children)
         text_anchor = parent_text_anchor
@@ -1689,20 +1840,31 @@ class SVGParser:
             result = self._parse_polygon(elem, style, transform)
         elif tag == "path":
             result = self._parse_path(elem, style, transform)
+            # Store path data by ID for textPath references
+            path_id = elem.get("id")
+            if path_id:
+                d = elem.get("d", "")
+                if d:
+                    self.path_data_by_id[path_id] = d
         elif tag == "g" or tag == "a":
             # Both g (group) and a (anchor) elements render children as a group
-            result = self._parse_group(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
+            # Children will have this element as their closest ancestor
+            child_ancestors = [elem] + list(ancestors)
+            result = self._parse_group(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1, child_ancestors)
         elif tag == "symbol":
             # Symbol is like a group but may have viewBox
-            result = self._parse_symbol(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
+            child_ancestors = [elem] + list(ancestors)
+            result = self._parse_symbol(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1, child_ancestors)
         elif tag == "switch":
-            result = self._parse_switch(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
+            child_ancestors = [elem] + list(ancestors)
+            result = self._parse_switch(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1, child_ancestors)
         elif tag == "text":
             result = self._parse_text(elem, style, transform, text_anchor, font_family, font_size)
         elif tag == "use":
             result = self._parse_use(elem, style, transform, parent_style, depth + 1)
         elif tag == "svg":
-            result = self._parse_nested_svg(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1)
+            child_ancestors = [elem] + list(ancestors)
+            result = self._parse_nested_svg(elem, style, transform, parent_style, text_anchor, font_family, font_size, depth + 1, child_ancestors)
         elif tag == "image":
             result = self._parse_image(elem, style, transform)
 
@@ -1734,8 +1896,17 @@ class SVGParser:
             return ref
         return None
 
-    def _parse_style(self, elem: ET.Element, parent_style: Style) -> Style:
-        """Parse style from element attributes and style attribute."""
+    def _parse_style(self, elem: ET.Element, parent_style: Style, ancestors: list = None) -> Style:
+        """Parse style from element attributes and style attribute.
+
+        Args:
+            elem: The element to parse style for
+            parent_style: Parent element's style for inheritance
+            ancestors: List of ancestor elements (closest first) for CSS matching
+        """
+        if ancestors is None:
+            ancestors = []
+
         # Start with parent style (inheritance)
         # If parent has fill specified (including None for "none"), inherit it
         # Otherwise use the default black fill
@@ -1759,13 +1930,10 @@ class SVGParser:
             visibility=parent_style.visibility
         )
 
-        # SVG style cascade order (lowest to highest priority):
-        # 1. Presentation attributes (like fill="red")
-        # 2. CSS type selectors (rect { ... })
-        # 3. CSS attribute selectors ([x] { ... })
-        # 4. CSS class selectors (.class { ... })
-        # 5. CSS ID selectors (#id { ... })
-        # 6. Style attribute (style="...")
+        # SVG style cascade order:
+        # 1. Presentation attributes (lowest priority)
+        # 2. CSS rules in specificity order
+        # 3. Style attribute (highest priority)
 
         style_dict = {}
 
@@ -1778,9 +1946,21 @@ class SVGParser:
             if val:
                 style_dict[attr] = val
 
-        # Then: CSS type selectors
+        # Apply complex CSS rules sorted by specificity (lowest first, so higher overrides)
+        matching_rules = []
+        for selector, properties, specificity, order in self.css_rules:
+            if self._selector_matches(selector, elem, ancestors):
+                matching_rules.append((specificity, order, properties))
+
+        # Sort by specificity then order (both ascending, so later/more specific wins)
+        matching_rules.sort(key=lambda x: (x[0], x[1]))
+        for _, _, props in matching_rules:
+            style_dict.update(props)
+
+        # Legacy: Apply simple CSS selectors (for backward compatibility)
+        # These should already be included in css_rules, but keep for now
         tag_name = self._strip_ns(elem.tag)
-        if tag_name in self.css_types:
+        if tag_name in self.css_types and not self.css_rules:
             style_dict.update(self.css_types[tag_name])
 
         # Apply CSS attribute selectors
@@ -2348,35 +2528,39 @@ class SVGParser:
     def _parse_group(self, elem: ET.Element, style: Style, transform: Transform,
                      parent_style: Style, text_anchor: str = "start",
                      font_family: str = "Arial", font_size: float = 16,
-                     depth: int = 0) -> GroupElement:
+                     depth: int = 0, ancestors: list = None) -> GroupElement:
         """Parse g (group) element."""
+        if ancestors is None:
+            ancestors = []
         group = GroupElement(
             tag="g",
             style=style,
             transform=transform,
-            children=self._parse_children(elem, transform, style, text_anchor, font_family, font_size, depth=depth)
+            children=self._parse_children(elem, transform, style, text_anchor, font_family, font_size, depth=depth, ancestors=ancestors)
         )
         return group
 
     def _parse_symbol(self, elem: ET.Element, style: Style, transform: Transform,
                       parent_style: Style, text_anchor: str = "start",
                       font_family: str = "Arial", font_size: float = 16,
-                      depth: int = 0) -> GroupElement:
+                      depth: int = 0, ancestors: list = None) -> GroupElement:
         """Parse symbol element - similar to group but may have viewBox."""
+        if ancestors is None:
+            ancestors = []
         # Symbol is like a group, but it can have its own viewBox
         # For now, treat it as a simple group
         group = GroupElement(
             tag="symbol",
             style=style,
             transform=transform,
-            children=self._parse_children(elem, transform, style, text_anchor, font_family, font_size, depth=depth)
+            children=self._parse_children(elem, transform, style, text_anchor, font_family, font_size, depth=depth, ancestors=ancestors)
         )
         return group
 
     def _parse_nested_svg(self, elem: ET.Element, style: Style, transform: Transform,
                           parent_style: Style, text_anchor: str = "start",
                           font_family: str = "Arial", font_size: float = 16,
-                          depth: int = 0) -> GroupElement:
+                          depth: int = 0, ancestors: list = None) -> GroupElement:
         """Parse nested svg element - treated as a group with its own coordinate system."""
         # Get parent viewport dimensions for percentage resolution
         parent_vb_width = getattr(self, 'viewbox_width', 100) or 100
@@ -2536,7 +2720,9 @@ class SVGParser:
         self.viewbox_height = nested_vb_height
 
         # Parse children with the nested transform
-        children = self._parse_children(elem, nested_transform, style, text_anchor, font_family, font_size, depth=depth)
+        if ancestors is None:
+            ancestors = []
+        children = self._parse_children(elem, nested_transform, style, text_anchor, font_family, font_size, depth=depth, ancestors=ancestors)
 
         # Restore parent viewport context
         self.viewbox_width = old_vb_width
@@ -2558,7 +2744,7 @@ class SVGParser:
     def _parse_switch(self, elem: ET.Element, style: Style, transform: Transform,
                       parent_style: Style, text_anchor: str = "start",
                       font_family: str = "Arial", font_size: float = 16,
-                      depth: int = 0) -> Optional[SVGElement]:
+                      depth: int = 0, ancestors: list = None) -> Optional[SVGElement]:
         """Parse switch element - returns first supported child."""
         # The switch element evaluates children in order and renders the first
         # one whose requiredExtensions/requiredFeatures are supported.
@@ -2575,7 +2761,9 @@ class SVGParser:
                 # We don't support any extensions
                 continue
             # This child is supported - parse and return it
-            result = self._parse_element(child, transform, style, text_anchor, font_family, font_size, depth=depth)
+            if ancestors is None:
+                ancestors = []
+            result = self._parse_element(child, transform, style, text_anchor, font_family, font_size, depth=depth, ancestors=ancestors)
             if result:
                 return result
         return None
@@ -2584,11 +2772,50 @@ class SVGParser:
                     parent_text_anchor: str = "start", parent_font_family: str = "Arial",
                     parent_font_size: float = 16) -> TextElement:
         """Parse text element."""
-        # Get text content
-        text = elem.text or ""
+        # Check for textPath child
+        text_path_href = None
+        text_path_start_offset = 0
+        text_path_data = None
+
         for child in elem:
-            if child.tail:
-                text += child.tail
+            child_tag = self._strip_ns(child.tag)
+            if child_tag == "textPath":
+                # Get href reference to path element
+                href = child.get(f"{self.XLINK_NS}href") or child.get("href")
+                if href and href.startswith("#"):
+                    text_path_href = href[1:]
+
+                # Get direct path data (SVG 2)
+                path_attr = child.get("path")
+                if path_attr:
+                    text_path_data = path_attr
+
+                # Get startOffset
+                start_offset = child.get("startOffset", "0")
+                if start_offset.endswith("%"):
+                    text_path_start_offset = float(start_offset[:-1]) / 100.0
+                else:
+                    text_path_start_offset = self._parse_length(start_offset)
+
+        # Get text content - from textPath child if present, otherwise from text element
+        text = ""
+        for child in elem:
+            child_tag = self._strip_ns(child.tag)
+            if child_tag == "textPath":
+                text = child.text or ""
+                # Also get text from tspan children within textPath
+                for subchild in child:
+                    if subchild.text:
+                        text += subchild.text
+                    if subchild.tail:
+                        text += subchild.tail
+                break
+        else:
+            # No textPath - get text directly
+            text = elem.text or ""
+            for child in elem:
+                if child.tail:
+                    text += child.tail
 
         # Font properties can come from element, style, or parent
         font_family = elem.get("font-family")
@@ -2640,7 +2867,10 @@ class SVGParser:
             text=text.strip(),
             font_family=font_family,
             font_size=font_size,
-            text_anchor=text_anchor
+            text_anchor=text_anchor,
+            text_path_href=text_path_href,
+            text_path_start_offset=text_path_start_offset,
+            text_path_data=text_path_data
         )
 
     def _parse_image(self, elem: ET.Element, style: Style, transform: Transform) -> ImageElement:

@@ -129,7 +129,7 @@ class SVGRenderer:
             image_arr = None
 
         # Create render context with numpy array as primary (if Rust available)
-        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.masks, doc.filters, doc.patterns, doc.elements_by_id)
+        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.masks, doc.filters, doc.patterns, doc.elements_by_id, doc.path_data_by_id)
         ctx.image_arr = image_arr
 
         # Render all elements
@@ -265,7 +265,7 @@ class SVGRenderer:
 
         # Create a temporary image for the element
         temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
-        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id)
+        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id, ctx.path_elements)
 
         # Temporarily remove clip path to render to temp image
         old_clip_path_id = element.clip_path_id
@@ -290,7 +290,7 @@ class SVGRenderer:
 
         # Create a temporary image for the element
         temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
-        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id)
+        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id, ctx.path_elements)
 
         # Temporarily remove mask to render to temp image
         old_mask_id = element.mask_id
@@ -337,7 +337,7 @@ class SVGRenderer:
             # userSpaceOnUse - use base transform
             mask_transform = ctx.base_transform
 
-        mask_ctx = RenderContext(mask_image, ctx.gradients, mask_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id)
+        mask_ctx = RenderContext(mask_image, ctx.gradients, mask_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id, ctx.path_elements)
 
         # Render mask elements
         for mask_elem in mask_def.elements:
@@ -412,12 +412,12 @@ class SVGRenderer:
             temp_image = Image.new("RGBA", (region_w, region_h), (0, 0, 0, 0))
             offset_transform = Transform(1, 0, 0, 1, -region_x, -region_y)
             adjusted_base = offset_transform.multiply(ctx.base_transform)
-            temp_ctx = RenderContext(temp_image, ctx.gradients, adjusted_base, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id)
+            temp_ctx = RenderContext(temp_image, ctx.gradients, adjusted_base, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id, ctx.path_elements)
         else:
             region_x, region_y = 0, 0
             region_w, region_h = ctx.image_width, ctx.image_height
             temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
-            temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id)
+            temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id, ctx.path_elements)
 
         # Render the element without filter to get SourceGraphic
         old_filter_id = element.style.filter_id
@@ -826,7 +826,8 @@ class SVGRenderer:
                         temp_ctx = RenderContext(temp_image, render_ctx.gradients,
                                                 render_ctx.base_transform, render_ctx.clip_paths,
                                                 render_ctx.masks, render_ctx.filters,
-                                                render_ctx.patterns, render_ctx.elements_by_id)
+                                                render_ctx.patterns, render_ctx.elements_by_id,
+                                                render_ctx.path_elements)
 
                         # Temporarily disable filter on the element to prevent recursion
                         old_filter_id = None
@@ -3098,7 +3099,8 @@ class SVGRenderer:
         # Create context without this pattern to prevent recursion
         safe_patterns = {k: v for k, v in ctx.patterns.items() if k != pattern.id}
         tile_ctx = RenderContext(tile_img, ctx.gradients, content_transform,
-                                 ctx.clip_paths, ctx.masks, ctx.filters, safe_patterns)
+                                 ctx.clip_paths, ctx.masks, ctx.filters, safe_patterns,
+                                 ctx.elements_by_id, ctx.path_elements)
 
         # Render pattern elements (with recursion limit)
         for elem in pattern.elements:
@@ -3720,7 +3722,6 @@ class SVGRenderer:
             return
 
         transform = ctx.base_transform.multiply(text.transform)
-        x, y = transform.apply(text.x, text.y)
 
         fill = self._get_fill_color(ctx, text.style)
         if not fill:
@@ -3729,6 +3730,13 @@ class SVGRenderer:
         # Calculate font size with transform scaling
         font_size = max(1, int(text.font_size * self._get_scale(ctx, text.transform)))
         font = self._get_font(text.font_family, font_size)
+
+        # Check for textPath
+        if text.text_path_href or text.text_path_data:
+            self._render_text_on_path(ctx, text, transform, fill, font)
+            return
+
+        x, y = transform.apply(text.x, text.y)
 
         # Map SVG text-anchor to PIL anchor
         # SVG: start=left, middle=center, end=right
@@ -3746,6 +3754,260 @@ class SVGRenderer:
         else:
             draw = ImageDraw.Draw(ctx.image, "RGBA")
             draw.text((x, y), text.text, fill=fill, font=font, anchor=anchor)
+
+    def _render_text_on_path(self, ctx: "RenderContext", text: TextElement,
+                             transform: Transform, fill: tuple, font):
+        """Render text along a path (textPath element)."""
+        import math
+
+        # Calculate font size with transform scaling
+        font_size = max(1, int(text.font_size * self._get_scale(ctx, text.transform)))
+
+        # Get path data - either from reference or direct attribute
+        path_data = text.text_path_data
+        if not path_data and text.text_path_href:
+            # Look up path element from document
+            if hasattr(ctx, 'path_elements') and text.text_path_href in ctx.path_elements:
+                path_data = ctx.path_elements[text.text_path_href]
+
+        if not path_data:
+            return
+
+        # Parse path and get points with cumulative distances
+        points = self._sample_path_points(path_data, transform)
+        if not points or len(points) < 2:
+            return
+
+        # Calculate total path length
+        total_length = points[-1][2]  # (x, y, cumulative_distance)
+        if total_length <= 0:
+            return
+
+        # Calculate starting offset
+        start_offset = text.text_path_start_offset
+        if start_offset < 1:  # Treat as percentage
+            start_offset = start_offset * total_length
+
+        # Create temp image for text rendering
+        temp = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(temp, "RGBA")
+
+        # Render each character along the path
+        current_dist = start_offset
+        for char in text.text:
+            if char.isspace():
+                # Get space width
+                try:
+                    char_width = font.getlength(" ")
+                except:
+                    char_width = font_size * 0.3
+                current_dist += char_width
+                continue
+
+            # Get character width
+            try:
+                char_width = font.getlength(char)
+            except:
+                char_width = font_size * 0.6
+
+            # Find position and angle at current distance (center of character)
+            char_center_dist = current_dist + char_width / 2
+            pos_angle = self._get_point_on_path(points, char_center_dist)
+            if pos_angle is None:
+                break
+
+            px, py, angle = pos_angle
+
+            # Create rotated character image
+            # Use "ms" anchor: middle horizontally, baseline vertically (baseline on path)
+            char_img = Image.new("RGBA", (int(char_width * 2) + 10, int(font_size * 2) + 10), (0, 0, 0, 0))
+            char_draw = ImageDraw.Draw(char_img, "RGBA")
+            char_draw.text((char_img.width // 2, char_img.height // 2), char, fill=fill, font=font, anchor="ms")
+
+            # Rotate character
+            rotated = char_img.rotate(-math.degrees(angle), expand=True, resample=Image.BICUBIC)
+
+            # Calculate paste position (centered on path point)
+            paste_x = int(px - rotated.width // 2)
+            paste_y = int(py - rotated.height // 2)
+
+            # Composite onto temp image
+            temp.paste(rotated, (paste_x, paste_y), rotated)
+
+            current_dist += char_width
+
+        self._alpha_composite(ctx, temp, 0, 0)
+
+    def _sample_path_points(self, path_data: str, transform: Transform, num_samples: int = 500) -> list:
+        """Sample points along a path with cumulative distances."""
+        import math
+
+        # Parse path commands
+        commands = self._parse_path_commands(path_data)
+        if not commands:
+            return []
+
+        points = []
+        current_x, current_y = 0, 0
+        start_x, start_y = 0, 0
+        cumulative_dist = 0
+
+        for cmd, args in commands:
+            if cmd == 'M':
+                current_x, current_y = args[0], args[1]
+                start_x, start_y = current_x, current_y
+                tx, ty = transform.apply(current_x, current_y)
+                points.append((tx, ty, cumulative_dist))
+            elif cmd == 'm':
+                current_x += args[0]
+                current_y += args[1]
+                start_x, start_y = current_x, current_y
+                tx, ty = transform.apply(current_x, current_y)
+                points.append((tx, ty, cumulative_dist))
+            elif cmd == 'L':
+                for i in range(0, len(args), 2):
+                    next_x, next_y = args[i], args[i+1]
+                    # Sample line with distances in render coordinates
+                    prev_tx, prev_ty = transform.apply(current_x, current_y)
+                    next_tx, next_ty = transform.apply(next_x, next_y)
+                    total_dist = math.sqrt((next_tx - prev_tx)**2 + (next_ty - prev_ty)**2)
+                    steps = max(2, int(total_dist / 5))
+                    for j in range(1, steps + 1):
+                        t = j / steps
+                        px = current_x + t * (next_x - current_x)
+                        py = current_y + t * (next_y - current_y)
+                        tx, ty = transform.apply(px, py)
+                        step_dist = math.sqrt((tx - prev_tx)**2 + (ty - prev_ty)**2)
+                        cumulative_dist += step_dist
+                        points.append((tx, ty, cumulative_dist))
+                        prev_tx, prev_ty = tx, ty
+                    current_x, current_y = next_x, next_y
+            elif cmd == 'l':
+                for i in range(0, len(args), 2):
+                    next_x = current_x + args[i]
+                    next_y = current_y + args[i+1]
+                    prev_tx, prev_ty = transform.apply(current_x, current_y)
+                    next_tx, next_ty = transform.apply(next_x, next_y)
+                    total_dist = math.sqrt((next_tx - prev_tx)**2 + (next_ty - prev_ty)**2)
+                    steps = max(2, int(total_dist / 5))
+                    for j in range(1, steps + 1):
+                        t = j / steps
+                        px = current_x + t * (next_x - current_x)
+                        py = current_y + t * (next_y - current_y)
+                        tx, ty = transform.apply(px, py)
+                        step_dist = math.sqrt((tx - prev_tx)**2 + (ty - prev_ty)**2)
+                        cumulative_dist += step_dist
+                        points.append((tx, ty, cumulative_dist))
+                        prev_tx, prev_ty = tx, ty
+                    current_x, current_y = next_x, next_y
+            elif cmd == 'C':
+                # Cubic bezier
+                for i in range(0, len(args), 6):
+                    x1, y1 = args[i], args[i+1]
+                    x2, y2 = args[i+2], args[i+3]
+                    x3, y3 = args[i+4], args[i+5]
+                    # Sample bezier curve
+                    steps = 20
+                    prev_tx, prev_ty = transform.apply(current_x, current_y)
+                    for j in range(1, steps + 1):
+                        t = j / steps
+                        u = 1 - t
+                        px = u*u*u*current_x + 3*u*u*t*x1 + 3*u*t*t*x2 + t*t*t*x3
+                        py = u*u*u*current_y + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y3
+                        tx, ty = transform.apply(px, py)
+                        # Compute distance in render coordinates
+                        step_dist = math.sqrt((tx - prev_tx)**2 + (ty - prev_ty)**2)
+                        cumulative_dist += step_dist
+                        points.append((tx, ty, cumulative_dist))
+                        prev_tx, prev_ty = tx, ty
+                    current_x, current_y = x3, y3
+            elif cmd == 'c':
+                # Relative cubic bezier
+                for i in range(0, len(args), 6):
+                    x1 = current_x + args[i]
+                    y1 = current_y + args[i+1]
+                    x2 = current_x + args[i+2]
+                    y2 = current_y + args[i+3]
+                    x3 = current_x + args[i+4]
+                    y3 = current_y + args[i+5]
+                    steps = 20
+                    prev_tx, prev_ty = transform.apply(current_x, current_y)
+                    for j in range(1, steps + 1):
+                        t = j / steps
+                        u = 1 - t
+                        px = u*u*u*current_x + 3*u*u*t*x1 + 3*u*t*t*x2 + t*t*t*x3
+                        py = u*u*u*current_y + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y3
+                        tx, ty = transform.apply(px, py)
+                        step_dist = math.sqrt((tx - prev_tx)**2 + (ty - prev_ty)**2)
+                        cumulative_dist += step_dist
+                        points.append((tx, ty, cumulative_dist))
+                        prev_tx, prev_ty = tx, ty
+                    current_x, current_y = x3, y3
+            elif cmd == 'Z' or cmd == 'z':
+                if (current_x, current_y) != (start_x, start_y):
+                    prev_tx, prev_ty = transform.apply(current_x, current_y)
+                    tx, ty = transform.apply(start_x, start_y)
+                    dist = math.sqrt((tx - prev_tx)**2 + (ty - prev_ty)**2)
+                    cumulative_dist += dist
+                    points.append((tx, ty, cumulative_dist))
+                current_x, current_y = start_x, start_y
+
+        return points
+
+    def _get_point_on_path(self, points: list, distance: float) -> tuple:
+        """Get position and angle at a given distance along the path."""
+        import math
+
+        if not points or distance < 0:
+            return None
+
+        # Find the segment containing this distance
+        for i in range(1, len(points)):
+            if points[i][2] >= distance:
+                # Interpolate between points[i-1] and points[i]
+                prev_x, prev_y, prev_dist = points[i-1]
+                curr_x, curr_y, curr_dist = points[i]
+
+                if curr_dist == prev_dist:
+                    t = 0
+                else:
+                    t = (distance - prev_dist) / (curr_dist - prev_dist)
+
+                px = prev_x + t * (curr_x - prev_x)
+                py = prev_y + t * (curr_y - prev_y)
+
+                # Calculate angle
+                dx = curr_x - prev_x
+                dy = curr_y - prev_y
+                angle = math.atan2(dy, dx)
+
+                return (px, py, angle)
+
+        # Beyond path end
+        return None
+
+    def _parse_path_commands(self, path_data: str) -> list:
+        """Parse SVG path data into commands and arguments."""
+        import re
+
+        commands = []
+        # Match command letter followed by numbers
+        pattern = r'([MmLlHhVvCcSsQqTtAaZz])([^MmLlHhVvCcSsQqTtAaZz]*)'
+
+        for match in re.finditer(pattern, path_data):
+            cmd = match.group(1)
+            args_str = match.group(2).strip()
+
+            if args_str:
+                # Parse numbers (handle negative numbers and scientific notation)
+                nums = re.findall(r'-?\d*\.?\d+(?:[eE][+-]?\d+)?', args_str)
+                args = [float(n) for n in nums]
+            else:
+                args = []
+
+            commands.append((cmd, args))
+
+        return commands
 
     def _render_image(self, ctx: "RenderContext", img_elem: ImageElement):
         """Render image element (embedded or external images)."""
@@ -4165,7 +4427,8 @@ class RenderContext:
                  masks: dict[str, Mask] = None,
                  filters: dict = None,
                  patterns: dict[str, Pattern] = None,
-                 elements_by_id: dict = None):
+                 elements_by_id: dict = None,
+                 path_elements: dict = None):
         self.image = image
         self.image_arr = None  # Optional numpy array for Rust compositing
         self.gradients = gradients
@@ -4175,6 +4438,7 @@ class RenderContext:
         self.masks = masks or {}
         self.filters = filters or {}
         self.elements_by_id = elements_by_id or {}
+        self.path_elements = path_elements or {}
 
     @property
     def image_width(self) -> int:

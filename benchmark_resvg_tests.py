@@ -59,6 +59,21 @@ def compute_similarity(img1: Image.Image, img2: Image.Image) -> float:
     arr1 = np.array(img1.convert('RGBA'), dtype=np.float32)
     arr2 = np.array(img2.convert('RGBA'), dtype=np.float32)
 
+    # Check if reference (arr2) has opaque white background
+    # If so, composite our image over white for fair comparison
+    ref_alpha_mean = arr2[:, :, 3].mean()
+    if ref_alpha_mean > 250:  # Reference is mostly opaque
+        # Check if reference background is white
+        corners = [(0,0), (0,-1), (-1,0), (-1,-1)]
+        white_corners = sum(1 for y,x in corners
+                          if arr2[y, x, 0] > 240 and arr2[y, x, 1] > 240 and arr2[y, x, 2] > 240)
+        if white_corners >= 3:
+            # Composite our transparent image over white background
+            a1_ratio = arr1[:, :, 3:4] / 255.0
+            white_bg = np.ones_like(arr1[:, :, :3]) * 255
+            arr1[:, :, :3] = arr1[:, :, :3] * a1_ratio + white_bg * (1 - a1_ratio)
+            arr1[:, :, 3] = 255
+
     # Use premultiplied alpha comparison
     # This correctly handles transparent pixels (RGB doesn't matter when A=0)
     a1 = arr1[:, :, 3:4] / 255.0
