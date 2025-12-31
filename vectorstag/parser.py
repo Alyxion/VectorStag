@@ -1759,8 +1759,26 @@ class SVGParser:
             visibility=parent_style.visibility
         )
 
-        # First apply CSS type selectors (lowest priority)
+        # SVG style cascade order (lowest to highest priority):
+        # 1. Presentation attributes (like fill="red")
+        # 2. CSS type selectors (rect { ... })
+        # 3. CSS attribute selectors ([x] { ... })
+        # 4. CSS class selectors (.class { ... })
+        # 5. CSS ID selectors (#id { ... })
+        # 6. Style attribute (style="...")
+
         style_dict = {}
+
+        # First: Presentation attributes (lowest priority - can be overridden by CSS)
+        for attr in ["fill", "stroke", "stroke-width", "fill-opacity",
+                     "stroke-opacity", "opacity", "fill-rule",
+                     "stroke-linecap", "stroke-linejoin", "stroke-miterlimit",
+                     "stroke-dasharray", "filter", "display", "visibility"]:
+            val = elem.get(attr)
+            if val:
+                style_dict[attr] = val
+
+        # Then: CSS type selectors
         tag_name = self._strip_ns(elem.tag)
         if tag_name in self.css_types:
             style_dict.update(self.css_types[tag_name])
@@ -1805,17 +1823,9 @@ class SVGParser:
         if elem_id and elem_id in self.css_ids:
             style_dict.update(self.css_ids[elem_id])
 
-        # Parse style attribute (higher priority - overrides CSS classes)
+        # Parse style attribute (highest priority - overrides everything)
         style_str = elem.get("style", "")
         style_dict.update(self._parse_style_string(style_str))
-
-        # Merge with direct attributes (highest priority)
-        for attr in ["fill", "stroke", "stroke-width", "fill-opacity",
-                     "stroke-opacity", "opacity", "fill-rule",
-                     "stroke-linecap", "stroke-linejoin", "stroke-miterlimit", "stroke-dasharray", "filter", "display", "visibility"]:
-            val = elem.get(attr)
-            if val:
-                style_dict[attr] = val
 
         # Apply parsed values
         if "fill" in style_dict:

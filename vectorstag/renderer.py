@@ -3831,11 +3831,48 @@ class SVGRenderer:
             # Calculate position and size
             x = img_elem.x
             y = img_elem.y
-            width = img_elem.width if img_elem.width > 0 else img.width
-            height = img_elem.height if img_elem.height > 0 else img.height
+
+            # Handle missing width/height with aspect ratio preservation
+            # SVG spec: if only one dimension is specified, calculate the other
+            # to preserve the image's intrinsic aspect ratio
+            intrinsic_w = img.width
+            intrinsic_h = img.height
+            has_width = img_elem.width > 0
+            has_height = img_elem.height > 0
+
+            if has_width and has_height:
+                # Both specified - use them directly
+                width = img_elem.width
+                height = img_elem.height
+            elif has_width and not has_height:
+                # Only width specified - calculate height from aspect ratio
+                width = img_elem.width
+                if intrinsic_w > 0:
+                    height = width * (intrinsic_h / intrinsic_w)
+                else:
+                    height = intrinsic_h
+            elif has_height and not has_width:
+                # Only height specified - calculate width from aspect ratio
+                height = img_elem.height
+                if intrinsic_h > 0:
+                    width = height * (intrinsic_w / intrinsic_h)
+                else:
+                    width = intrinsic_w
+            else:
+                # Neither specified - use intrinsic dimensions
+                width = intrinsic_w
+                height = intrinsic_h
 
             # Handle preserveAspectRatio
             par = img_elem.preserveAspectRatio
+            is_slice = "slice" in par
+
+            # Remember original viewport for slice clipping
+            viewport_x = x
+            viewport_y = y
+            viewport_w = width
+            viewport_h = height
+
             if par != "none":
                 # Calculate aspect-ratio-preserving fit
                 src_aspect = img.width / img.height if img.height > 0 else 1
@@ -3849,7 +3886,7 @@ class SVGRenderer:
                     else:
                         new_height = height
                         new_width = height * src_aspect
-                elif "slice" in par:
+                elif is_slice:
                     # Scale to cover bounds (may crop)
                     if src_aspect > dst_aspect:
                         new_height = height
@@ -3893,6 +3930,27 @@ class SVGRenderer:
 
             # Resize image to target dimensions
             resized = img.resize((final_width, final_height), Image.LANCZOS)
+
+            # For slice mode, crop to viewport bounds
+            if is_slice:
+                # Transform viewport corners
+                vp_x1, vp_y1 = transform.apply(viewport_x, viewport_y)
+                vp_x2, vp_y2 = transform.apply(viewport_x + viewport_w, viewport_y + viewport_h)
+                vp_final_x = int(min(vp_x1, vp_x2))
+                vp_final_y = int(min(vp_y1, vp_y2))
+                vp_final_w = int(abs(vp_x2 - vp_x1))
+                vp_final_h = int(abs(vp_y2 - vp_y1))
+
+                # Calculate crop region within the resized image
+                crop_left = max(0, vp_final_x - final_x)
+                crop_top = max(0, vp_final_y - final_y)
+                crop_right = min(final_width, crop_left + vp_final_w)
+                crop_bottom = min(final_height, crop_top + vp_final_h)
+
+                if crop_right > crop_left and crop_bottom > crop_top:
+                    resized = resized.crop((crop_left, crop_top, crop_right, crop_bottom))
+                    final_x = vp_final_x
+                    final_y = vp_final_y
 
             # Apply opacity if needed
             if img_elem.style.opacity < 1.0:
@@ -3940,17 +3998,84 @@ class SVGRenderer:
                 antialias=self.antialias
             )
 
-            # Parse and render the embedded SVG
+            # Parse the embedded SVG to get its intrinsic dimensions
             doc = embedded_renderer.parser.parse(svg_content)
             if doc is None:
                 return
 
-            # Render at target dimensions
-            img = embedded_renderer.render_document(doc, final_width, final_height)
+            # Get intrinsic dimensions from the embedded SVG
+            if doc.viewBox and len(doc.viewBox) >= 4:
+                svg_w = doc.viewBox[2] if doc.viewBox[2] > 0 else 100
+                svg_h = doc.viewBox[3] if doc.viewBox[3] > 0 else 100
+            else:
+                svg_w = doc.width if doc.width > 0 else 100
+                svg_h = doc.height if doc.height > 0 else 100
+
+            # Handle preserveAspectRatio for embedded SVG
+            par = img_elem.preserveAspectRatio
+            is_slice = "slice" in par
+
+            render_w = final_width
+            render_h = final_height
+            crop_x = 0
+            crop_y = 0
+
+            if par != "none" and (is_slice or "meet" in par):
+                src_aspect = svg_w / svg_h if svg_h > 0 else 1
+                dst_aspect = final_width / final_height if final_height > 0 else 1
+
+                if "meet" in par:
+                    # Scale to fit within bounds
+                    if src_aspect > dst_aspect:
+                        render_w = final_width
+                        render_h = int(final_width / src_aspect)
+                    else:
+                        render_h = final_height
+                        render_w = int(final_height * src_aspect)
+                elif is_slice:
+                    # Scale to cover bounds
+                    if src_aspect > dst_aspect:
+                        render_h = final_height
+                        render_w = int(final_height * src_aspect)
+                    else:
+                        render_w = final_width
+                        render_h = int(final_width / src_aspect)
+
+            render_w = max(1, render_w)
+            render_h = max(1, render_h)
+
+            # Render at calculated dimensions
+            img = embedded_renderer.render_document(doc, render_w, render_h)
             if img is None:
                 return
 
             img = img.convert("RGBA")
+
+            # Handle alignment and cropping
+            if par != "none":
+                x_offset = 0
+                y_offset = 0
+                if "xMid" in par:
+                    x_offset = (final_width - render_w) // 2
+                elif "xMax" in par:
+                    x_offset = final_width - render_w
+                if "YMid" in par:
+                    y_offset = (final_height - render_h) // 2
+                elif "YMax" in par:
+                    y_offset = final_height - render_h
+
+                if is_slice:
+                    # Crop to viewport
+                    crop_x = -x_offset if x_offset < 0 else 0
+                    crop_y = -y_offset if y_offset < 0 else 0
+                    crop_right = min(render_w, crop_x + final_width)
+                    crop_bottom = min(render_h, crop_y + final_height)
+                    if crop_right > crop_x and crop_bottom > crop_y:
+                        img = img.crop((crop_x, crop_y, crop_right, crop_bottom))
+                else:
+                    # For meet, adjust final position
+                    final_x += x_offset
+                    final_y += y_offset
 
             # Apply opacity if needed
             if img_elem.style.opacity < 1.0:
