@@ -2297,10 +2297,11 @@ class SVGRenderer:
                                 fill: tuple[int, int, int, int],
                                 fill_rule: str):
         """Fill a polygon with the specified fill rule."""
-        # Fast path: use Rust to render directly to numpy array
+        # Fast path: use Rust to render directly to numpy array with AA
         if HAS_RUST and ctx.image_arr is not None:
             fill_rule_code = 1 if fill_rule == "evenodd" else 0
-            vectorstag_rust.fill_polygon_to_array(
+            # Use anti-aliased version for better edge quality
+            vectorstag_rust.fill_polygon_aa_to_array(
                 ctx.image_arr, points,
                 fill[0], fill[1], fill[2], fill[3],
                 fill_rule_code
@@ -2699,7 +2700,7 @@ class SVGRenderer:
         elif fill:
             # Solid fill - use Rust direct rendering if available
             if HAS_RUST and ctx.image_arr is not None:
-                vectorstag_rust.fill_multi_polygon_to_array(
+                vectorstag_rust.fill_multi_polygon_aa_to_array(
                     ctx.image_arr, polygons,
                     fill[0], fill[1], fill[2], fill[3],
                     0  # nonzero fill rule
