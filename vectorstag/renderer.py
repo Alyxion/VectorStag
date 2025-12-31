@@ -129,7 +129,7 @@ class SVGRenderer:
             image_arr = None
 
         # Create render context with numpy array as primary (if Rust available)
-        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.masks, doc.filters, doc.patterns, doc.elements_by_id, doc.path_data_by_id)
+        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.masks, doc.filters, doc.patterns, doc.elements_by_id, doc.path_data_by_id, viewport_width=src_w, viewport_height=src_h)
         ctx.image_arr = image_arr
 
         # Render all elements
@@ -2401,11 +2401,17 @@ class SVGRenderer:
                                           fill: Optional[tuple[int, int, int, int]],
                                           fill_ref: Optional[str]):
         """Fill a polygon, handling gradients and patterns if needed."""
+        fallback_fill = fill  # Keep original fill as fallback
+
         if fill_ref and fill_ref.startswith("url("):
             # Extract paint server ID - handle fallback colors like "url(#id) rgb(0,0,0)"
             end_paren = fill_ref.find(")")
             if end_paren != -1:
                 match = fill_ref[4:end_paren]  # Remove "url(" and extract up to ")"
+                # Check for fallback color after the url()
+                fallback_str = fill_ref[end_paren + 1:].strip()
+                if fallback_str:
+                    fallback_fill = self._parse_fallback_color(fallback_str, style)
             else:
                 match = fill_ref[4:]
             match = match.strip()
@@ -2417,11 +2423,14 @@ class SVGRenderer:
 
             if match in ctx.gradients:
                 gradient = ctx.gradients[match]
-                self._fill_polygon_with_gradient(ctx, points, gradient, bbox,
-                                                 style.fill_opacity * style.opacity,
-                                                 style.fill_rule,
-                                                 element_transform)
-                return
+                # Check if gradient has stops - empty gradient should use fallback
+                if gradient.stops:
+                    self._fill_polygon_with_gradient(ctx, points, gradient, bbox,
+                                                     style.fill_opacity * style.opacity,
+                                                     style.fill_rule,
+                                                     element_transform)
+                    return
+                # Empty gradient - fall through to use fallback color
 
             if match in ctx.patterns:
                 pattern = ctx.patterns[match]
@@ -2431,9 +2440,80 @@ class SVGRenderer:
                                                 element_transform)
                 return
 
+            # Gradient/pattern not found - use fallback color
+            fill = fallback_fill
+
         # Simple fill with fill-rule support
         if fill and len(points) >= 3:
             self._fill_polygon_with_rule(ctx, points, fill, style.fill_rule)
+
+    def _parse_fallback_color(self, color_str: str, style: Style) -> Optional[tuple[int, int, int, int]]:
+        """Parse a fallback color string."""
+        color_str = color_str.strip()
+        if not color_str or color_str == "none":
+            return None
+
+        # Handle currentColor
+        if color_str == "currentColor":
+            # currentColor inherits from parent - use style's fill as approximation
+            if isinstance(style.fill, tuple):
+                return style.fill
+            return (0, 0, 0, 255)  # Default black
+
+        # Try to parse as a color
+        color = self._parse_color(color_str)
+        if color:
+            r, g, b = color
+            a = int(255 * style.fill_opacity * style.opacity)
+            return (r, g, b, a)
+
+        return None
+
+    def _parse_color(self, color_str: str) -> Optional[tuple[int, int, int]]:
+        """Parse a color string to RGB tuple."""
+        color_str = color_str.strip().lower()
+
+        # Named colors
+        named_colors = {
+            "black": (0, 0, 0), "white": (255, 255, 255), "red": (255, 0, 0),
+            "green": (0, 128, 0), "blue": (0, 0, 255), "yellow": (255, 255, 0),
+            "cyan": (0, 255, 255), "magenta": (255, 0, 255), "gray": (128, 128, 128),
+            "grey": (128, 128, 128), "lime": (0, 255, 0), "maroon": (128, 0, 0),
+            "navy": (0, 0, 128), "olive": (128, 128, 0), "purple": (128, 0, 128),
+            "teal": (0, 128, 128), "silver": (192, 192, 192), "fuchsia": (255, 0, 255),
+            "aqua": (0, 255, 255), "orange": (255, 165, 0), "pink": (255, 192, 203),
+            "brown": (165, 42, 42), "gold": (255, 215, 0), "coral": (255, 127, 80),
+            "crimson": (220, 20, 60), "darkblue": (0, 0, 139), "darkgreen": (0, 100, 0),
+            "darkred": (139, 0, 0), "lightblue": (173, 216, 230), "lightgreen": (144, 238, 144),
+        }
+        if color_str in named_colors:
+            return named_colors[color_str]
+
+        # Hex colors
+        if color_str.startswith("#"):
+            hex_str = color_str[1:]
+            if len(hex_str) == 3:
+                r = int(hex_str[0] * 2, 16)
+                g = int(hex_str[1] * 2, 16)
+                b = int(hex_str[2] * 2, 16)
+                return (r, g, b)
+            elif len(hex_str) == 6:
+                r = int(hex_str[0:2], 16)
+                g = int(hex_str[2:4], 16)
+                b = int(hex_str[4:6], 16)
+                return (r, g, b)
+
+        # rgb() and rgba()
+        import re
+        rgb_match = re.match(r'rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', color_str)
+        if rgb_match:
+            return (int(rgb_match.group(1)), int(rgb_match.group(2)), int(rgb_match.group(3)))
+
+        rgba_match = re.match(r'rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*[\d.]+\s*\)', color_str)
+        if rgba_match:
+            return (int(rgba_match.group(1)), int(rgba_match.group(2)), int(rgba_match.group(3)))
+
+        return None
 
     def _fill_polygon_with_rule(self, ctx: "RenderContext",
                                 points: list[tuple[float, float]],
@@ -3291,8 +3371,21 @@ class SVGRenderer:
             x2 = bx + gradient.x2 * bw
             y2 = by + gradient.y2 * bh
         else:
+            # userSpaceOnUse - convert percentage values to viewport coordinates
             x1, y1 = gradient.x1, gradient.y1
             x2, y2 = gradient.x2, gradient.y2
+
+            # If values were percentages, scale by viewport dimensions
+            vp_w = ctx.viewport_width or 100
+            vp_h = ctx.viewport_height or 100
+            if getattr(gradient, 'x1_pct', False):
+                x1 = gradient.x1 * vp_w
+            if getattr(gradient, 'y1_pct', False):
+                y1 = gradient.y1 * vp_h
+            if getattr(gradient, 'x2_pct', False):
+                x2 = gradient.x2 * vp_w
+            if getattr(gradient, 'y2_pct', False):
+                y2 = gradient.y2 * vp_h
 
         # Apply gradient transform if present
         if gradient.transform:
@@ -3387,11 +3480,25 @@ class SVGRenderer:
             fy = by + (gradient.fy if gradient.fy is not None else gradient.cy) * bh
             fr = gradient.fr * max(bw, bh)
         else:
-            cx, cy = gradient.cx, gradient.cy
-            r = gradient.r
-            fx = gradient.fx if gradient.fx is not None else cx
-            fy = gradient.fy if gradient.fy is not None else cy
-            fr = gradient.fr
+            # userSpaceOnUse - convert percentage values to viewport coordinates
+            vp_w = ctx.viewport_width or 100
+            vp_h = ctx.viewport_height or 100
+            vp_max = max(vp_w, vp_h)
+
+            cx = gradient.cx * vp_w if getattr(gradient, 'cx_pct', False) else gradient.cx
+            cy = gradient.cy * vp_h if getattr(gradient, 'cy_pct', False) else gradient.cy
+            r = gradient.r * vp_max if getattr(gradient, 'r_pct', False) else gradient.r
+
+            # Focal point defaults to center
+            if gradient.fx is not None:
+                fx = gradient.fx * vp_w if getattr(gradient, 'fx_pct', False) else gradient.fx
+            else:
+                fx = cx
+            if gradient.fy is not None:
+                fy = gradient.fy * vp_h if getattr(gradient, 'fy_pct', False) else gradient.fy
+            else:
+                fy = cy
+            fr = gradient.fr * vp_max if getattr(gradient, 'fr_pct', False) else gradient.fr
 
         if r == 0:
             return Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -4428,7 +4535,9 @@ class RenderContext:
                  filters: dict = None,
                  patterns: dict[str, Pattern] = None,
                  elements_by_id: dict = None,
-                 path_elements: dict = None):
+                 path_elements: dict = None,
+                 viewport_width: float = None,
+                 viewport_height: float = None):
         self.image = image
         self.image_arr = None  # Optional numpy array for Rust compositing
         self.gradients = gradients
@@ -4439,6 +4548,9 @@ class RenderContext:
         self.filters = filters or {}
         self.elements_by_id = elements_by_id or {}
         self.path_elements = path_elements or {}
+        # Viewport dimensions for userSpaceOnUse gradient percentages
+        self.viewport_width = viewport_width
+        self.viewport_height = viewport_height
 
     @property
     def image_width(self) -> int:

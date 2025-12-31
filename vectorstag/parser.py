@@ -114,6 +114,11 @@ class LinearGradient:
     transform: Optional[Transform] = None
     href: Optional[str] = None  # Reference to another gradient
     spread_method: str = "pad"  # pad, reflect, repeat
+    # Flags for percentage coordinates (for userSpaceOnUse)
+    x1_pct: bool = True
+    y1_pct: bool = True
+    x2_pct: bool = True
+    y2_pct: bool = True
 
 
 @dataclass
@@ -131,6 +136,13 @@ class RadialGradient:
     transform: Optional[Transform] = None
     href: Optional[str] = None
     spread_method: str = "pad"  # pad, reflect, repeat
+    # Flags for percentage coordinates (for userSpaceOnUse)
+    cx_pct: bool = True
+    cy_pct: bool = True
+    r_pct: bool = True
+    fx_pct: bool = False
+    fy_pct: bool = False
+    fr_pct: bool = False
 
 
 @dataclass
@@ -1493,27 +1505,37 @@ class SVGParser:
         if href and href.startswith("#"):
             href = href[1:]
 
-        # Validate gradientUnits - mark as invalid if not valid value
+        # Parse gradientUnits - default to objectBoundingBox if invalid (per SVG spec)
         units_raw = elem.get("gradientUnits")
-        if units_raw is not None and units_raw not in ("objectBoundingBox", "userSpaceOnUse"):
-            units = "invalid"  # Mark as invalid - renderer should not use this gradient
+        if units_raw in ("objectBoundingBox", "userSpaceOnUse"):
+            units = units_raw
         else:
-            units = units_raw or "objectBoundingBox"
+            units = "objectBoundingBox"
 
         # Parse spreadMethod - default is "pad"
         spread_method = elem.get("spreadMethod", "pad")
         if spread_method not in ("pad", "reflect", "repeat"):
             spread_method = "pad"
 
+        # Parse coordinates and track if they were percentages
+        x1_str = elem.get("x1", "0%")
+        y1_str = elem.get("y1", "0%")
+        x2_str = elem.get("x2", "100%")
+        y2_str = elem.get("y2", "0%")
+
         grad = LinearGradient(
             id=grad_id,
-            x1=self._parse_gradient_coord(elem.get("x1", "0%")),
-            y1=self._parse_gradient_coord(elem.get("y1", "0%")),
-            x2=self._parse_gradient_coord(elem.get("x2", "100%")),
-            y2=self._parse_gradient_coord(elem.get("y2", "0%")),
+            x1=self._parse_gradient_coord(x1_str),
+            y1=self._parse_gradient_coord(y1_str),
+            x2=self._parse_gradient_coord(x2_str),
+            y2=self._parse_gradient_coord(y2_str),
             units=units,
             href=href,
-            spread_method=spread_method
+            spread_method=spread_method,
+            x1_pct=x1_str.strip().endswith("%"),
+            y1_pct=y1_str.strip().endswith("%"),
+            x2_pct=x2_str.strip().endswith("%"),
+            y2_pct=y2_str.strip().endswith("%")
         )
 
         # Parse transform
@@ -1536,37 +1558,48 @@ class SVGParser:
         if href and href.startswith("#"):
             href = href[1:]
 
-        # Validate gradientUnits - mark as invalid if not valid value
+        # Parse gradientUnits - default to objectBoundingBox if invalid (per SVG spec)
         units_raw = elem.get("gradientUnits")
-        if units_raw is not None and units_raw not in ("objectBoundingBox", "userSpaceOnUse"):
-            units = "invalid"  # Mark as invalid - renderer should not use this gradient
+        if units_raw in ("objectBoundingBox", "userSpaceOnUse"):
+            units = units_raw
         else:
-            units = units_raw or "objectBoundingBox"
+            units = "objectBoundingBox"
 
         # Parse spreadMethod - default is "pad"
         spread_method = elem.get("spreadMethod", "pad")
         if spread_method not in ("pad", "reflect", "repeat"):
             spread_method = "pad"
 
+        # Parse coordinates and track if they were percentages
+        cx_str = elem.get("cx", "50%")
+        cy_str = elem.get("cy", "50%")
+        r_str = elem.get("r", "50%")
+
         grad = RadialGradient(
             id=grad_id,
-            cx=self._parse_gradient_coord(elem.get("cx", "50%")),
-            cy=self._parse_gradient_coord(elem.get("cy", "50%")),
-            r=self._parse_gradient_coord(elem.get("r", "50%")),
+            cx=self._parse_gradient_coord(cx_str),
+            cy=self._parse_gradient_coord(cy_str),
+            r=self._parse_gradient_coord(r_str),
             units=units,
             href=href,
-            spread_method=spread_method
+            spread_method=spread_method,
+            cx_pct=cx_str.strip().endswith("%"),
+            cy_pct=cy_str.strip().endswith("%"),
+            r_pct=r_str.strip().endswith("%")
         )
 
-        fx = elem.get("fx")
-        fy = elem.get("fy")
-        fr = elem.get("fr")
-        if fx:
-            grad.fx = self._parse_gradient_coord(fx)
-        if fy:
-            grad.fy = self._parse_gradient_coord(fy)
-        if fr:
-            grad.fr = self._parse_gradient_coord(fr)
+        fx_str = elem.get("fx")
+        fy_str = elem.get("fy")
+        fr_str = elem.get("fr")
+        if fx_str:
+            grad.fx = self._parse_gradient_coord(fx_str)
+            grad.fx_pct = fx_str.strip().endswith("%")
+        if fy_str:
+            grad.fy = self._parse_gradient_coord(fy_str)
+            grad.fy_pct = fy_str.strip().endswith("%")
+        if fr_str:
+            grad.fr = self._parse_gradient_coord(fr_str)
+            grad.fr_pct = fr_str.strip().endswith("%")
 
         transform_str = elem.get("gradientTransform")
         if transform_str:
@@ -1614,33 +1647,59 @@ class SVGParser:
                 style_dict = self._parse_style_string(style_str)
 
                 color_str = style_dict.get("stop-color") or child.get("stop-color", "black")
-                opacity_str = style_dict.get("stop-opacity") or child.get("stop-opacity", "1")
+                opacity_str = style_dict.get("stop-opacity") or child.get("stop-opacity")
 
-                color = self._parse_color(color_str)
-                if color:
-                    try:
-                        if opacity_str.endswith('%'):
-                            opacity = float(opacity_str[:-1]) / 100.0
-                        else:
-                            opacity = float(opacity_str)
-                    except (ValueError, AttributeError):
-                        opacity = 1.0
-                    color = (color[0], color[1], color[2], int(opacity * 255))
+                # Try to parse color with embedded alpha (e.g., hsla, rgba)
+                color_with_alpha = self._parse_color_with_alpha(color_str)
+                if color_with_alpha:
+                    rgb, color_alpha = color_with_alpha
+                    # Use explicit stop-opacity if provided, otherwise use color's alpha
+                    if opacity_str is not None:
+                        try:
+                            if opacity_str.endswith('%'):
+                                opacity = float(opacity_str[:-1]) / 100.0
+                            else:
+                                opacity = float(opacity_str)
+                        except (ValueError, AttributeError):
+                            opacity = color_alpha
+                    else:
+                        opacity = color_alpha
+                    color = (rgb[0], rgb[1], rgb[2], int(opacity * 255))
                 else:
-                    color = (0, 0, 0, 255)
+                    color = self._parse_color(color_str)
+                    if color:
+                        opacity = 1.0
+                        if opacity_str is not None:
+                            try:
+                                if opacity_str.endswith('%'):
+                                    opacity = float(opacity_str[:-1]) / 100.0
+                                else:
+                                    opacity = float(opacity_str)
+                            except (ValueError, AttributeError):
+                                pass
+                        color = (color[0], color[1], color[2], int(opacity * 255))
+                    else:
+                        color = (0, 0, 0, 255)
 
                 stops.append(GradientStop(offset=offset, color=color))
 
         return sorted(stops, key=lambda s: s.offset)
 
     def _resolve_gradient_refs(self):
-        """Resolve gradient href references."""
-        for grad in self.gradients.values():
-            if grad.href and grad.href in self.gradients:
-                ref = self.gradients[grad.href]
-                # Inherit stops if not defined
-                if not grad.stops and ref.stops:
-                    grad.stops = ref.stops.copy()
+        """Resolve gradient href references iteratively to handle chains."""
+        # Iterate until no changes, to handle chains like: lg4 -> lg1 -> lg3 -> lg2
+        max_iterations = 10  # Prevent infinite loops
+        for _ in range(max_iterations):
+            changed = False
+            for grad in self.gradients.values():
+                if grad.href and grad.href in self.gradients:
+                    ref = self.gradients[grad.href]
+                    # Inherit stops if not defined
+                    if not grad.stops and ref.stops:
+                        grad.stops = ref.stops.copy()
+                        changed = True
+            if not changed:
+                break
 
     def _parse_pattern(self, elem: ET.Element):
         """Parse a pattern element."""
@@ -2181,18 +2240,20 @@ class SVGParser:
                 # Invalid hex characters
                 return None
 
-        # RGB function
+        # RGB function (comma-separated only - space-separated is UB in SVG 1.1)
         rgb_match = re.match(r"rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", color_str)
         if rgb_match:
             return (int(rgb_match.group(1)), int(rgb_match.group(2)), int(rgb_match.group(3)))
 
-        # RGB with percentages
-        rgb_pct_match = re.match(r"rgb\s*\(\s*([\d.]+)%\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*\)", color_str)
+        # RGB with percentages (allow negative and overflow, clamp to 0-255)
+        rgb_pct_match = re.match(r"rgb\s*\(\s*(-?[\d.]+)%\s*,\s*(-?[\d.]+)%\s*,\s*(-?[\d.]+)%\s*\)", color_str)
         if rgb_pct_match:
+            def clamp_pct(val):
+                return max(0, min(255, int(float(val) * 255 / 100)))
             return (
-                int(float(rgb_pct_match.group(1)) * 255 / 100),
-                int(float(rgb_pct_match.group(2)) * 255 / 100),
-                int(float(rgb_pct_match.group(3)) * 255 / 100)
+                clamp_pct(rgb_pct_match.group(1)),
+                clamp_pct(rgb_pct_match.group(2)),
+                clamp_pct(rgb_pct_match.group(3))
             )
 
         # HSL function: hsl(h, s%, l%)
@@ -2245,12 +2306,27 @@ class SVGParser:
             except ValueError:
                 pass
 
-        # RGBA function
-        rgba_match = re.match(r"rgba\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+)\s*\)", color_str)
+        # RGB with alpha (SVG 2 style - 4 parameters, like rgba but uses "rgb")
+        rgb_alpha_match = re.match(r"rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(-?[\d.]+%?)\s*\)", color_str)
+        if rgb_alpha_match:
+            a_str = rgb_alpha_match.group(4)
+            if a_str.endswith('%'):
+                a = float(a_str[:-1]) / 100.0
+            else:
+                a = float(a_str)
+            a = max(0.0, min(1.0, a))
+            return ((int(rgb_alpha_match.group(1)), int(rgb_alpha_match.group(2)), int(rgb_alpha_match.group(3))), a)
+
+        # RGBA function - handle negative alpha values and percentage alpha
+        rgba_match = re.match(r"rgba\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(-?[\d.]+%?)\s*\)", color_str)
         if rgba_match:
-            a = float(rgba_match.group(4))
-            if a > 1:
-                a = a / 255.0  # Some use 0-255 for alpha
+            a_str = rgba_match.group(4)
+            if a_str.endswith('%'):
+                a = float(a_str[:-1]) / 100.0
+            else:
+                a = float(rgba_match.group(4))
+            # SVG 2 spec: clamp alpha to 0-1 range (don't scale from 0-255)
+            a = max(0.0, min(1.0, a))
             return ((int(rgba_match.group(1)), int(rgba_match.group(2)), int(rgba_match.group(3))), a)
 
         # RGBA with percentages
@@ -2266,6 +2342,15 @@ class SVGParser:
                 int(float(rgba_pct_match.group(2)) * 255 / 100),
                 int(float(rgba_pct_match.group(3)) * 255 / 100)
             ), a)
+
+        # HSL with alpha (SVG 2 style - 4 parameters)
+        hsl_alpha_match = re.match(r"hsl\s*\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*,\s*([\d.]+)\s*\)", color_str)
+        if hsl_alpha_match:
+            h = float(hsl_alpha_match.group(1)) / 360.0
+            s = float(hsl_alpha_match.group(2)) / 100.0
+            l = float(hsl_alpha_match.group(3)) / 100.0
+            a = float(hsl_alpha_match.group(4))
+            return (self._hsl_to_rgb(h, s, l), a)
 
         # HSLA function: hsla(h, s%, l%, a)
         hsla_match = re.match(r"hsla\s*\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*,\s*([\d.]+)\s*\)", color_str)
