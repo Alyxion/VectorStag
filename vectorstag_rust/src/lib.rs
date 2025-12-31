@@ -3618,6 +3618,80 @@ fn fill_multi_polygon_aa_to_array<'py>(
     }
 }
 
+/// Convert sRGB to linearRGB color space (for filter operations)
+/// SVG filters default to linearRGB color-interpolation-filters
+#[pyfunction]
+fn srgb_to_linear<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr = src.as_array();
+    let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    // Pre-compute lookup table for sRGB to linear conversion
+    // This is much faster than computing per-pixel
+    let mut lut = [0u8; 256];
+    for i in 0..256 {
+        let c = i as f32 / 255.0;
+        let linear = if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        };
+        lut[i] = (linear * 255.0).round() as u8;
+    }
+
+    for y in 0..h {
+        for x in 0..w {
+            // Convert RGB channels, preserve alpha
+            dst[[y, x, 0]] = lut[arr[[y, x, 0]] as usize];
+            dst[[y, x, 1]] = lut[arr[[y, x, 1]] as usize];
+            dst[[y, x, 2]] = lut[arr[[y, x, 2]] as usize];
+            dst[[y, x, 3]] = arr[[y, x, 3]];  // Alpha unchanged
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
+/// Convert linearRGB to sRGB color space (after filter operations)
+#[pyfunction]
+fn linear_to_srgb<'py>(
+    py: Python<'py>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+) -> Bound<'py, numpy::PyArray3<u8>> {
+    use ndarray::Array3;
+    let arr = src.as_array();
+    let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+    let mut dst = Array3::<u8>::zeros((h, w, 4));
+
+    // Pre-compute lookup table for linear to sRGB conversion
+    let mut lut = [0u8; 256];
+    for i in 0..256 {
+        let c = i as f32 / 255.0;
+        let srgb = if c <= 0.0031308 {
+            c * 12.92
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        lut[i] = (srgb * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+
+    for y in 0..h {
+        for x in 0..w {
+            // Convert RGB channels, preserve alpha
+            dst[[y, x, 0]] = lut[arr[[y, x, 0]] as usize];
+            dst[[y, x, 1]] = lut[arr[[y, x, 1]] as usize];
+            dst[[y, x, 2]] = lut[arr[[y, x, 2]] as usize];
+            dst[[y, x, 3]] = arr[[y, x, 3]];  // Alpha unchanged
+        }
+    }
+
+    dst.into_pyarray(py)
+}
+
 /// A Python module implemented in Rust for fast SVG rendering operations.
 #[pymodule]
 fn vectorstag_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -3659,5 +3733,8 @@ fn vectorstag_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fe_gaussian_blur, m)?)?;
     m.add_function(wrap_pyfunction!(fe_drop_shadow, m)?)?;
     m.add_function(wrap_pyfunction!(get_source_alpha, m)?)?;
+    // Color space conversion
+    m.add_function(wrap_pyfunction!(srgb_to_linear, m)?)?;
+    m.add_function(wrap_pyfunction!(linear_to_srgb, m)?)?;
     Ok(())
 }

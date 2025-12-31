@@ -290,6 +290,7 @@ class ClipPath:
     id: str
     elements: list[SVGElement] = field(default_factory=list)
     clip_path_id: Optional[str] = None  # For nested clip paths (intersection)
+    units: str = "userSpaceOnUse"  # clipPathUnits: userSpaceOnUse or objectBoundingBox
 
 
 @dataclass
@@ -526,6 +527,11 @@ class Filter:
     filter_units: str = "objectBoundingBox"  # or "userSpaceOnUse"
     primitive_units: str = "userSpaceOnUse"  # or "objectBoundingBox"
     color_interpolation_filters: str = "linearRGB"  # linearRGB or sRGB
+    # Track if coordinates are percentages (for userSpaceOnUse viewport conversion)
+    x_pct: bool = True
+    y_pct: bool = True
+    width_pct: bool = True
+    height_pct: bool = True
 
 
 @dataclass
@@ -1110,10 +1116,15 @@ class SVGParser:
                     if clip_path_attr and clip_path_attr.startswith("url(#"):
                         nested_clip = clip_path_attr[5:-1]
 
+                    # Parse clipPathUnits attribute
+                    clip_units_raw = elem.get("clipPathUnits")
+                    clip_units = clip_units_raw if clip_units_raw in ("userSpaceOnUse", "objectBoundingBox") else "userSpaceOnUse"
+
                     self.clip_paths[clip_id] = ClipPath(
                         id=clip_id,
                         elements=clip_elements,
-                        clip_path_id=nested_clip
+                        clip_path_id=nested_clip,
+                        units=clip_units
                     )
 
     def _parse_masks(self, root: ET.Element):
@@ -1170,27 +1181,32 @@ class SVGParser:
             base_filter = self.filters.get(base_id)
 
         # Parse filter region attributes (can be percentages like "-10%")
-        def parse_filter_val(val: str, default: float) -> float:
+        # Returns (value, is_percentage)
+        def parse_filter_val(val: str, default: float, default_pct: bool) -> tuple[float, bool]:
             if val is None:
-                return default
+                return default, default_pct
             val = val.strip()
             if val.endswith('%'):
-                return float(val[:-1]) / 100.0
+                return float(val[:-1]) / 100.0, True
             try:
-                return float(val)
+                return float(val), False
             except ValueError:
-                return default
+                return default, default_pct
 
         # Use base filter defaults if inheriting
         default_x = base_filter.x if base_filter else -0.1
         default_y = base_filter.y if base_filter else -0.1
         default_w = base_filter.width if base_filter else 1.2
         default_h = base_filter.height if base_filter else 1.2
+        default_x_pct = base_filter.x_pct if base_filter else True
+        default_y_pct = base_filter.y_pct if base_filter else True
+        default_w_pct = base_filter.width_pct if base_filter else True
+        default_h_pct = base_filter.height_pct if base_filter else True
 
-        filter_x = parse_filter_val(elem.get("x"), default_x)
-        filter_y = parse_filter_val(elem.get("y"), default_y)
-        filter_w = parse_filter_val(elem.get("width"), default_w)
-        filter_h = parse_filter_val(elem.get("height"), default_h)
+        filter_x, x_pct = parse_filter_val(elem.get("x"), default_x, default_x_pct)
+        filter_y, y_pct = parse_filter_val(elem.get("y"), default_y, default_y_pct)
+        filter_w, w_pct = parse_filter_val(elem.get("width"), default_w, default_w_pct)
+        filter_h, h_pct = parse_filter_val(elem.get("height"), default_h, default_h_pct)
         filter_units_raw = elem.get("filterUnits") or (base_filter.filter_units if base_filter else "objectBoundingBox")
         # Validate filterUnits - only objectBoundingBox and userSpaceOnUse are valid
         filter_units = filter_units_raw if filter_units_raw in ("objectBoundingBox", "userSpaceOnUse") else "objectBoundingBox"
@@ -1220,7 +1236,11 @@ class SVGParser:
             height=filter_h,
             filter_units=filter_units,
             primitive_units=primitive_units,
-            color_interpolation_filters=color_interp
+            color_interpolation_filters=color_interp,
+            x_pct=x_pct,
+            y_pct=y_pct,
+            width_pct=w_pct,
+            height_pct=h_pct
         )
 
     def _parse_filter_primitive(self, elem: ET.Element, tag: str) -> Optional[FilterPrimitive]:
@@ -1264,12 +1284,26 @@ class SVGParser:
                            dx=dx, dy=dy)
 
         elif tag == "feFlood":
-            flood_color = elem.get("flood-color", "black")
-            flood_opacity = _safe_float(elem.get("flood-opacity", "1"), 1.0)
-            color = self._parse_color(flood_color)
-            if color is None:
-                color = (0, 0, 0)
-            rgba = (color[0], color[1], color[2], int(flood_opacity * 255))
+            flood_color_str = elem.get("flood-color", "black")
+            flood_opacity_str = elem.get("flood-opacity")
+
+            # Try to parse color with embedded alpha (e.g., hsla, rgba)
+            color_with_alpha = self._parse_color_with_alpha(flood_color_str)
+            if color_with_alpha:
+                rgb, color_alpha = color_with_alpha
+                # Use explicit flood-opacity if provided, otherwise use color's alpha
+                if flood_opacity_str is not None:
+                    flood_opacity = _safe_float(flood_opacity_str, 1.0)
+                else:
+                    flood_opacity = color_alpha
+            else:
+                color = self._parse_color(flood_color_str)
+                if color is None:
+                    color = (0, 0, 0)
+                rgb = color
+                flood_opacity = _safe_float(flood_opacity_str, 1.0) if flood_opacity_str else 1.0
+
+            rgba = (rgb[0], rgb[1], rgb[2], int(flood_opacity * 255))
             return FeFlood(input1=input1, result=result, x=x, y=y, width=width, height=height,
                           flood_color=rgba, flood_opacity=flood_opacity)
 
@@ -1419,12 +1453,26 @@ class SVGParser:
                 std_y = _safe_float(parts[1], std_x) if len(parts) > 1 else std_x
             except (ValueError, IndexError):
                 std_x = std_y = 0.0
-            flood_color = elem.get("flood-color", "black")
-            flood_opacity = _safe_float(elem.get("flood-opacity", "1"), 1.0)
-            color = self._parse_color(flood_color)
-            if color is None:
-                color = (0, 0, 0)
-            rgba = (color[0], color[1], color[2], int(flood_opacity * 255))
+            flood_color_str = elem.get("flood-color", "black")
+            flood_opacity_str = elem.get("flood-opacity")
+
+            # Try to parse color with embedded alpha (e.g., hsla, rgba)
+            color_with_alpha = self._parse_color_with_alpha(flood_color_str)
+            if color_with_alpha:
+                rgb, color_alpha = color_with_alpha
+                # Use explicit flood-opacity if provided, otherwise use color's alpha
+                if flood_opacity_str is not None:
+                    flood_opacity = _safe_float(flood_opacity_str, 1.0)
+                else:
+                    flood_opacity = color_alpha
+            else:
+                color = self._parse_color(flood_color_str)
+                if color is None:
+                    color = (0, 0, 0)
+                rgb = color
+                flood_opacity = _safe_float(flood_opacity_str, 1.0) if flood_opacity_str else 1.0
+
+            rgba = (rgb[0], rgb[1], rgb[2], int(flood_opacity * 255))
             return FeDropShadow(input1=input1, result=result, x=x, y=y, width=width, height=height,
                                dx=dx, dy=dy, std_deviation_x=std_x, std_deviation_y=std_y,
                                flood_color=rgba, flood_opacity=flood_opacity)
@@ -2197,6 +2245,16 @@ class SVGParser:
             return None
 
         color_str = color_str.strip().lower()
+
+        # Handle icc-color() fallback - format: "fallback icc-color(...)"
+        # We don't support ICC color profiles, so use the fallback color
+        if "icc-color(" in color_str:
+            # Extract the fallback color (everything before icc-color)
+            icc_idx = color_str.index("icc-color(")
+            fallback = color_str[:icc_idx].strip()
+            if fallback:
+                return self._parse_color(fallback)
+            return None
 
         # currentColor keyword - defaults to black
         if color_str == "currentcolor":

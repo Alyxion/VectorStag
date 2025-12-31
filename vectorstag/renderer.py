@@ -278,7 +278,9 @@ class SVGRenderer:
         element.clip_path_id = old_clip_path_id
 
         # Create clip mask from clip path shapes
-        mask = self._create_clip_mask(ctx, clip_path, element.transform)
+        # Get element bounding box for objectBoundingBox units
+        elem_bbox = self._get_element_bbox(element, ctx.base_transform)
+        mask = self._create_clip_mask(ctx, clip_path, element.transform, elem_bbox)
 
         # Apply the mask and composite onto main image
         temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], mask))
@@ -370,14 +372,30 @@ class SVGRenderer:
         # Get element bounding box in screen coordinates
         elem_bbox = self._get_element_bbox(element, ctx.base_transform)
 
-        # If element has no content (empty bbox), check if filter has explicit region
-        # Filters with userSpaceOnUse and explicit region can render even on empty elements
+        # Get viewport dimensions for percentage calculations
+        vp_w = getattr(ctx, 'viewport_width', None) or ctx.image_width
+        vp_h = getattr(ctx, 'viewport_height', None) or ctx.image_height
+
+        # Calculate filter region coordinates based on filterUnits
+        if filter_def.filter_units == "userSpaceOnUse":
+            # For userSpaceOnUse, percentages are relative to viewport
+            fx = filter_def.x * vp_w if getattr(filter_def, 'x_pct', False) else filter_def.x
+            fy = filter_def.y * vp_h if getattr(filter_def, 'y_pct', False) else filter_def.y
+            fw = filter_def.width * vp_w if getattr(filter_def, 'width_pct', False) else filter_def.width
+            fh = filter_def.height * vp_h if getattr(filter_def, 'height_pct', False) else filter_def.height
+
+            # Transform to screen coordinates
+            fx1, fy1 = ctx.base_transform.apply(fx, fy)
+            fx2, fy2 = ctx.base_transform.apply(fx + fw, fy + fh)
+            filter_bbox = (fx1, fy1, fx2 - fx1, fy2 - fy1)
+        else:
+            # objectBoundingBox - percentages relative to element bbox
+            filter_bbox = None
+
+        # If element has no content (empty bbox), use filter region if available
         if elem_bbox is None or (elem_bbox[2] <= 0 and elem_bbox[3] <= 0):
-            if filter_def.filter_units == "userSpaceOnUse" and filter_def.width > 0 and filter_def.height > 0:
-                # Use the filter's explicit region as the bounding box
-                fx, fy = ctx.base_transform.apply(filter_def.x, filter_def.y)
-                fx2, fy2 = ctx.base_transform.apply(filter_def.x + filter_def.width, filter_def.y + filter_def.height)
-                elem_bbox = (fx, fy, fx2 - fx, fy2 - fy)
+            if filter_bbox is not None and filter_bbox[2] > 0 and filter_bbox[3] > 0:
+                elem_bbox = filter_bbox
             else:
                 return
 
@@ -395,18 +413,26 @@ class SVGRenderer:
             elif isinstance(prim, FeDropShadow):
                 max_padding = max(max_padding, int((prim.std_deviation_x + prim.std_deviation_y) * scale * 3 + abs(prim.dx) + abs(prim.dy)) + 5)
 
-        # Determine filter region
-        if elem_bbox:
-            ex, ey, ew, eh = elem_bbox
-            region_x = max(0, int(ex) - max_padding)
-            region_y = max(0, int(ey) - max_padding)
-            region_x2 = min(ctx.image_width, int(ex + ew) + max_padding)
-            region_y2 = min(ctx.image_height, int(ey + eh) + max_padding)
-            region_w = region_x2 - region_x
-            region_h = region_y2 - region_y
-            use_region = region_w * region_h < ctx.image_width * ctx.image_height * 0.5
+        # Determine filter region - use filter_bbox for userSpaceOnUse, elem_bbox for objectBoundingBox
+        if filter_def.filter_units == "userSpaceOnUse" and filter_bbox is not None:
+            # Use the explicit filter region
+            ex, ey, ew, eh = filter_bbox
         else:
-            use_region = False
+            # Use element bbox (possibly expanded by filter percentages for objectBoundingBox)
+            ex, ey, ew, eh = elem_bbox
+            # Apply filter region as percentages of element bbox
+            ex = ex + filter_def.x * ew
+            ey = ey + filter_def.y * eh
+            ew = filter_def.width * ew
+            eh = filter_def.height * eh
+
+        region_x = max(0, int(ex) - max_padding)
+        region_y = max(0, int(ey) - max_padding)
+        region_x2 = min(ctx.image_width, int(ex + ew) + max_padding)
+        region_y2 = min(ctx.image_height, int(ey + eh) + max_padding)
+        region_w = region_x2 - region_x
+        region_h = region_y2 - region_y
+        use_region = region_w * region_h < ctx.image_width * ctx.image_height * 0.5
 
         if use_region and region_w > 0 and region_h > 0:
             temp_image = Image.new("RGBA", (region_w, region_h), (0, 0, 0, 0))
@@ -420,8 +446,12 @@ class SVGRenderer:
             temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id, ctx.path_elements)
 
         # Render the element without filter to get SourceGraphic
+        # Per SVG spec, SourceGraphic should NOT include element opacity
+        # Opacity is applied AFTER the filter
         old_filter_id = element.style.filter_id
+        old_opacity = element.style.opacity
         element.style.filter_id = None
+        element.style.opacity = 1.0
 
         if isinstance(element, GroupElement):
             for child in element.children:
@@ -444,6 +474,7 @@ class SVGRenderer:
             self._render_text(temp_ctx, element)
 
         element.style.filter_id = old_filter_id
+        element.style.opacity = old_opacity
 
         # Execute filter chain (pass temp_ctx for feImage element references)
         source_graphic = np.array(temp_image, dtype=np.uint8)
@@ -453,16 +484,20 @@ class SVGRenderer:
 
         # Apply filter region clipping if needed
         if elem_bbox:
-            ex, ey, ew, eh = elem_bbox
+            ebx, eby, ebw, ebh = elem_bbox
             if filter_def.filter_units == "objectBoundingBox":
-                fx = ex + filter_def.x * ew
-                fy = ey + filter_def.y * eh
-                fw = filter_def.width * ew
-                fh = filter_def.height * eh
+                fx = ebx + filter_def.x * ebw
+                fy = eby + filter_def.y * ebh
+                fw = filter_def.width * ebw
+                fh = filter_def.height * ebh
             else:
-                fx, fy = ctx.base_transform.apply(filter_def.x, filter_def.y)
-                fx2, fy2 = ctx.base_transform.apply(filter_def.x + filter_def.width,
-                                                     filter_def.y + filter_def.height)
+                # userSpaceOnUse - convert percentages to viewport coordinates
+                user_x = filter_def.x * vp_w if getattr(filter_def, 'x_pct', False) else filter_def.x
+                user_y = filter_def.y * vp_h if getattr(filter_def, 'y_pct', False) else filter_def.y
+                user_w = filter_def.width * vp_w if getattr(filter_def, 'width_pct', False) else filter_def.width
+                user_h = filter_def.height * vp_h if getattr(filter_def, 'height_pct', False) else filter_def.height
+                fx, fy = ctx.base_transform.apply(user_x, user_y)
+                fx2, fy2 = ctx.base_transform.apply(user_x + user_w, user_y + user_h)
                 fw, fh = fx2 - fx, fy2 - fy
 
             filter_mask = Image.new("L", temp_image.size, 0)
@@ -470,6 +505,13 @@ class SVGRenderer:
             filter_draw.rectangle([int(fx - region_x), int(fy - region_y),
                                    int(fx + fw - region_x), int(fy + fh - region_y)], fill=255)
             temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], filter_mask))
+
+        # Apply element opacity to the filter result (per SVG spec, opacity is applied after filter)
+        if old_opacity < 1.0:
+            alpha = temp_image.split()[3]
+            # Multiply alpha by opacity
+            alpha = alpha.point(lambda x: int(x * old_opacity))
+            temp_image.putalpha(alpha)
 
         self._alpha_composite(ctx, temp_image, region_x, region_y)
 
@@ -548,19 +590,33 @@ class SVGRenderer:
     def _execute_filter_primitive(self, prim: FilterPrimitive, in1: np.ndarray,
                                     in2: Optional[np.ndarray], width: int, height: int,
                                     scale: float, render_ctx: "RenderContext" = None,
-                                    elem_bbox: tuple = None) -> np.ndarray:
+                                    elem_bbox: tuple = None, filter_def: Filter = None) -> np.ndarray:
         """Execute a single filter primitive."""
         result = None
+
+        # Check if primitiveUnits=objectBoundingBox (length values are fractions of bbox)
+        use_bbox_units = filter_def is not None and filter_def.primitive_units == "objectBoundingBox"
+
         if isinstance(prim, FeGaussianBlur):
-            std_x = prim.std_deviation_x * scale
-            std_y = prim.std_deviation_y * scale
+            if use_bbox_units:
+                # stdDeviation as fraction of bbox - use average of width/height
+                std_x = prim.std_deviation_x * width
+                std_y = prim.std_deviation_y * height
+            else:
+                std_x = prim.std_deviation_x * scale
+                std_y = prim.std_deviation_y * scale
             if HAS_RUST and std_x >= 0.5 or std_y >= 0.5:
                 return vectorstag_rust.fe_gaussian_blur(in1, std_x, std_y)
             return in1
 
         elif isinstance(prim, FeOffset):
-            dx = int(prim.dx * scale)
-            dy = int(prim.dy * scale)
+            if use_bbox_units:
+                # dx/dy as fractions of bbox
+                dx = int(prim.dx * width)
+                dy = int(prim.dy * height)
+            else:
+                dx = int(prim.dx * scale)
+                dy = int(prim.dy * scale)
             if HAS_RUST:
                 return vectorstag_rust.fe_offset(in1, dx, dy)
             # Fallback
@@ -640,8 +696,12 @@ class SVGRenderer:
             return in1
 
         elif isinstance(prim, FeMorphology):
-            rx = prim.radius_x * scale
-            ry = prim.radius_y * scale
+            if use_bbox_units:
+                rx = prim.radius_x * width
+                ry = prim.radius_y * height
+            else:
+                rx = prim.radius_x * scale
+                ry = prim.radius_y * scale
             h, w = in1.shape[:2]
             # For erode with huge radius (>= image dimension), result is transparent
             # because the kernel extends into transparent padding
@@ -856,6 +916,11 @@ class SVGRenderer:
                                           width: int, height: int, scale: float,
                                           render_ctx: "RenderContext" = None) -> np.ndarray:
         """Execute filter chain with proper feMerge support and subregion handling."""
+        # Apply color space conversion if needed (default is linearRGB)
+        use_linear = filter_def.color_interpolation_filters == "linearRGB"
+        if use_linear and HAS_RUST:
+            source_graphic = vectorstag_rust.srgb_to_linear(source_graphic)
+
         buffers = {
             "SourceGraphic": source_graphic,
             "SourceAlpha": self._get_source_alpha(source_graphic),
@@ -892,12 +957,16 @@ class SVGRenderer:
                 in2_name = getattr(prim, 'input2', None)
                 in2 = buffers.get(in2_name, source_graphic) if in2_name else None
                 result = self._execute_filter_primitive_with_subregion(
-                    prim, in1, in2, width, height, scale, subregion, render_ctx
+                    prim, in1, in2, width, height, scale, subregion, render_ctx, filter_def=filter_def
                 )
 
             if prim.result:
                 buffers[prim.result] = result
             last_result = result
+
+        # Convert back to sRGB if we were working in linear space
+        if use_linear and HAS_RUST:
+            last_result = vectorstag_rust.linear_to_srgb(last_result)
 
         return last_result
 
@@ -944,7 +1013,8 @@ class SVGRenderer:
     def _execute_filter_primitive_with_subregion(self, prim: FilterPrimitive, in1: np.ndarray,
                                                    in2: Optional[np.ndarray], width: int, height: int,
                                                    scale: float, subregion: tuple,
-                                                   render_ctx: "RenderContext" = None) -> np.ndarray:
+                                                   render_ctx: "RenderContext" = None,
+                                                   filter_def: Filter = None) -> np.ndarray:
         """Execute a filter primitive with subregion handling."""
         # Unpack subregion: logical (x, y, w, h) and clipped (clip_x, clip_y, clip_w, clip_h)
         log_x, log_y, log_w, log_h, clip_x, clip_y, clip_w, clip_h = subregion
@@ -1001,7 +1071,7 @@ class SVGRenderer:
             return np.random.randint(0, 256, (height, width, 4), dtype=np.uint8)
 
         # For other primitives, execute normally then apply subregion mask
-        result = self._execute_filter_primitive(prim, in1, in2, width, height, scale, render_ctx)
+        result = self._execute_filter_primitive(prim, in1, in2, width, height, scale, render_ctx, filter_def=filter_def)
 
         # Apply subregion mask - only show output within the subregion
         log_x, log_y, log_w, log_h, clip_x, clip_y, clip_w, clip_h = subregion
@@ -1033,6 +1103,54 @@ class SVGRenderer:
                 (element.cx - element.rx, element.cy - element.ry),
                 (element.cx + element.rx, element.cy + element.ry)
             ]
+        elif isinstance(element, GroupElement):
+            # For groups, compute union of all children bboxes
+            all_xs, all_ys = [], []
+            combined = transform.multiply(element.transform)
+            for child in element.children:
+                child_bbox = self._get_element_bbox(child, combined)
+                if child_bbox:
+                    x, y, w, h = child_bbox
+                    all_xs.extend([x, x + w])
+                    all_ys.extend([y, y + h])
+            if all_xs and all_ys:
+                return (min(all_xs), min(all_ys), max(all_xs) - min(all_xs), max(all_ys) - min(all_ys))
+            return None
+        elif isinstance(element, PathElement):
+            # For paths, compute bbox from commands
+            combined = transform.multiply(element.transform)
+            xs, ys = [], []
+            for cmd in element.commands:
+                if hasattr(cmd, 'x'):
+                    tx, ty = combined.apply(cmd.x, cmd.y)
+                    xs.append(tx)
+                    ys.append(ty)
+                if hasattr(cmd, 'x1'):
+                    tx, ty = combined.apply(cmd.x1, cmd.y1)
+                    xs.append(tx)
+                    ys.append(ty)
+                if hasattr(cmd, 'x2'):
+                    tx, ty = combined.apply(cmd.x2, cmd.y2)
+                    xs.append(tx)
+                    ys.append(ty)
+            if xs and ys:
+                return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+            return None
+        elif isinstance(element, (PolygonElement, PolylineElement)):
+            combined = transform.multiply(element.transform)
+            if element.points:
+                transformed = [combined.apply(x, y) for x, y in element.points]
+                xs = [p[0] for p in transformed]
+                ys = [p[1] for p in transformed]
+                return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+            return None
+        elif isinstance(element, LineElement):
+            combined = transform.multiply(element.transform)
+            p1 = combined.apply(element.x1, element.y1)
+            p2 = combined.apply(element.x2, element.y2)
+            xs = [p1[0], p2[0]]
+            ys = [p1[1], p2[1]]
+            return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
         else:
             # For other elements, return None (no clipping)
             return None
@@ -1046,12 +1164,24 @@ class SVGRenderer:
         return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
 
     def _create_clip_mask(self, ctx: "RenderContext", clip_path: ClipPath,
-                          element_transform: Transform) -> Image.Image:
+                          element_transform: Transform, elem_bbox: tuple = None) -> Image.Image:
         """Create a mask image from a clip path."""
         mask = Image.new("L", ctx.image_size, 0)
 
+        # Determine the transform based on clipPathUnits
+        use_bbox_units = clip_path.units == "objectBoundingBox" and elem_bbox is not None
+
         for clip_elem in clip_path.elements:
-            full_transform = ctx.base_transform.multiply(element_transform).multiply(clip_elem.transform)
+            if use_bbox_units:
+                # For objectBoundingBox, clip coordinates (0-1) should be scaled to element bbox
+                bbox_x, bbox_y, bbox_w, bbox_h = elem_bbox
+                # Create transform: translate to bbox origin, then scale by bbox size
+                bbox_transform = Transform.translate(bbox_x, bbox_y).multiply(
+                    Transform.scale(bbox_w, bbox_h)
+                )
+                full_transform = bbox_transform.multiply(clip_elem.transform)
+            else:
+                full_transform = ctx.base_transform.multiply(element_transform).multiply(clip_elem.transform)
 
             # PathElement may have multiple subpaths - handle each separately
             if isinstance(clip_elem, PathElement):
@@ -1076,7 +1206,7 @@ class SVGRenderer:
         # Handle nested clip path (for intersection)
         if clip_path.clip_path_id and clip_path.clip_path_id in ctx.clip_paths:
             nested_clip = ctx.clip_paths[clip_path.clip_path_id]
-            nested_mask = self._create_clip_mask(ctx, nested_clip, element_transform)
+            nested_mask = self._create_clip_mask(ctx, nested_clip, element_transform, elem_bbox)
             # Intersection: keep only where both masks are white
             mask = ImageChops.multiply(mask, nested_mask)
 
@@ -1681,11 +1811,11 @@ class SVGRenderer:
 
         # Create a temporary style with fill set to the stroke gradient
         stroke_ref = style.stroke
-        opacity = style.stroke_opacity * style.opacity
+        stroke_opacity = style.stroke_opacity * style.opacity
 
         # Fill the stroke polygon with gradient
         self._fill_polygon_with_gradient_check(ctx, stroke_polygon, style, element_transform,
-                                               screen_bbox, None, stroke_ref)
+                                               screen_bbox, None, stroke_ref, opacity=stroke_opacity)
 
     def _stroke_dashed_path(self, ctx: "RenderContext", points: List[Tuple[float, float]],
                             style: Style, element_transform: Transform, width: float,
@@ -2399,9 +2529,17 @@ class SVGRenderer:
                                           element_transform: Transform,
                                           bbox: tuple[float, float, float, float],
                                           fill: Optional[tuple[int, int, int, int]],
-                                          fill_ref: Optional[str]):
-        """Fill a polygon, handling gradients and patterns if needed."""
+                                          fill_ref: Optional[str],
+                                          opacity: Optional[float] = None):
+        """Fill a polygon, handling gradients and patterns if needed.
+
+        Args:
+            opacity: Override opacity (for strokes, pass stroke_opacity * element_opacity)
+        """
         fallback_fill = fill  # Keep original fill as fallback
+        # Use passed opacity or default to fill_opacity * element_opacity
+        if opacity is None:
+            opacity = style.fill_opacity * style.opacity
 
         if fill_ref and fill_ref.startswith("url("):
             # Extract paint server ID - handle fallback colors like "url(#id) rgb(0,0,0)"
@@ -2426,7 +2564,7 @@ class SVGRenderer:
                 # Check if gradient has stops - empty gradient should use fallback
                 if gradient.stops:
                     self._fill_polygon_with_gradient(ctx, points, gradient, bbox,
-                                                     style.fill_opacity * style.opacity,
+                                                     opacity,
                                                      style.fill_rule,
                                                      element_transform)
                     return
@@ -2435,7 +2573,7 @@ class SVGRenderer:
             if match in ctx.patterns:
                 pattern = ctx.patterns[match]
                 self._fill_polygon_with_pattern(ctx, points, pattern, bbox,
-                                                style.fill_opacity * style.opacity,
+                                                opacity,
                                                 style.fill_rule,
                                                 element_transform)
                 return
