@@ -29,7 +29,7 @@ class TestResult:
 
 
 def compute_similarity(img1: Image.Image, img2: Image.Image) -> float:
-    """Compute structural similarity between two images."""
+    """Compute structural similarity between two images using premultiplied alpha."""
     # Resize to same dimensions if needed
     if img1.size != img2.size:
         # Use the reference size
@@ -38,38 +38,26 @@ def compute_similarity(img1: Image.Image, img2: Image.Image) -> float:
     arr1 = np.array(img1.convert('RGBA'), dtype=np.float32)
     arr2 = np.array(img2.convert('RGBA'), dtype=np.float32)
 
-    # For transparent pixels (alpha=0), RGB values don't matter
-    # Only compare RGB where at least one image has non-zero alpha
-    alpha1 = arr1[:, :, 3]
-    alpha2 = arr2[:, :, 3]
+    # Use premultiplied alpha comparison
+    # This correctly handles transparent pixels (RGB doesn't matter when A=0)
+    a1 = arr1[:, :, 3:4] / 255.0
+    a2 = arr2[:, :, 3:4] / 255.0
 
-    # Create mask for pixels where we should compare
-    visible = (alpha1 > 0) | (alpha2 > 0)
+    # Premultiply RGB by alpha
+    rgb1 = arr1[:, :, :3] * a1
+    rgb2 = arr2[:, :, :3] * a2
 
-    if not visible.any():
-        return 100.0  # Both images fully transparent
+    # Compare premultiplied RGB
+    rgb_diff = np.abs(rgb1 - rgb2).mean()
 
-    # Compare RGB only for visible pixels, plus compare alpha for all
-    rgb_diff = np.abs(arr1[:, :, :3] - arr2[:, :, :3])
-    rgb_diff_masked = np.where(visible[:, :, np.newaxis], rgb_diff, 0)
-    alpha_diff = np.abs(alpha1 - alpha2)
+    # Also compare alpha channel
+    alpha_diff = np.abs(arr1[:, :, 3] - arr2[:, :, 3]).mean()
 
-    # Weighted average: RGB diff for visible + alpha diff for all
-    total_pixels = arr1.shape[0] * arr1.shape[1]
-    visible_count = visible.sum()
-
-    if visible_count > 0:
-        rgb_mae = rgb_diff_masked.sum() / (visible_count * 3)
-    else:
-        rgb_mae = 0
-
-    alpha_mae = alpha_diff.mean()
-
-    # Combine: RGB contributes more but alpha also matters
-    combined_mae = (rgb_mae * 0.75 + alpha_mae * 0.25)
+    # Combine: both RGB and alpha contribute equally
+    combined_diff = (rgb_diff + alpha_diff) / 2
 
     # Convert to similarity percentage (0-255 scale)
-    similarity = 100 * (1 - combined_mae / 255)
+    similarity = 100 * (1 - combined_diff / 255)
     return max(0, similarity)
 
 

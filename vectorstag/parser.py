@@ -133,6 +133,22 @@ class RadialGradient:
     spread_method: str = "pad"  # pad, reflect, repeat
 
 
+@dataclass
+class Pattern:
+    """Pattern definition for tiled fills."""
+    id: str
+    x: float = 0.0
+    y: float = 0.0
+    width: float = 0.0
+    height: float = 0.0
+    pattern_units: str = "objectBoundingBox"  # objectBoundingBox or userSpaceOnUse
+    pattern_content_units: str = "userSpaceOnUse"  # objectBoundingBox or userSpaceOnUse
+    transform: Optional[Transform] = None
+    href: Optional[str] = None  # Reference to another pattern
+    viewbox: Optional[tuple[float, float, float, float]] = None
+    elements: list = field(default_factory=list)  # Child elements to render
+
+
 # Sentinel value to distinguish "fill not set" from "fill=none"
 FILL_NOT_SET = object()
 
@@ -503,6 +519,7 @@ class SVGDocument:
     viewBox: Optional[tuple[float, float, float, float]] = None
     elements: list[SVGElement] = field(default_factory=list)
     gradients: dict[str, Union[LinearGradient, RadialGradient]] = field(default_factory=dict)
+    patterns: dict[str, Pattern] = field(default_factory=dict)
     clip_paths: dict[str, ClipPath] = field(default_factory=dict)
     masks: dict[str, Mask] = field(default_factory=dict)
     filters: dict[str, Filter] = field(default_factory=dict)
@@ -729,6 +746,7 @@ class SVGParser:
 
         # Reset state
         self.gradients = {}
+        self.patterns = {}
         self.clip_paths = {}
         self.masks = {}
         self.filters = {}
@@ -745,8 +763,9 @@ class SVGParser:
         self._parse_clip_paths(root)
         self._parse_masks(root)
 
-        # Resolve gradient references
+        # Resolve gradient and pattern references
         self._resolve_gradient_refs()
+        self._resolve_pattern_refs()
 
         # Parse root element style (for inherited properties like stroke-width)
         root_style = self._parse_style(root, Style())
@@ -782,6 +801,7 @@ class SVGParser:
             viewBox=viewBox,
             elements=elements,
             gradients=self.gradients,
+            patterns=self.patterns,
             clip_paths=self.clip_paths,
             masks=self.masks,
             filters=self.filters,
@@ -844,6 +864,8 @@ class SVGParser:
                 self._parse_linear_gradient(elem)
             elif tag == "radialGradient":
                 self._parse_radial_gradient(elem)
+            elif tag == "pattern":
+                self._parse_pattern(elem)
             elif tag == "filter":
                 self._parse_filter(elem)
 
@@ -1406,6 +1428,85 @@ class SVGParser:
                 # Inherit stops if not defined
                 if not grad.stops and ref.stops:
                     grad.stops = ref.stops.copy()
+
+    def _parse_pattern(self, elem: ET.Element):
+        """Parse a pattern element."""
+        pattern_id = elem.get("id")
+        if not pattern_id:
+            return
+
+        # Get pattern attributes
+        x = self._parse_length(elem.get("x", "0"))
+        y = self._parse_length(elem.get("y", "0"))
+        width = self._parse_length(elem.get("width", "0"))
+        height = self._parse_length(elem.get("height", "0"))
+
+        pattern_units = elem.get("patternUnits", "objectBoundingBox")
+        pattern_content_units = elem.get("patternContentUnits", "userSpaceOnUse")
+
+        # Parse transform
+        transform = None
+        transform_str = elem.get("patternTransform")
+        if transform_str:
+            transform = self._parse_transform(transform_str)
+
+        # Parse href reference
+        href = None
+        for attr in ["href", "{http://www.w3.org/1999/xlink}href"]:
+            href_val = elem.get(attr)
+            if href_val and href_val.startswith("#"):
+                href = href_val[1:]
+                break
+
+        # Parse viewBox
+        viewbox = None
+        viewbox_str = elem.get("viewBox")
+        if viewbox_str:
+            try:
+                parts = viewbox_str.replace(",", " ").split()
+                if len(parts) >= 4:
+                    viewbox = tuple(float(p) for p in parts[:4])
+            except ValueError:
+                pass
+
+        # Parse child elements
+        elements = []
+        for child in elem:
+            child_tag = self._strip_ns(child.tag)
+            if child_tag not in ["title", "desc", "metadata"]:
+                parsed = self._parse_element(child, Transform.identity(), Style(), depth=1)
+                if parsed:
+                    elements.append(parsed)
+
+        pattern = Pattern(
+            id=pattern_id,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            pattern_units=pattern_units,
+            pattern_content_units=pattern_content_units,
+            transform=transform,
+            href=href,
+            viewbox=viewbox,
+            elements=elements
+        )
+
+        self.patterns[pattern_id] = pattern
+
+    def _resolve_pattern_refs(self):
+        """Resolve pattern href references."""
+        for pattern in self.patterns.values():
+            if pattern.href and pattern.href in self.patterns:
+                ref = self.patterns[pattern.href]
+                # Inherit elements if not defined
+                if not pattern.elements and ref.elements:
+                    pattern.elements = ref.elements.copy()
+                # Inherit dimensions if not set
+                if pattern.width == 0 and ref.width > 0:
+                    pattern.width = ref.width
+                if pattern.height == 0 and ref.height > 0:
+                    pattern.height = ref.height
 
     def _parse_children(self, parent: ET.Element, parent_transform: Transform,
                         parent_style: Style, parent_text_anchor: str = "start",

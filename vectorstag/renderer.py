@@ -16,7 +16,7 @@ from .parser import (
     SVGParser, SVGDocument, SVGElement, Transform, Style,
     RectElement, CircleElement, EllipseElement, LineElement,
     PolylineElement, PolygonElement, PathElement, GroupElement,
-    TextElement, ImageElement, LinearGradient, RadialGradient, GradientStop,
+    TextElement, ImageElement, LinearGradient, RadialGradient, GradientStop, Pattern,
     ClipPath, Mask, FILL_NOT_SET, Filter, FilterPrimitive,
     FeGaussianBlur, FeOffset, FeFlood, FeBlend, FeComposite, FeMerge, FeMergeNode,
     FeColorMatrix, FeComponentTransfer, FeMorphology, FeConvolveMatrix,
@@ -129,7 +129,7 @@ class SVGRenderer:
             image_arr = None
 
         # Create render context with numpy array as primary (if Rust available)
-        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.masks, doc.filters)
+        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.masks, doc.filters, doc.patterns)
         ctx.image_arr = image_arr
 
         # Render all elements
@@ -263,7 +263,7 @@ class SVGRenderer:
 
         # Create a temporary image for the element
         temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
-        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters)
+        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns)
 
         # Temporarily remove clip path to render to temp image
         old_clip_path_id = element.clip_path_id
@@ -288,7 +288,7 @@ class SVGRenderer:
 
         # Create a temporary image for the element
         temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
-        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters)
+        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns)
 
         # Temporarily remove mask to render to temp image
         old_mask_id = element.mask_id
@@ -335,7 +335,7 @@ class SVGRenderer:
             # userSpaceOnUse - use base transform
             mask_transform = ctx.base_transform
 
-        mask_ctx = RenderContext(mask_image, ctx.gradients, mask_transform, ctx.clip_paths, ctx.masks, ctx.filters)
+        mask_ctx = RenderContext(mask_image, ctx.gradients, mask_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns)
 
         # Render mask elements
         for mask_elem in mask_def.elements:
@@ -395,12 +395,12 @@ class SVGRenderer:
             temp_image = Image.new("RGBA", (region_w, region_h), (0, 0, 0, 0))
             offset_transform = Transform(1, 0, 0, 1, -region_x, -region_y)
             adjusted_base = offset_transform.multiply(ctx.base_transform)
-            temp_ctx = RenderContext(temp_image, ctx.gradients, adjusted_base, ctx.clip_paths, ctx.masks, ctx.filters)
+            temp_ctx = RenderContext(temp_image, ctx.gradients, adjusted_base, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns)
         else:
             region_x, region_y = 0, 0
             region_w, region_h = ctx.image_width, ctx.image_height
             temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
-            temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters)
+            temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns)
 
         # Render the element without filter to get SourceGraphic
         old_filter_id = element.style.filter_id
@@ -2269,9 +2269,9 @@ class SVGRenderer:
                                           bbox: tuple[float, float, float, float],
                                           fill: Optional[tuple[int, int, int, int]],
                                           fill_ref: Optional[str]):
-        """Fill a polygon, handling gradients if needed."""
+        """Fill a polygon, handling gradients and patterns if needed."""
         if fill_ref and fill_ref.startswith("url("):
-            # Extract gradient ID - handle fallback colors like "url(#id) rgb(0,0,0)"
+            # Extract paint server ID - handle fallback colors like "url(#id) rgb(0,0,0)"
             end_paren = fill_ref.find(")")
             if end_paren != -1:
                 match = fill_ref[4:end_paren]  # Remove "url(" and extract up to ")"
@@ -2286,6 +2286,14 @@ class SVGRenderer:
                                                  style.fill_opacity * style.opacity,
                                                  style.fill_rule,
                                                  element_transform)
+                return
+
+            if match in ctx.patterns:
+                pattern = ctx.patterns[match]
+                self._fill_polygon_with_pattern(ctx, points, pattern, bbox,
+                                                style.fill_opacity * style.opacity,
+                                                style.fill_rule,
+                                                element_transform)
                 return
 
         # Simple fill with fill-rule support
@@ -2862,6 +2870,188 @@ class SVGRenderer:
 
         # Apply gradient with mask (memory-optimized: no full-size temp)
         self._composite_gradient_masked(ctx, grad_img, mask_arr, min_x, min_y)
+
+    def _fill_polygon_with_pattern(self, ctx: "RenderContext",
+                                   points: list[tuple[float, float]],
+                                   pattern: Pattern,
+                                   bbox: tuple[float, float, float, float],
+                                   opacity: float,
+                                   fill_rule: str = "nonzero",
+                                   element_transform: Transform = None):
+        """Fill a polygon with a tiled pattern."""
+        if not points or len(points) < 3:
+            return
+
+        if pattern.width <= 0 or pattern.height <= 0:
+            return
+
+        # Get bounds of transformed points
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        min_x, max_x = int(min(xs)), int(max(xs)) + 1
+        min_y, max_y = int(min(ys)), int(max(ys)) + 1
+
+        if min_x >= max_x or min_y >= max_y:
+            return
+
+        # Clip to image bounds
+        min_x = max(0, min_x)
+        min_y = max(0, min_y)
+        max_x = min(ctx.image_width, max_x)
+        max_y = min(ctx.image_height, max_y)
+
+        if min_x >= max_x or min_y >= max_y:
+            return
+
+        fill_width = max_x - min_x
+        fill_height = max_y - min_y
+
+        # Calculate pattern tile size in screen coordinates
+        bx, by, bw, bh = bbox
+        scale_x = ctx.base_transform.a
+        scale_y = ctx.base_transform.d
+
+        if pattern.pattern_units == "objectBoundingBox":
+            # Pattern dimensions are relative to bbox (0-1 range)
+            tile_w = int(pattern.width * bw * scale_x + 0.5)
+            tile_h = int(pattern.height * bh * scale_y + 0.5)
+            pat_x = bx + pattern.x * bw
+            pat_y = by + pattern.y * bh
+        else:
+            # Pattern dimensions are in user space
+            tile_w = int(pattern.width * scale_x + 0.5)
+            tile_h = int(pattern.height * scale_y + 0.5)
+            pat_x = pattern.x
+            pat_y = pattern.y
+
+        if tile_w <= 0 or tile_h <= 0:
+            return
+
+        # Render pattern tile
+        tile_img = Image.new("RGBA", (tile_w, tile_h), (0, 0, 0, 0))
+
+        # Create a sub-context for rendering pattern elements
+        if pattern.pattern_content_units == "objectBoundingBox":
+            # Content coordinates are relative to bbox
+            content_transform = Transform(bw, 0, 0, bh, bx, by)
+            content_transform = ctx.base_transform.multiply(content_transform)
+        else:
+            # Content coordinates are in user space, scale to tile size
+            if pattern.viewbox:
+                vb_x, vb_y, vb_w, vb_h = pattern.viewbox
+                sx = tile_w / vb_w if vb_w > 0 else 1
+                sy = tile_h / vb_h if vb_h > 0 else 1
+                content_transform = Transform(sx, 0, 0, sy, -vb_x * sx, -vb_y * sy)
+            else:
+                content_transform = Transform(scale_x, 0, 0, scale_y, 0, 0)
+
+        # Create context without this pattern to prevent recursion
+        safe_patterns = {k: v for k, v in ctx.patterns.items() if k != pattern.id}
+        tile_ctx = RenderContext(tile_img, ctx.gradients, content_transform,
+                                 ctx.clip_paths, ctx.masks, ctx.filters, safe_patterns)
+
+        # Render pattern elements (with recursion limit)
+        for elem in pattern.elements:
+            self._render_element(tile_ctx, elem, depth=5)
+
+        # Handle patternTransform
+        has_transform = pattern.transform is not None
+
+        if has_transform:
+            # For transformed patterns, we need to tile in a larger area and transform
+            import math
+            # Calculate expanded bounds to handle rotation
+            diag = math.sqrt(fill_width**2 + fill_height**2)
+            expand = int(diag - min(fill_width, fill_height)) // 2 + tile_w + tile_h
+            exp_width = fill_width + 2 * expand
+            exp_height = fill_height + 2 * expand
+
+            # Create larger tiled pattern
+            exp_pattern = Image.new("RGBA", (exp_width, exp_height), (0, 0, 0, 0))
+
+            # Calculate pattern offset in expanded coordinates
+            px, py = ctx.base_transform.apply(pat_x, pat_y)
+            offset_x = int((min_x - expand - px) % tile_w) if tile_w > 0 else 0
+            offset_y = int((min_y - expand - py) % tile_h) if tile_h > 0 else 0
+
+            # Tile the pattern in expanded area
+            for ty in range(-offset_y, exp_height, tile_h):
+                for tx in range(-offset_x, exp_width, tile_w):
+                    exp_pattern.paste(tile_img, (tx, ty), tile_img)
+
+            # Apply patternTransform using PIL
+            # Convert Transform to PIL affine (inverse for sampling)
+            pt = pattern.transform
+            # Apply transform centered on the fill region
+            cx, cy = exp_width / 2, exp_height / 2
+
+            # Create affine matrix for PIL (inverse transform for resampling)
+            # PIL expects [a, b, c, d, e, f] where new_x = a*x + b*y + c
+            det = pt.a * pt.d - pt.b * pt.c
+            if abs(det) > 1e-10:
+                inv_a = pt.d / det
+                inv_b = -pt.b / det
+                inv_c = (pt.b * pt.f - pt.d * pt.e) / det
+                inv_d = -pt.c / det
+                inv_e = pt.a / det
+                inv_f = (pt.c * pt.e - pt.a * pt.f) / det
+
+                # Apply transform around center of fill region
+                fill_cx = fill_width / 2
+                fill_cy = fill_height / 2
+                exp_cx = expand + fill_cx
+                exp_cy = expand + fill_cy
+
+                # Translate to center, apply inverse, translate back
+                affine = (
+                    inv_a, inv_b, exp_cx - inv_a * fill_cx - inv_b * fill_cy,
+                    inv_d, inv_e, exp_cy - inv_d * fill_cx - inv_e * fill_cy
+                )
+
+                pattern_img = exp_pattern.transform(
+                    (fill_width, fill_height),
+                    Image.AFFINE,
+                    affine,
+                    resample=Image.BILINEAR
+                )
+            else:
+                # Singular transform - just crop
+                pattern_img = exp_pattern.crop((expand, expand, expand + fill_width, expand + fill_height))
+        else:
+            # No transform - simple tiling
+            pattern_img = Image.new("RGBA", (fill_width, fill_height), (0, 0, 0, 0))
+
+            # Calculate pattern offset
+            px, py = ctx.base_transform.apply(pat_x, pat_y)
+            offset_x = int((min_x - px) % tile_w) if tile_w > 0 else 0
+            offset_y = int((min_y - py) % tile_h) if tile_h > 0 else 0
+
+            # Tile the pattern
+            for ty in range(-offset_y, fill_height, tile_h):
+                for tx in range(-offset_x, fill_width, tile_w):
+                    pattern_img.paste(tile_img, (tx, ty), tile_img)
+
+        # Apply opacity if needed
+        if opacity < 1.0:
+            pattern_arr = np.array(pattern_img)
+            pattern_arr[:, :, 3] = (pattern_arr[:, :, 3] * opacity).astype(np.uint8)
+            pattern_img = Image.fromarray(pattern_arr, "RGBA")
+
+        # Create mask from polygon
+        if HAS_RUST:
+            if fill_rule == "evenodd":
+                mask_arr = vectorstag_rust.fill_polygon_evenodd(points, fill_width, fill_height, min_x, min_y)
+            else:
+                mask_arr = vectorstag_rust.fill_polygon_nonzero(points, fill_width, fill_height, min_x, min_y)
+        else:
+            mask_img = Image.new("L", (fill_width, fill_height), 0)
+            mask_draw = ImageDraw.Draw(mask_img)
+            local_points = [(x - min_x, y - min_y) for x, y in points]
+            mask_draw.polygon(local_points, fill=255)
+            mask_arr = np.array(mask_img)
+
+        # Apply pattern with mask
+        self._composite_gradient_masked(ctx, pattern_img, mask_arr, min_x, min_y)
 
     def _create_evenodd_mask(self, points: list[tuple[float, float]],
                              min_x: int, min_y: int, width: int, height: int) -> Image.Image:
@@ -3527,10 +3717,12 @@ class RenderContext:
                  base_transform: Transform,
                  clip_paths: dict[str, ClipPath] = None,
                  masks: dict[str, Mask] = None,
-                 filters: dict = None):
+                 filters: dict = None,
+                 patterns: dict[str, Pattern] = None):
         self.image = image
         self.image_arr = None  # Optional numpy array for Rust compositing
         self.gradients = gradients
+        self.patterns = patterns or {}
         self.base_transform = base_transform
         self.clip_paths = clip_paths or {}
         self.masks = masks or {}
