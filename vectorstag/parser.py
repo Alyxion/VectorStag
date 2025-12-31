@@ -523,6 +523,7 @@ class SVGDocument:
     clip_paths: dict[str, ClipPath] = field(default_factory=dict)
     masks: dict[str, Mask] = field(default_factory=dict)
     filters: dict[str, Filter] = field(default_factory=dict)
+    elements_by_id: dict[str, SVGElement] = field(default_factory=dict)  # For feImage references
     preserve_aspect_ratio: str = "xMidYMid"  # SVG default
 
 
@@ -752,6 +753,7 @@ class SVGParser:
         self.filters = {}
         self.defs = {}
         self.css_classes = {}
+        self.elements_by_id = {}  # For feImage element references
 
         # Parse CSS from <style> blocks
         self._parse_css_styles(root)
@@ -805,6 +807,7 @@ class SVGParser:
             clip_paths=self.clip_paths,
             masks=self.masks,
             filters=self.filters,
+            elements_by_id=self.elements_by_id,
             preserve_aspect_ratio=preserve_aspect_ratio
         )
 
@@ -853,12 +856,20 @@ class SVGParser:
 
     def _collect_defs(self, root: ET.Element):
         """Collect all definitions (gradients, filters, etc.)."""
+        # Visual element tags that can be referenced by feImage
+        visual_tags = {"rect", "circle", "ellipse", "line", "polyline", "polygon", "path", "g", "text", "image", "use"}
+
         for elem in root.iter():
             tag = self._strip_ns(elem.tag)
             elem_id = elem.get("id")
 
             if elem_id:
                 self.defs[elem_id] = elem
+                # Parse visual elements inside defs for feImage references
+                if tag in visual_tags:
+                    parsed = self._parse_element(elem, Transform.identity(), Style(), depth=1)
+                    if parsed:
+                        self.elements_by_id[elem_id] = parsed
 
             if tag == "linearGradient":
                 self._parse_linear_gradient(elem)
@@ -973,8 +984,11 @@ class SVGParser:
         filter_y = parse_filter_val(elem.get("y"), default_y)
         filter_w = parse_filter_val(elem.get("width"), default_w)
         filter_h = parse_filter_val(elem.get("height"), default_h)
-        filter_units = elem.get("filterUnits") or (base_filter.filter_units if base_filter else "objectBoundingBox")
-        primitive_units = elem.get("primitiveUnits") or (base_filter.primitive_units if base_filter else "userSpaceOnUse")
+        filter_units_raw = elem.get("filterUnits") or (base_filter.filter_units if base_filter else "objectBoundingBox")
+        # Validate filterUnits - only objectBoundingBox and userSpaceOnUse are valid
+        filter_units = filter_units_raw if filter_units_raw in ("objectBoundingBox", "userSpaceOnUse") else "objectBoundingBox"
+        primitive_units_raw = elem.get("primitiveUnits") or (base_filter.primitive_units if base_filter else "userSpaceOnUse")
+        primitive_units = primitive_units_raw if primitive_units_raw in ("objectBoundingBox", "userSpaceOnUse") else "userSpaceOnUse"
         color_interp = elem.get("color-interpolation-filters") or (base_filter.color_interpolation_filters if base_filter else "linearRGB")
 
         primitives = []
@@ -1626,6 +1640,10 @@ class SVGParser:
                 result.clip_path_id = clip_path_id
             if mask_id:
                 result.mask_id = mask_id
+            # Track element by ID for feImage references
+            elem_id = elem.get("id")
+            if elem_id:
+                self.elements_by_id[elem_id] = result
 
         return result
 
@@ -1636,6 +1654,9 @@ class SVGParser:
         value = value.strip()
         if value.startswith("url(") and value.endswith(")"):
             ref = value[4:-1].strip()
+            # Strip quotes if present (SVG 2 allows quoted URLs)
+            if (ref.startswith("'") and ref.endswith("'")) or (ref.startswith('"') and ref.endswith('"')):
+                ref = ref[1:-1]
             if ref.startswith("#"):
                 return ref[1:]
             return ref
@@ -1689,7 +1710,7 @@ class SVGParser:
         # Apply parsed values
         if "fill" in style_dict:
             fill_val = style_dict["fill"]
-            if fill_val == "none":
+            if fill_val == "none" or fill_val == "transparent":
                 style.fill = None
             elif fill_val.startswith("url("):
                 # Gradient reference
@@ -1705,7 +1726,7 @@ class SVGParser:
 
         if "stroke" in style_dict:
             stroke_val = style_dict["stroke"]
-            if stroke_val == "none":
+            if stroke_val == "none" or stroke_val == "transparent":
                 style.stroke = None
             elif stroke_val.startswith("url("):
                 style.stroke = stroke_val
@@ -1725,9 +1746,9 @@ class SVGParser:
             try:
                 val = style_dict["fill-opacity"]
                 if val.endswith('%'):
-                    style.fill_opacity = float(val[:-1]) / 100.0
+                    style.fill_opacity = max(0.0, min(1.0, float(val[:-1]) / 100.0))
                 else:
-                    style.fill_opacity = float(val)
+                    style.fill_opacity = max(0.0, min(1.0, float(val)))
             except (ValueError, AttributeError):
                 pass
 
@@ -1735,9 +1756,9 @@ class SVGParser:
             try:
                 val = style_dict["stroke-opacity"]
                 if val.endswith('%'):
-                    style.stroke_opacity = float(val[:-1]) / 100.0
+                    style.stroke_opacity = max(0.0, min(1.0, float(val[:-1]) / 100.0))
                 else:
-                    style.stroke_opacity = float(val)
+                    style.stroke_opacity = max(0.0, min(1.0, float(val)))
             except (ValueError, AttributeError):
                 pass
 
@@ -1745,9 +1766,9 @@ class SVGParser:
             try:
                 val = style_dict["opacity"]
                 if val.endswith('%'):
-                    style.opacity = float(val[:-1]) / 100.0
+                    style.opacity = max(0.0, min(1.0, float(val[:-1]) / 100.0))
                 else:
-                    style.opacity = float(val)
+                    style.opacity = max(0.0, min(1.0, float(val)))
             except (ValueError, AttributeError):
                 pass
 

@@ -3,27 +3,37 @@
 ## Project Goal
 Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG and resvg.
 
-## Current Status: 92% resvg-filter-suite / 100% FontAwesome / 99.9% Emoji / 99.9% Flag Accuracy
+**Target**: 99.9% accuracy on resvg-test-suite (currently 94.3%)
 
-**Date**: 2025-12-30
+## Current Status: 94.3% resvg-test-suite / 100% FontAwesome / 99.9% Emoji / 99.9% Flag Accuracy
 
-### resvg-test-suite Results (800 tests sample)
-- **Average Accuracy**: 89.06%
-- **99%+ Accuracy**: 35.6% (283 tests)
-- **95-99%**: 12.7% (101 tests)
-- **90-95%**: 16.0% (127 tests)
-- **80-90%**: 14.4% (114 tests)
-- **<80%**: 21.3% (169 tests)
+**Date**: 2025-12-31
+
+### Priority Issues to Reach 99.9%
+1. **feSpecularLighting** (70.4%) - Complex lighting calculations need improvement
+2. **feImage** (80.3%) - Embedded SVG images not supported
+3. **feConvolveMatrix** (80.6%) - Pattern support needed
+4. **structure/image** (~81%) - External/embedded image handling
+5. **Filter subregion calculations** - Incomplete implementation
+6. **Text rendering differences** - Font metrics/positioning
+
+### resvg-test-suite Results (1,295 tests)
+- **Average Accuracy**: 94.3%
+- **99%+ Accuracy**: 51.9% (672 tests)
+- **95-99%**: 20.8% (270 tests)
+- **90-95%**: 9.4% (121 tests)
+- **80-90%**: 9.0% (117 tests)
+- **<80%**: 8.9% (115 tests)
+- **Errors**: 4 (0.3%)
 
 | Category | Accuracy | Tests |
 |----------|----------|-------|
-| shapes | 96.71% | 133 |
-| text | 95.60% | 356 |
-| painting | 93.67% | 304 |
-| masking | 92.50% | 93 |
-| paint-servers | 90.48% | 149 |
-| structure | 88.45% | 247 |
-| filters | 86.26% | 397 |
+| shapes | 96.7% | 133 |
+| painting | 95.9% | 144 |
+| paint-servers | 94.5% | 149 |
+| masking | 93.3% | 91 |
+| filters | 93.1% | 396 |
+| structure | 92.2% | 238 |
 
 ### Performance vs Reference Renderers
 - **VectorStag**: ~32 files/sec at 400x400 with 4x antialiasing (single-thread)

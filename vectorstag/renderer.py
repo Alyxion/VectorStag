@@ -129,7 +129,7 @@ class SVGRenderer:
             image_arr = None
 
         # Create render context with numpy array as primary (if Rust available)
-        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.masks, doc.filters, doc.patterns)
+        ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.masks, doc.filters, doc.patterns, doc.elements_by_id)
         ctx.image_arr = image_arr
 
         # Render all elements
@@ -263,7 +263,7 @@ class SVGRenderer:
 
         # Create a temporary image for the element
         temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
-        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns)
+        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id)
 
         # Temporarily remove clip path to render to temp image
         old_clip_path_id = element.clip_path_id
@@ -288,7 +288,7 @@ class SVGRenderer:
 
         # Create a temporary image for the element
         temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
-        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns)
+        temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id)
 
         # Temporarily remove mask to render to temp image
         old_mask_id = element.mask_id
@@ -335,7 +335,7 @@ class SVGRenderer:
             # userSpaceOnUse - use base transform
             mask_transform = ctx.base_transform
 
-        mask_ctx = RenderContext(mask_image, ctx.gradients, mask_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns)
+        mask_ctx = RenderContext(mask_image, ctx.gradients, mask_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id)
 
         # Render mask elements
         for mask_elem in mask_def.elements:
@@ -361,8 +361,23 @@ class SVGRenderer:
         """Render an element with SVG filter primitives applied."""
         filter_def = ctx.filters[element.style.filter_id]
 
+        # If filter has no primitives, output is transparent (no rendering)
+        if not filter_def.primitives:
+            return
+
         # Get element bounding box in screen coordinates
         elem_bbox = self._get_element_bbox(element, ctx.base_transform)
+
+        # If element has no content (empty bbox), check if filter has explicit region
+        # Filters with userSpaceOnUse and explicit region can render even on empty elements
+        if elem_bbox is None or (elem_bbox[2] <= 0 and elem_bbox[3] <= 0):
+            if filter_def.filter_units == "userSpaceOnUse" and filter_def.width > 0 and filter_def.height > 0:
+                # Use the filter's explicit region as the bounding box
+                fx, fy = ctx.base_transform.apply(filter_def.x, filter_def.y)
+                fx2, fy2 = ctx.base_transform.apply(filter_def.x + filter_def.width, filter_def.y + filter_def.height)
+                elem_bbox = (fx, fy, fx2 - fx, fy2 - fy)
+            else:
+                return
 
         # Calculate filter region
         combined = ctx.base_transform.multiply(element.transform)
@@ -395,12 +410,12 @@ class SVGRenderer:
             temp_image = Image.new("RGBA", (region_w, region_h), (0, 0, 0, 0))
             offset_transform = Transform(1, 0, 0, 1, -region_x, -region_y)
             adjusted_base = offset_transform.multiply(ctx.base_transform)
-            temp_ctx = RenderContext(temp_image, ctx.gradients, adjusted_base, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns)
+            temp_ctx = RenderContext(temp_image, ctx.gradients, adjusted_base, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id)
         else:
             region_x, region_y = 0, 0
             region_w, region_h = ctx.image_width, ctx.image_height
             temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
-            temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns)
+            temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id)
 
         # Render the element without filter to get SourceGraphic
         old_filter_id = element.style.filter_id
@@ -428,9 +443,9 @@ class SVGRenderer:
 
         element.style.filter_id = old_filter_id
 
-        # Execute filter chain
+        # Execute filter chain (pass temp_ctx for feImage element references)
         source_graphic = np.array(temp_image, dtype=np.uint8)
-        result = self._execute_filter_chain_with_merge(filter_def, source_graphic, region_w, region_h, scale)
+        result = self._execute_filter_chain_with_merge(filter_def, source_graphic, region_w, region_h, scale, temp_ctx)
 
         temp_image = Image.fromarray(result, mode='RGBA')
 
@@ -497,7 +512,7 @@ class SVGRenderer:
 
     def _execute_filter_primitive(self, prim: FilterPrimitive, in1: np.ndarray,
                                     in2: Optional[np.ndarray], width: int, height: int,
-                                    scale: float) -> np.ndarray:
+                                    scale: float, render_ctx: "RenderContext" = None) -> np.ndarray:
         """Execute a single filter primitive."""
         if isinstance(prim, FeGaussianBlur):
             std_x = prim.std_deviation_x * scale
@@ -589,8 +604,12 @@ class SVGRenderer:
         elif isinstance(prim, FeConvolveMatrix):
             if HAS_RUST:
                 divisor = prim.divisor if prim.divisor is not None else sum(prim.kernel_matrix) or 1.0
+                # Default target to center, clamp to valid range [0, order-1]
                 target_x = prim.target_x if prim.target_x is not None else prim.order_x // 2
                 target_y = prim.target_y if prim.target_y is not None else prim.order_y // 2
+                # Clamp to valid range to prevent errors with negative or out-of-range values
+                target_x = max(0, min(target_x, prim.order_x - 1))
+                target_y = max(0, min(target_y, prim.order_y - 1))
                 edge_map = {"duplicate": 0, "wrap": 1, "none": 2}
                 edge_mode = edge_map.get(prim.edge_mode, 0)
                 return vectorstag_rust.fe_convolve_matrix(
@@ -729,16 +748,57 @@ class SVGRenderer:
                         return np.array(img)
                 except Exception:
                     pass
-            elif href.startswith('#'):
-                # Element reference - not supported yet
-                pass
+            elif href.startswith('#') and render_ctx is not None:
+                # Element reference - render the referenced element
+                elem_id = href[1:]  # Remove the # prefix
+                if elem_id in render_ctx.elements_by_id:
+                    # Check for recursive reference - if we're rendering for feImage,
+                    # don't allow the referenced element to use the same filter
+                    ref_elem = render_ctx.elements_by_id[elem_id]
+
+                    # Track which elements are being rendered for feImage to prevent loops
+                    if not hasattr(self, '_feimage_rendering'):
+                        self._feimage_rendering = set()
+
+                    if elem_id in self._feimage_rendering:
+                        # Self-recursive reference - return transparent
+                        return np.zeros((height, width, 4), dtype=np.uint8)
+
+                    self._feimage_rendering.add(elem_id)
+                    try:
+                        # Create a temporary image for rendering the referenced element
+                        temp_image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                        temp_ctx = RenderContext(temp_image, render_ctx.gradients,
+                                                render_ctx.base_transform, render_ctx.clip_paths,
+                                                render_ctx.masks, render_ctx.filters,
+                                                render_ctx.patterns, render_ctx.elements_by_id)
+
+                        # Temporarily disable filter on the element to prevent recursion
+                        old_filter_id = None
+                        if hasattr(ref_elem, 'style') and hasattr(ref_elem.style, 'filter_id'):
+                            old_filter_id = ref_elem.style.filter_id
+                            ref_elem.style.filter_id = None
+
+                        # Render the referenced element
+                        self._render_element(temp_ctx, ref_elem, depth=0)
+
+                        # Restore filter
+                        if old_filter_id is not None:
+                            ref_elem.style.filter_id = old_filter_id
+
+                        return np.array(temp_image, dtype=np.uint8)
+                    except Exception:
+                        pass
+                    finally:
+                        self._feimage_rendering.discard(elem_id)
 
             return in1
 
         return in1
 
     def _execute_filter_chain_with_merge(self, filter_def: Filter, source_graphic: np.ndarray,
-                                          width: int, height: int, scale: float) -> np.ndarray:
+                                          width: int, height: int, scale: float,
+                                          render_ctx: "RenderContext" = None) -> np.ndarray:
         """Execute filter chain with proper feMerge support and subregion handling."""
         buffers = {
             "SourceGraphic": source_graphic,
@@ -773,7 +833,7 @@ class SVGRenderer:
                 in2_name = getattr(prim, 'input2', None)
                 in2 = buffers.get(in2_name, source_graphic) if in2_name else None
                 result = self._execute_filter_primitive_with_subregion(
-                    prim, in1, in2, width, height, scale, subregion
+                    prim, in1, in2, width, height, scale, subregion, render_ctx
                 )
 
             if prim.result:
@@ -824,7 +884,8 @@ class SVGRenderer:
 
     def _execute_filter_primitive_with_subregion(self, prim: FilterPrimitive, in1: np.ndarray,
                                                    in2: Optional[np.ndarray], width: int, height: int,
-                                                   scale: float, subregion: tuple) -> np.ndarray:
+                                                   scale: float, subregion: tuple,
+                                                   render_ctx: "RenderContext" = None) -> np.ndarray:
         """Execute a filter primitive with subregion handling."""
         # Unpack subregion: logical (x, y, w, h) and clipped (clip_x, clip_y, clip_w, clip_h)
         log_x, log_y, log_w, log_h, clip_x, clip_y, clip_w, clip_h = subregion
@@ -881,7 +942,7 @@ class SVGRenderer:
             return np.random.randint(0, 256, (height, width, 4), dtype=np.uint8)
 
         # For other primitives, use the standard execution
-        return self._execute_filter_primitive(prim, in1, in2, width, height, scale)
+        return self._execute_filter_primitive(prim, in1, in2, width, height, scale, render_ctx)
 
     def _get_element_bbox(self, element: SVGElement, transform: Transform) -> Optional[tuple]:
         """Get element bounding box in screen coordinates."""
@@ -2277,6 +2338,10 @@ class SVGRenderer:
                 match = fill_ref[4:end_paren]  # Remove "url(" and extract up to ")"
             else:
                 match = fill_ref[4:]
+            match = match.strip()
+            # Strip quotes if present (SVG 2 allows quoted URLs)
+            if (match.startswith("'") and match.endswith("'")) or (match.startswith('"') and match.endswith('"')):
+                match = match[1:-1]
             if match.startswith("#"):
                 match = match[1:]
 
@@ -2582,8 +2647,16 @@ class SVGRenderer:
         mask_img = Image.fromarray(mask, "L")
 
         if fill_ref and fill_ref.startswith("url("):
-            # Gradient fill
-            match = fill_ref[4:-1]
+            # Gradient fill - extract URL reference
+            end_paren = fill_ref.find(")")
+            if end_paren != -1:
+                match = fill_ref[4:end_paren]
+            else:
+                match = fill_ref[4:-1]
+            match = match.strip()
+            # Strip quotes if present (SVG 2 allows quoted URLs)
+            if (match.startswith("'") and match.endswith("'")) or (match.startswith('"') and match.endswith('"')):
+                match = match[1:-1]
             if match.startswith("#"):
                 match = match[1:]
             if match in ctx.gradients:
@@ -2694,7 +2767,15 @@ class SVGRenderer:
 
         if fill_ref and fill_ref.startswith("url("):
             # Gradient fill - still needs mask-based approach
-            match = fill_ref[4:-1]
+            end_paren = fill_ref.find(")")
+            if end_paren != -1:
+                match = fill_ref[4:end_paren]
+            else:
+                match = fill_ref[4:-1]
+            match = match.strip()
+            # Strip quotes if present (SVG 2 allows quoted URLs)
+            if (match.startswith("'") and match.endswith("'")) or (match.startswith('"') and match.endswith('"')):
+                match = match[1:-1]
             if match.startswith("#"):
                 match = match[1:]
             if match in ctx.gradients:
@@ -3718,7 +3799,8 @@ class RenderContext:
                  clip_paths: dict[str, ClipPath] = None,
                  masks: dict[str, Mask] = None,
                  filters: dict = None,
-                 patterns: dict[str, Pattern] = None):
+                 patterns: dict[str, Pattern] = None,
+                 elements_by_id: dict = None):
         self.image = image
         self.image_arr = None  # Optional numpy array for Rust compositing
         self.gradients = gradients
@@ -3727,6 +3809,7 @@ class RenderContext:
         self.clip_paths = clip_paths or {}
         self.masks = masks or {}
         self.filters = filters or {}
+        self.elements_by_id = elements_by_id or {}
 
     @property
     def image_width(self) -> int:
