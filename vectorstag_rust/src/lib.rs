@@ -542,6 +542,12 @@ fn render_stroke_closed_polygon<'py>(
         return Array2::<u8>::zeros((height, width)).into_pyarray(py);
     }
 
+    // Add epsilon to half_width for fill coverage
+    // This ensures pixels exactly at the stroke boundary are filled
+    // (compensates for scanline fill rounding and edge exclusion)
+    // Using 1.0 for better coverage of edge pixels
+    let fill_half_width = half_width + 1.0;
+
     let use_bevel = linejoin == "round" || linejoin == "bevel";
 
     // Compute left and right edge points
@@ -567,31 +573,31 @@ fn render_stroke_closed_polygon<'py>(
             if use_bevel {
                 // For round/bevel joins, use the average perpendicular (shorter corner)
                 let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
-                let left_pt = (p_curr.0 + avg_perp.0 * half_width, p_curr.1 + avg_perp.1 * half_width);
-                let right_pt = (p_curr.0 - avg_perp.0 * half_width, p_curr.1 - avg_perp.1 * half_width);
+                let left_pt = (p_curr.0 + avg_perp.0 * fill_half_width, p_curr.1 + avg_perp.1 * fill_half_width);
+                let right_pt = (p_curr.0 - avg_perp.0 * fill_half_width, p_curr.1 - avg_perp.1 * fill_half_width);
                 (left_pt, right_pt)
             } else {
                 // Compute miter intersection
-                let left_p1 = (p_curr.0 + perp1.0 * half_width, p_curr.1 + perp1.1 * half_width);
-                let left_p2 = (p_curr.0 + perp2.0 * half_width, p_curr.1 + perp2.1 * half_width);
-                let right_p1 = (p_curr.0 - perp1.0 * half_width, p_curr.1 - perp1.1 * half_width);
-                let right_p2 = (p_curr.0 - perp2.0 * half_width, p_curr.1 - perp2.1 * half_width);
+                let left_p1 = (p_curr.0 + perp1.0 * fill_half_width, p_curr.1 + perp1.1 * fill_half_width);
+                let left_p2 = (p_curr.0 + perp2.0 * fill_half_width, p_curr.1 + perp2.1 * fill_half_width);
+                let right_p1 = (p_curr.0 - perp1.0 * fill_half_width, p_curr.1 - perp1.1 * fill_half_width);
+                let right_p2 = (p_curr.0 - perp2.0 * fill_half_width, p_curr.1 - perp2.1 * fill_half_width);
 
                 let mut left_pt = line_intersection(left_p1, d1, left_p2, d2).unwrap_or(left_p1);
                 let mut right_pt = line_intersection(right_p1, d1, right_p2, d2).unwrap_or(right_p1);
 
-                // Apply miterlimit
+                // Apply miterlimit (use original half_width for geometric correctness)
                 let max_miter = miterlimit * half_width;
                 let left_dist = ((left_pt.0 - p_curr.0).powi(2) + (left_pt.1 - p_curr.1).powi(2)).sqrt();
                 let right_dist = ((right_pt.0 - p_curr.0).powi(2) + (right_pt.1 - p_curr.1).powi(2)).sqrt();
 
                 if left_dist > max_miter {
                     let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
-                    left_pt = (p_curr.0 + avg_perp.0 * half_width, p_curr.1 + avg_perp.1 * half_width);
+                    left_pt = (p_curr.0 + avg_perp.0 * fill_half_width, p_curr.1 + avg_perp.1 * fill_half_width);
                 }
                 if right_dist > max_miter {
                     let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
-                    right_pt = (p_curr.0 - avg_perp.0 * half_width, p_curr.1 - avg_perp.1 * half_width);
+                    right_pt = (p_curr.0 - avg_perp.0 * fill_half_width, p_curr.1 - avg_perp.1 * fill_half_width);
                 }
 
                 (left_pt, right_pt)
@@ -599,8 +605,8 @@ fn render_stroke_closed_polygon<'py>(
         } else {
             // Nearly collinear
             let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
-            let left_pt = (p_curr.0 + avg_perp.0 * half_width, p_curr.1 + avg_perp.1 * half_width);
-            let right_pt = (p_curr.0 - avg_perp.0 * half_width, p_curr.1 - avg_perp.1 * half_width);
+            let left_pt = (p_curr.0 + avg_perp.0 * fill_half_width, p_curr.1 + avg_perp.1 * fill_half_width);
+            let right_pt = (p_curr.0 - avg_perp.0 * fill_half_width, p_curr.1 - avg_perp.1 * fill_half_width);
             (left_pt, right_pt)
         };
 

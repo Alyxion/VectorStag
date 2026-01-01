@@ -26,11 +26,13 @@ from PIL import Image
 
 from .renderer import SVGRenderer
 from .svg_parser import SVGParser
+from .canvas import Canvas
 
 __all__ = [
     # Main classes
     "SVGRenderer",
     "SVGParser",
+    "Canvas",
     # Simple conversion functions
     "svg_to_pil",
     "svg_to_numpy",

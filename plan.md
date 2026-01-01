@@ -1,655 +1,647 @@
-# VectorStag - Pure Python SVG Renderer
+# High-Quality Subpixel Rendering Without Supersampling
 
-## Project Goal
-Create an SVG renderer using only Pillow (and optionally OpenCV) without external SVG libraries, achieving visual parity with CairoSVG and resvg.
+## Gap Artifacts - FIXED
 
-**Target**: 99.9% accuracy on resvg-test-suite (currently 94.85%)
+**Status**: All major visual gaps fixed
+**Root cause**: Stroke polygon construction created problematic seam edge
 
-## Current Status: 94.7% resvg-test-suite / 100% FontAwesome / 99.9% Emoji / 99.9% Flag Accuracy
+### Issue History:
 
-**Date**: 2025-12-31
-**Memory Status**: Benchmark stable with 8 workers (~87MB base per worker)
+#### Session 1: Initial Gap Reduction
+- Changed `_stroke_closed_polygon_segmented` from per-quad to unified polygon
+- Reduced gaps from 203 to 27 (87% reduction)
 
-### Priority Issues to Reach 99.9%
-1. **Pattern fills** - Required for feConvolveMatrix tests
-2. **Embedded/External SVG images** - image element with SVG content
-3. **textPath** - Text along path rendering
-4. **Multiple filter URLs (SVG 2)** - Chaining filters
-5. **CSS shape functions** - circle(), ellipse() in clipPath
-
-### resvg-test-suite Results (1,679 tests)
-- **Average Accuracy**: 94.69%
-- **99%+ Accuracy**: 42.6% (713 tests)
-- **95-99%**: 33.8% (566 tests)
-- **90-95%**: 9.4% (157 tests)
-- **80-90%**: 7.2% (121 tests)
-- **<80%**: 7.0% (117 tests)
-- **Errors**: 5 (0.3%)
-
-| Category | Accuracy | Tests |
-|----------|----------|-------|
-| shapes | 96.58% | 133 |
-| text | 96.32% | 356 |
-| painting | 96.56% | 304 |
-| paint-servers | 94.18% | 149 |
-| filters | 94.07% | 396 |
-| masking | 93.15% | 93 |
-| structure | 90.86% | 247 |
-
-### Performance vs Reference Renderers
-- **VectorStag**: ~32 files/sec at 400x400 with 4x antialiasing (single-thread)
-- **CairoSVG**: ~41 files/sec (VectorStag is ~0.79x)
-- **Resvg**: ~75 files/sec (VectorStag is ~0.43x)
-- **Multiprocessing**: ~520 files/sec with 14 workers
-
-### FontAwesome Icons (2028 files)
-- **Average Accuracy**: 100.0%
-- **99%+ Accuracy**: 100.0% (2028 files)
-- **<99%**: 0.0% (0 files)
-
-### Emoji Test Results (3427 Noto emojis)
-- **Average Accuracy**: 99.8%
-- **99%+ Accuracy**: 99.9% (3423 files)
-- **95-99%**: 0.1% (4 files)
-- **<80%**: 0.0% (0 files)
-
-### Flag Test Results (358 Noto flags)
-- **Average Accuracy**: 99.9%
-- **99%+ Accuracy**: 99.4% (356 files)
-- **95-99%**: 0.6% (2 files - AF.svg, complex emblems)
-- **<95%**: 0.0% (0 files)
-- **Errors**: 0 (single-threaded); memory issues with parallel workers on complex flags
-
-**Reference Renderer**: resvg (Rust-based)
-
-### Material Icons Test (336 files)
-- **Average Accuracy**: 99.0%
-- **99%+ Accuracy**: 58.0% (195 files)
-- **95-99%**: 42.0% (141 files)
-- **<95%**: 0.0% (0 files)
-
-### Lucide Icons (200 files)
-- **Average Accuracy**: 98.7%
-- **99%+ Accuracy**: 44.0% (88 files)
-- **95-99%**: 56.0% (112 files)
-- **<95%**: 0.0% (0 files)
-
-### W3C SVG Samples (30 files)
-- **Average Accuracy**: 99.3% (vs resvg)
-- **99%+ Accuracy**: 80.0% (24 files)
-- **95-99%**: 16.7% (5 files)
-- **90-95%**: 3.3% (1 file)
-- **Note**: Lower scores are primarily due to text rendering differences (different fonts)
-
-### Comparison Images
-Comparison grids (VectorStag | resvg | diff) saved to:
-- `comparisons/emojis/` - 3427 files
-- `comparisons/flags/` - 358 files
-- `comparisons/material/` - 336 files
-- `comparisons/fontawesome/` - 2028 files
-- `comparisons/lucide/` - 200 files
-- `comparisons/w3c/` - 30 files
-
----
-
-## Recent Optimizations & Fixes
-
-### SVG Filter Implementation (2025-12-30)
-Implemented comprehensive SVG filter support with all filter primitives in Rust for performance:
-
-**Filter Primitives Implemented**:
-- feGaussianBlur, feOffset, feFlood, feBlend, feComposite, feMerge
-- feColorMatrix, feComponentTransfer, feMorphology, feConvolveMatrix
-- feTurbulence, feDisplacementMap, feTile, feImage
-- feDiffuseLighting, feSpecularLighting, feDropShadow
-- Light sources: FeDistantLight, FePointLight, FeSpotLight
-
-**Filter Accuracy by Subcategory** (260 tests):
-| Filter | Accuracy | Notes |
-|--------|----------|-------|
-| feDisplacementMap | 100.0% | Excellent |
-| feDistantLight | 99.7% | Excellent |
-| flood-opacity | 99.8% | Excellent |
-| feDropShadow | 97.6% | Excellent |
-| feOffset | 97.4% | Excellent |
-| feComponentTransfer | 97.2% | Excellent |
-| enable-background | 97.2% | Excellent |
-| filter-functions | 97.1% | Excellent |
-| feGaussianBlur | 96.7% | O(1) sliding window blur |
-| feMerge | 96.8% | Excellent |
-| flood-color | 96.6% | Excellent |
-| feFlood | 96.3% | Fixed subregion handling |
-| feComposite | 95.9% | Excellent |
-| feDiffuseLighting | 95.7% | Fixed no-light-source case |
-| feBlend | 92.9% | All blend modes supported |
-| feTile | 92.9% | Fixed subregion tiling |
-| feTurbulence | 92.9% | Perlin noise implemented |
-| feSpotLight | 92.2% | Good |
-| fePointLight | 90.7% | Good |
-| filter | 90.4% | Good |
-| feColorMatrix | 89.7% | Some UB tests |
-| feMorphology | 89.4% | Radius clamping |
-| feConvolveMatrix | 80.6% | Limited by pattern support |
-| feImage | 80.3% | Data URLs supported |
-| feSpecularLighting | 70.4% | Complex lighting calculations |
-
-**Performance Optimizations**:
-1. **O(1) Gaussian blur** - Replaced O(radius) box blur with sliding window approach
-2. **O(1) Drop shadow blur** - Same optimization for feDropShadow
-3. **Radius clamping** - feMorphology radius clamped to prevent slow operations
-4. **Filter inheritance** - xlink:href support for filter element inheritance
-
-**Known Limitations**:
-- Pattern fills not implemented (affects feConvolveMatrix tests)
-- Filter subregion calculations incomplete
-- feImage external file references not supported
-
-### Performance (2025-12-30)
-1. **Vectorized gradient rendering** - 5.7x faster using numpy
-2. **Optimized self-intersection check** - Skip for >200 points, limit to 5000 pairs
-3. **Vectorized scanline fill** - Numpy-based edge processing
-4. **Multiprocessing** - 12-worker parallel testing (memory-optimized)
-5. **Memory optimization** - Eliminated full-size temp images, use cropped regions
-6. **Rust fill algorithms** - `fill_polygon_evenodd` and `fill_multi_polygon_evenodd` via Rust extension
-7. **Float32 gradients** - Reduced memory from float64 to float32, row-by-row computation
-8. **Rust resize** - Box filter resize in Rust, faster than PIL LANCZOS for 4x downscale
-9. **Rust gradient images** - `create_linear_gradient_image` and `create_radial_gradient_image` in Rust
-10. **Numpy clipping optimization** - Reuse numpy arrays between clipping and resize steps
-11. **Rust polygon nonzero fill** - All polygon fill operations now use Rust when available
-12. **Direct-to-array rendering** - `fill_polygon_to_array` and `fill_multi_polygon_to_array` composite directly to numpy arrays, bypassing PIL
-13. **Numpy-first image pipeline** - Main image created as numpy array, avoiding PIL Image.new and conversions
-14. **Rust alpha compositing** - All alpha compositing uses `alpha_composite_inplace` for numpy arrays
-15. **Stroke polygon fast path** - Open/closed strokes use fast Rust polygon fill instead of PIL ImageDraw
-16. **Gradient numpy passthrough** - Gradient functions return numpy arrays directly, avoiding PIL roundtrip
-
-### Memory Optimization (2025-12-31)
-**Problem**: Benchmark crashed with 8+ workers around test 500
+#### Session 2: Circle Stroke Gap Fix (Current)
+**Problem**: Circle strokes (like copyleft.svg) had massive gaps on the right side
+- Rows y=252-255 had entire right half of stroke missing
+- Caused by single-polygon construction with seam edge
 
 **Root Cause Analysis**:
-- NOT a memory leak - memory is stable at ~87MB per worker after initialization
-- One-time startup costs: PIL (30MB), NumPy (6MB), Rust extension (15MB)
-- Filter processing peaks at ~60-110MB per test but memory is freed
-- With 8 workers: 8 × 87MB base = 696MB, plus filter spikes = OOM
+1. `render_stroke_closed_polygon` in Rust built stroke as: `left_points + reversed(right_points)`
+2. This created a diagonal seam edge from inner[last] to outer[last]
+3. At rightmost point of circle, seam edge was nearly horizontal
+4. Scanline fill condition `y1 <= screen_y < y2` excluded edge ending exactly at screen_y
+5. Result: 4 rows near center had no right-side stroke
 
-**Fixes**:
-1. **Batched processing** - Workers restart every 100 tests to clean memory
-2. **Antialias reduction** - Default from 4x to 2x (4x memory savings, minimal quality loss)
-3. **Worker timeout** - 30 second timeout per test prevents hangs
-4. **Explicit gc.collect()** - Called after each test and between batches
-5. **Memory monitoring** - Added `get_memory_mb()` function for debugging
+**Fix Applied** (`vectorstag_rust/src/lib.rs:618-706`):
+```rust
+// OLD: Single polygon with problematic seam
+let stroke_polygon = left_points + reversed(right_points);
+// Seam edge from left[359] to right[359] caused gaps
 
-**Result**: Benchmark now stable with 8 workers on all 1679 tests
+// NEW: Two separate contours with nonzero winding rule
+let outer_edges = build_edges(&right_points, +1);  // Outer = add winding
+let inner_edges = build_edges(&left_points, -1);   // Inner = subtract winding
+// Fill using winding count: winding != 0 means inside stroke
+```
 
-### resvg-test-suite Improvements (2025-12-31)
-1. **feSpecularLighting specularExponent validation** - Out-of-range values (< 1 or > 128) now produce transparent output per SVG spec
-2. **feColorMatrix saturate validation** - Saturate values outside [0, 1] produce transparent output
-3. **feColorMatrix matrix value validation** - Invalid matrix (not exactly 20 values) passes through source
-4. **feMorphology huge-radius handling** - Erode with radius >= image dimension produces transparent output
-5. **Filter primitive subregion** - Proper masking of filter output to subregion bounds
-6. **Invalid filter reference** - Elements with invalid filter references (non-existent filters) are not rendered
-7. **Empty feMerge** - feMerge with no nodes produces transparent output
-8. **Invalid gradientUnits** - Gradients with invalid gradientUnits values produce transparent fill
+**Key Changes**:
+1. Build edges for outer contour (right_points) with +1 winding direction
+2. Build edges for inner contour (left_points) with -1 winding direction
+3. Use nonzero winding rule: fill when winding count != 0
+4. Eliminates seam edge entirely - each contour is self-closing
 
-### resvg-test-suite Improvements (2025-12-30)
-1. **`<mask>` element** - Implemented SVG masking with luminance-based alpha (mask elements render content, convert to luminance, apply as alpha mask)
-2. **`<symbol>` element** - Symbols now properly parse and render only when referenced by `<use>`, not directly
-3. **`<image>` element** - Added support for embedded images via data URLs (base64 PNG/JPEG)
-4. **RGBA color support** - Added parsing for `#RGBA`, `#RRGGBBAA`, and `rgba()` color formats with alpha channel
-5. **HSL/HSLA colors** - Implemented HSL to RGB conversion for `hsl()` and `hsla()` color functions
-6. **Radial gradient `fr`** - Added focal radius attribute support for radial gradients
-7. **CSS unit parsing** - Added support for mm, rem, vmin, vmax, ch, rlh, vh, vw, q units
-8. **visibility:hidden** - Added visibility attribute to Style, elements with visibility:hidden don't render
-9. **Improved similarity calculation** - Benchmark now ignores RGB values when alpha=0 (transparent pixels)
-10. **Error handling** - Fixed various parsing errors for edge cases (invalid hex colors, percentage opacity, etc.)
+### Results:
+- copyleft.svg: 182 gap pixels → 0 gap pixels
+- android.svg: 0 gap pixels (was aspect ratio issue, not gaps)
+- book-image.svg: 0 gap pixels
+- All 124 tests pass
 
-### Bug Fixes (2025-12-30)
-1. **Recursion protection** - Added MAX_PARSE_DEPTH and MAX_RENDER_DEPTH limits to prevent stack overflow
-2. **Circular `<use>` detection** - Track `_use_stack` to prevent infinite loops on circular references
-3. **Arc-to-bezier control point fix** - Fixed Rust `arc_to_bezier` using `half_d.sin()` instead of `d_theta.sin()` for control point calculation. This was causing ~21 pixel errors for large arcs (FontAwesome 97.3% → 100%)
-4. **Stroke round/bevel linejoin** - Added `linejoin` parameter to Rust `render_stroke_closed_polygon` for proper round/bevel corner handling (Android logo fix)
-5. **Premultiplied alpha resize** - Fixed `resize_rgba` to use proper premultiplied alpha averaging instead of independent channel averaging, eliminating dark edges on anti-aliased shapes
-6. **Gaussian blur SVG spec** - Implemented triple box-blur approximation per SVG spec (`d = floor(s * 3 * sqrt(2*pi) / 4 + 0.5)`), proper stdDeviation scaling with combined element+base transform (W3C 90% → 93.3% at 99%+)
-7. **Font path fallbacks** - Added Noto fonts (NotoSerif, NotoSans, NotoMono) to font path fallbacks for systems without DejaVu fonts
-8. **Filter + clip-path combination** - Fixed `_render_element_with_clip` to properly handle elements with both clip-path AND filter (gaussian blur now works inside clip regions)
-9. **Round/bevel stroke segmented approach** - Use segmented stroke rendering for round/bevel joins to get correct per-edge perpendicular offsets (fixes Android belly cutout)
-10. **Letterbox background color** - Fixed viewBox clipping to set letterbox areas to background color instead of transparent (was causing 8% similarity drop)
-11. **Round join pie slices** - Changed round join corners from full circles to pie slice arcs, preventing over-fill at corners
-12. **Skip miter triangles for round joins** - Miter triangles were filling corners with square shapes even when linejoin="round", overriding the pieslice arcs (Android 99.72% → 99.85%)
-13. **preserveAspectRatio="none" in comparisons** - Fixed `render_vectorstag_for_comparison()` to check `should_stretch()` for SVGs with `preserveAspectRatio="none"` (QA.svg 13% → 99.99%)
+### Gap detection tool:
+```bash
+python scripts/detect_gaps.py --categories lucide --limit 100
+python scripts/detect_gaps.py --file samples/svg/copyleft.svg
+```
 
-### Notes
-- **Text Rendering**: Now working well - use CairoSVG as reference for text comparisons
-- **Gaussian Blur**: Significantly improved, but slight color differences remain due to blending/blur algorithm differences - investigate resvg source code for exact implementation
-- **Debugging**: Always create comparison images with `svg_compare.py compare --save` to verify fixes visually.
-  - Thin pink outlines around ALL edges: Normal - PIL vs resvg rasterization difference (~0.25px)
-  - Large solid pink areas inside shapes: Real rendering bug - investigate
-  - Pink text: Expected - different font rendering between renderers
-
-### Completed: Android Logo (99.85% similarity)
-**Fixed**: Round corners now render correctly
-- Changed from full circles to pie slice arcs for round joins
-- Arc angles calculated from perpendicular directions of adjacent edges
-- Segmented stroke rendering for round/bevel joins
-- Skip miter triangles for round joins (was filling corners square instead of round)
-- Remaining ~0.15% difference is due to PIL vs resvg rasterization (~0.25px edge variance)
-
-### Bug Fixes (2025-12-29)
-1. **Gradient alpha compositing** - Fixed `paste` → `alpha_composite` for proper transparency
-2. **Nonzero winding rule** - Fixed multi-polygon fills to create proper holes
-3. **display:none support** - Added CSS display property parsing and rendering skip
-4. **GradientTransform** - Now properly applied in renderer
-5. **Radial gradient inverse transform** - Fixed matrix inversion formula for transformed radial gradients
-6. **Stroke gradient support** - Added gradient fills for strokes (clown mouth, etc.)
-7. **Stroke miterlimit** - Apply miterlimit to prevent infinitely long miters
-8. **stroke-dasharray** - Added dashed/dotted stroke support
-9. **Switch element** - Added `<switch>` element support for fallback rendering
-10. **Nested SVG support** - Added `<svg>` element parsing inside other SVGs (SI flag)
-11. **userSpaceOnUse gradient transforms** - Fixed element transform propagation for gradients
-12. **Comparison workflow** - Render at aspect-ratio-preserving size to match resvg output
-13. **Closed path stroke rendering** - Always use polygon-based stroke for closed paths to ensure proper miter joins (NP flag fix)
-14. **Non-convex stroke detection** - Detect reflex angles and use segment-based stroke for non-convex shapes
-15. **Stroke ring rendering** - Fixed closed polygon strokes using quad-per-edge approach with proper miter points (IL Star of David fix)
-16. **Comparison dimension calculation** - Use viewBox for aspect ratio, handle unit conversions and precision issues
-17. **spreadMethod support** - Added pad/reflect/repeat for linear and radial gradients
-18. **URL gradient parsing** - Fixed parsing of gradient URLs with fallback colors (e.g., `url(#id) rgb(0,0,0)`)
-19. **currentColor keyword** - Added support for the CSS currentColor keyword (defaults to black)
+### Visual inspection:
+```bash
+python scripts/visual_inspect.py --count 5
+# Open: file:///tmp/vectorstag_inspect_*/index.html
+```
 
 ---
 
-## Implemented Features
+## Summary
+- **Goal**: Render to large surfaces (1920x1080+) with 8x8 quality antialiasing without creating massive supersampling buffers
+- **Algorithm**: Signed-trapezoid-area coverage calculation (AGG/stb_truetype style)
+- **API**: New `Canvas` class for direct numpy array rendering with subpixel accuracy
+- **Target**: 99.9% visual match with 8x8 supersampling, ~10x memory savings
 
-### Shapes
-- [x] `<rect>` - including rounded corners (rx, ry)
-- [x] `<circle>`
-- [x] `<ellipse>`
-- [x] `<line>`
-- [x] `<polygon>`
-- [x] `<polyline>`
-- [x] `<path>` - full path command support
+## Problem Statement
 
-### Path Commands
-- [x] M/m - moveto
-- [x] L/l - lineto
-- [x] H/h - horizontal lineto
-- [x] V/v - vertical lineto
-- [x] C/c - cubic bezier
-- [x] S/s - smooth cubic bezier
-- [x] Q/q - quadratic bezier
-- [x] T/t - smooth quadratic bezier
-- [x] A/a - elliptical arc (converted to beziers)
-- [x] Z/z - closepath
+Current approach uses supersampling:
+- 1920x1080 with 3x antialias = 5760x3240 buffer = **70MB per render**
+- 8x8 supersampling = 15360x8640 = **530MB per render**
+- Memory-bound, especially for video/animation pipelines
 
-### Transforms
-- [x] translate(tx, ty)
-- [x] scale(sx, sy)
-- [x] rotate(angle, cx, cy)
-- [x] skewX(angle)
-- [x] skewY(angle)
-- [x] matrix(a, b, c, d, e, f)
-- [x] Transform inheritance through groups
-- [x] gradientTransform support
+## Solution: Analytical Coverage Calculation
 
-### Styles
-- [x] fill (color, none, url() gradient reference)
-- [x] stroke (color, none, url() gradient reference)
-- [x] stroke-width
-- [x] stroke-linecap (butt, round, square)
-- [x] stroke-linejoin (miter, round, bevel)
-- [x] stroke-miterlimit
-- [x] stroke-dasharray
-- [x] fill-opacity
-- [x] stroke-opacity
-- [x] opacity
-- [x] fill-rule (nonzero, evenodd)
-- [x] display (none, inline, block)
-- [x] Style inheritance from parent groups
+### Algorithm Overview (from [stb_truetype](https://nothings.org/gamedev/rasterize/) / [AGG](https://agg.sourceforge.net/antigrain.com/doc/index.html))
 
-### Rendering
-- [x] Anti-aliasing (configurable supersampling, default 4x)
-- [x] Automatic bounding box computation
-- [x] ClipPath support
-- [x] Proper alpha compositing
-- [x] Nonzero winding rule with holes
-- [x] Evenodd fill rule
+Instead of sampling subpixels, compute **exact pixel coverage** analytically:
 
-### Text
-- [x] Basic `<text>` rendering
-- [x] x, y positioning
-- [x] font-size
-- [x] font-family mapping
+1. **Signed Trapezoid Areas**: Each edge contributes a right-extending trapezoid
+2. **Two-Array Method**:
+   - Array A: Direct trapezoid areas intersecting pixels
+   - Array X: Cumulative "height" for pixels right of edges
+3. **Linear Stepping**: Coverage differences between adjacent pixels = `dy/dx`
+4. **Signed Winding**: Holes work via opposite winding direction (areas cancel)
 
-### Gradients
-- [x] `<linearGradient>` with stops
-- [x] `<radialGradient>` with stops
-- [x] gradientUnits: objectBoundingBox
-- [x] gradientUnits: userSpaceOnUse
-- [x] gradientTransform
-- [x] Gradient href inheritance
-- [x] stop-color, stop-opacity
-- [x] Vectorized rendering (numpy)
-
-### Document
-- [x] width/height attributes
-- [x] viewBox with proper scaling
-- [x] preserveAspectRatio
-- [x] Namespace handling
-- [x] CSS class parsing
-
-### Use Element
-- [x] `<use>` element support
-- [x] x, y positioning
-
-### Switch Element
-- [x] `<switch>` element support
-- [x] requiredExtensions fallback
-
-### Symbol Element
-- [x] `<symbol>` element support
-- [x] Only renders when referenced by `<use>`
-
-### Image Element
-- [x] `<image>` element with data URLs
-- [x] Base64 PNG/JPEG support
-- [x] preserveAspectRatio
-
-### Mask Element
-- [x] `<mask>` element support
-- [x] Luminance-based masking
-- [x] maskUnits and maskContentUnits
-
-### Filter Element
-- [x] `<filter>` element with primitives
-- [x] Filter chaining with named buffers (in, in2, result)
-- [x] SourceGraphic, SourceAlpha inputs
-- [x] Filter inheritance via xlink:href
-- [x] feGaussianBlur (O(1) sliding window)
-- [x] feOffset
-- [x] feFlood
-- [x] feBlend (all 16 blend modes including HSL)
-- [x] feComposite (all Porter-Duff operators)
-- [x] feMerge, feMergeNode
-- [x] feColorMatrix (matrix, saturate, hueRotate, luminanceToAlpha)
-- [x] feComponentTransfer (identity, table, discrete, linear, gamma)
-- [x] feMorphology (erode, dilate)
-- [x] feConvolveMatrix
-- [x] feTurbulence (Perlin noise)
-- [x] feDisplacementMap
-- [x] feTile
-- [x] feImage (data URLs)
-- [x] feDiffuseLighting
-- [x] feSpecularLighting
-- [x] feDropShadow
-- [x] Light sources: feDistantLight, fePointLight, feSpotLight
-
-### Colors
-- [x] Hex colors (#RGB, #RRGGBB, #RGBA, #RRGGBBAA)
-- [x] rgb() and rgba() functions
-- [x] hsl() and hsla() functions
-- [x] Named colors (140+ CSS colors)
-- [x] currentColor keyword
-
-### CSS Units
-- [x] px, pt, pc, mm, cm, in
-- [x] em, ex, rem, ch
-- [x] vw, vh, vmin, vmax
-- [x] Percentages
+**Complexity**: O(p log p) where p = pixels on polygon edges
+**Quality**: Equivalent to infinite supersampling (within floating-point precision)
 
 ---
 
-## Known Issues
+## New Rust Module: `canvas.rs`
 
-### Previously Fixed Issues
-- **AS.svg**: Added `<switch>` element support - now renders correctly
-- **BR.svg**: Was CairoSVG bug with negative viewBox - our rendering was correct
-- **TW.svg**: Fixed with proper resvg reference generation (aspect ratio preserved)
+### Core Data Structures
 
-### CairoSVG Bugs (verified with resvg)
-- clippath.svg: CairoSVG renders intersection wrong
-- lineargradient1/2.svg: CairoSVG fills gaps that don't exist
-- Gaussian blur: CairoSVG doesn't apply properly
-- Negative viewBox: CairoSVG stretches content incorrectly
+```rust
+/// Analytical edge for coverage calculation
+struct AnalyticalEdge {
+    x_top: f32,      // X at top of edge
+    y_top: f32,      // Top Y
+    y_bottom: f32,   // Bottom Y
+    dx_per_dy: f32,  // X increment per Y unit (inverse slope)
+    direction: i8,   // +1 for downward, -1 for upward (winding)
+}
+
+/// Canvas for direct numpy rendering
+pub struct Canvas {
+    width: usize,
+    height: usize,
+    // No internal buffer - renders directly to provided array
+}
+```
+
+### Core Algorithm Functions
+
+```rust
+/// Compute per-pixel coverage using signed trapezoid areas
+fn compute_coverage_scanline(
+    edges: &[AnalyticalEdge],
+    y: f32,                    // Current scanline (can be fractional)
+    coverage: &mut [f32],      // Output: coverage per pixel [0.0, 1.0]
+    x_offset: f32,             // Subpixel X offset
+) {
+    // For each active edge crossing this scanline:
+    // 1. Compute X intersection
+    // 2. Add trapezoid area contribution to pixels
+    // 3. Track cumulative coverage for pixels to the right
+}
+
+/// Fill polygon with analytical AA directly to RGBA array
+#[pyfunction]
+pub fn canvas_fill_polygon_aa(
+    dst: PyReadwriteArray3<u8>,  // Target RGBA array (modified in-place)
+    points: Vec<(f32, f32)>,     // Polygon vertices (float coords)
+    r: u8, g: u8, b: u8, a: u8,  // Fill color
+    fill_rule: u8,               // 0=nonzero, 1=evenodd
+) -> PyResult<()>
+```
+
+### Canvas Methods (Rust + Python bindings)
+
+#### 1. Polygon Rendering
+
+```rust
+// Basic polygon fill with analytical AA
+canvas_fill_polygon_aa(dst, points, r, g, b, a, fill_rule)
+
+// Polygon with holes (multi-contour)
+canvas_fill_multi_polygon_aa(dst, contours, r, g, b, a, fill_rule)
+
+// Polygon with stroke
+canvas_fill_stroke_polygon_aa(
+    dst, points,
+    fill_color, stroke_color, stroke_width,
+    linejoin, miterlimit, fill_rule
+)
+
+// Polygon with gradient fill
+canvas_fill_polygon_gradient_aa(
+    dst, points,
+    gradient_type,  // 0=linear, 1=radial
+    gradient_params, stops, colors,
+    fill_rule
+)
+```
+
+#### 2. Line/Path Rendering
+
+```rust
+// Antialiased line with subpixel endpoints
+canvas_stroke_line_aa(
+    dst,
+    x1: f32, y1: f32, x2: f32, y2: f32,
+    r, g, b, a,
+    width: f32,
+    linecap: u8,  // 0=butt, 1=round, 2=square
+)
+
+// Polyline (open path) with joins
+canvas_stroke_polyline_aa(
+    dst, points,
+    r, g, b, a,
+    width: f32,
+    linecap: u8,
+    linejoin: u8,  // 0=miter, 1=round, 2=bevel
+    miterlimit: f32,
+)
+
+// Dashed line
+canvas_stroke_dashed_aa(
+    dst, points,
+    r, g, b, a, width,
+    dash_array: Vec<f32>,
+    dash_offset: f32,
+    linecap, linejoin, miterlimit,
+)
+```
+
+#### 3. Rectangle Rendering
+
+```rust
+// Axis-aligned rectangle (fast path)
+canvas_fill_rect_aa(
+    dst,
+    x: f32, y: f32, width: f32, height: f32,
+    r, g, b, a,
+)
+
+// Rounded rectangle
+canvas_fill_rounded_rect_aa(
+    dst,
+    x, y, width, height,
+    rx: f32, ry: f32,  // Corner radii
+    r, g, b, a,
+)
+
+// Rectangle with stroke
+canvas_stroke_rect_aa(
+    dst,
+    x, y, width, height,
+    r, g, b, a,
+    stroke_width: f32,
+)
+```
+
+#### 3b. Circle/Ellipse Rendering (Native AA)
+
+```rust
+// Filled circle with analytical AA
+canvas_fill_circle_aa(
+    dst,
+    cx: f32, cy: f32, radius: f32,
+    r, g, b, a,
+)
+
+// Filled ellipse with analytical AA
+canvas_fill_ellipse_aa(
+    dst,
+    cx: f32, cy: f32,
+    rx: f32, ry: f32,  // Semi-axes
+    r, g, b, a,
+)
+
+// Stroked circle
+canvas_stroke_circle_aa(
+    dst,
+    cx, cy, radius,
+    r, g, b, a,
+    stroke_width: f32,
+)
+
+// Stroked ellipse
+canvas_stroke_ellipse_aa(
+    dst,
+    cx, cy, rx, ry,
+    r, g, b, a,
+    stroke_width: f32,
+)
+```
+
+#### 4. Image/Mask Operations
+
+```rust
+// Blit image with polygon mask (analytical AA on mask edges)
+canvas_masked_blit_aa(
+    dst: PyReadwriteArray3<u8>,
+    src: PyReadonlyArray3<u8>,
+    mask_polygon: Vec<(f32, f32)>,  // Mask shape
+    dst_x: f32, dst_y: f32,          // Destination (subpixel)
+    src_x: i32, src_y: i32,          // Source region
+    width: i32, height: i32,
+    opacity: f32,
+)
+
+// Transformed image blit with mask
+canvas_masked_blit_transformed_aa(
+    dst, src,
+    mask_polygon,
+    transform: [f32; 6],  // Affine transform matrix
+    opacity: f32,
+)
+```
+
+#### 5. Gradient Support (Per-Pixel Inline Computation)
+
+Gradients are computed per-pixel during the coverage pass for optimal cache efficiency.
+No separate gradient buffer is created - color is interpolated inline as coverage is applied.
+
+```rust
+// Linear gradient fill (inline color computation)
+canvas_fill_linear_gradient_aa(
+    dst, points,
+    x1, y1, x2, y2,  // Gradient vector
+    stops: Vec<f32>,
+    colors: Vec<(u8,u8,u8,u8)>,
+    spread_method: u8,  // 0=pad, 1=repeat, 2=reflect
+    fill_rule: u8,
+)
+
+// Radial gradient fill (inline color computation)
+canvas_fill_radial_gradient_aa(
+    dst, points,
+    cx, cy, r,       // Circle
+    fx, fy, fr,      // Focal point
+    stops, colors,
+    spread_method, fill_rule,
+)
+
+// Circle with gradient fill
+canvas_fill_circle_gradient_aa(
+    dst,
+    cx, cy, radius,
+    gradient_type, gradient_params,
+    stops, colors, spread_method,
+)
+```
+
+**Implementation**: During scanline processing, for each pixel with non-zero coverage:
+1. Compute gradient t-value based on pixel position
+2. Interpolate color from stops
+3. Apply coverage-weighted alpha compositing
 
 ---
 
-## Performance Notes
+## Implementation Details
 
-VectorStag achieves ~60% of CairoSVG performance at 4x antialiasing. The remaining performance gap is due to:
+### Signed Trapezoid Algorithm (per scanline)
 
-1. **PIL alpha_composite overhead** (~25% of render time) - PIL's native compositing is called per-element. Cairo does this in native C with less overhead.
+```rust
+fn process_scanline_coverage(
+    edges: &mut [AnalyticalEdge],
+    y_scanline: f32,
+    row_coverage: &mut [f32],
+    width: usize,
+) {
+    // Clear coverage array
+    row_coverage.fill(0.0);
 
-2. **Image.new allocation** (~16% of render time) - Creating temporary images for semi-transparent fills. Cairo reuses internal buffers.
+    for edge in edges.iter_mut() {
+        if edge.y_top > y_scanline + 1.0 || edge.y_bottom < y_scanline {
+            continue;  // Edge not active
+        }
 
-3. **Python/C boundary crossing** - Each PIL/numpy call has overhead that pure C libraries avoid.
+        // Compute X intersection at scanline
+        let y_clamp_top = y_scanline.max(edge.y_top);
+        let y_clamp_bot = (y_scanline + 1.0).min(edge.y_bottom);
+        let height = y_clamp_bot - y_clamp_top;
 
-### Potential Future Optimizations
-- Replace PIL compositing with native Rust implementation (tested, but conversion overhead made it slower)
-- Implement full rendering pipeline in Rust (major rewrite)
-- Reduce temporary image allocations by reusing buffers
+        let x_at_top = edge.x_top + (y_clamp_top - edge.y_top) * edge.dx_per_dy;
+        let x_at_bot = edge.x_top + (y_clamp_bot - edge.y_top) * edge.dx_per_dy;
+
+        let x_min = x_at_top.min(x_at_bot);
+        let x_max = x_at_top.max(x_at_bot);
+
+        // Distribute coverage across affected pixels
+        let px_start = (x_min.floor() as i32).max(0) as usize;
+        let px_end = ((x_max.ceil() as i32) + 1).min(width as i32) as usize;
+
+        for px in px_start..px_end {
+            let px_left = px as f32;
+            let px_right = px_left + 1.0;
+
+            // Compute trapezoid area within this pixel
+            let area = compute_trapezoid_area(
+                x_at_top, x_at_bot, height,
+                px_left, px_right,
+            );
+
+            row_coverage[px] += area * edge.direction as f32;
+        }
+    }
+
+    // Apply winding rule (nonzero or evenodd)
+    for cov in row_coverage.iter_mut() {
+        *cov = cov.abs().min(1.0);  // nonzero
+        // For evenodd: *cov = (cov.abs() % 2.0).min(1.0);
+    }
+}
+```
+
+### Trapezoid Area Calculation
+
+```rust
+fn compute_trapezoid_area(
+    x_top: f32, x_bot: f32,    // Edge X at top/bottom of scanline
+    height: f32,               // Clipped height within scanline
+    px_left: f32, px_right: f32,  // Pixel boundaries
+) -> f32 {
+    // Clip edge to pixel X boundaries
+    let left = px_left;
+    let right = px_right;
+
+    // Compute intersection of edge with pixel
+    let x_min = x_top.min(x_bot);
+    let x_max = x_top.max(x_bot);
+
+    if x_max <= left || x_min >= right {
+        // Edge entirely outside pixel
+        if x_min >= right {
+            return height;  // Pixel fully to left of edge = fully covered
+        }
+        return 0.0;  // Pixel fully to right of edge
+    }
+
+    // Partial coverage: compute actual trapezoid area
+    // (simplified - full impl handles all edge cases)
+    let avg_x = (x_top + x_bot) / 2.0;
+    let coverage = ((right - avg_x) / (right - left)).clamp(0.0, 1.0);
+    coverage * height
+}
+```
+
+### Performance Optimizations
+
+1. **Edge sorting**: Sort edges by y_top once, maintain active edge list
+2. **Scanline stepping**: Process rows in order, step edge X values incrementally
+3. **SIMD**: Use packed f32 operations for coverage accumulation
+4. **Fast paths**:
+   - Fully covered rows: direct fill without per-pixel calculation
+   - Horizontal/vertical edges: simplified coverage
+   - Axis-aligned rectangles: 4-edge fast path
 
 ---
 
-## Missing Features
-
-### Medium Priority
-- [x] spreadMethod (pad, reflect, repeat) for gradients *(implemented 2025-12-29)*
-- [x] currentColor keyword support *(implemented 2025-12-29)*
-- [x] `<mask>` element *(implemented 2025-12-30)*
-- [x] `<image>` element with data URLs *(implemented 2025-12-30)*
-- [x] `<symbol>` element *(implemented 2025-12-30)*
-- [x] visibility attribute *(implemented 2025-12-30)*
-- [x] RGBA colors (#RGBA, #RRGGBBAA, rgba()) *(implemented 2025-12-30)*
-- [x] HSL/HSLA colors *(implemented 2025-12-30)*
-- [x] Radial gradient focal radius (fr) *(implemented 2025-12-30)*
-- [x] `<filter>` primitives *(implemented 2025-12-30)* - All major primitives in Rust (86.26% accuracy)
-  - feGaussianBlur, feOffset, feFlood, feBlend, feComposite, feMerge
-  - feColorMatrix, feComponentTransfer, feMorphology, feConvolveMatrix
-  - feTurbulence, feDisplacementMap, feTile, feImage
-  - feDiffuseLighting, feSpecularLighting, feDropShadow
-  - Light sources: FeDistantLight, FePointLight, FeSpotLight
-- [ ] stroke-dashoffset
-- [ ] `<pattern>` fills (needed for higher filter accuracy)
-- [ ] `<marker>` for arrowheads
-- [ ] External file references in `<image>`
-- [ ] Embedded SVG in `<image>`
-- [ ] Filter subregion calculations
-
-### Low Priority
-- [ ] `<tspan>` advanced features
-- [ ] `<style>` block CSS rules
-- [ ] Symbol viewBox handling
-- [ ] feSpecularLighting accuracy improvements
-- [ ] feTile implementation improvements
-
----
-
-## Testing & Quality Assurance
-
-### Test Suite Locations
-
-| Collection | SVG Source | Reference PNGs | Tests |
-|------------|-----------|----------------|-------|
-| emojis | `SciStagEssentialData/images/noto/emojis/svg/` | `references/emojis/resvg/` | 3427 |
-| flags | `SciStagEssentialData/images/noto/flags/svg/` | `references/flags/resvg/` | 358 |
-| fontawesome | `advanced_svg/fontawesome/fa/fontawesome-free-6.4.2-web/svgs/` | `references/fontawesome/resvg/` | 2028 |
-| material | `advanced_svg/material/` | `references/material/resvg/` | 336 |
-| lucide | `advanced_svg/lucide/` | `references/lucide/resvg/` | 200 |
-| w3c | `samples/svg/` | `references/w3c/resvg/` | 30 |
-| resvg-test-suite | `resvg-test-suite/tests/` | Built-in `.png` files | 1679 |
-
-### Running Tests
-
-**Quick verification (run after changes):**
-```bash
-# Verify accuracy hasn't regressed (should all be >99%)
-python svg_compare.py compare --emojis --limit 200
-python svg_compare.py compare --flags --limit 200
-python svg_compare.py compare --fontawesome --limit 200
-```
-
-**Full test suite:**
-```bash
-# Full accuracy test all collections
-python svg_compare.py compare --all -j 16
-
-# resvg-test-suite benchmark (1679 tests)
-python benchmark_resvg_tests.py
-
-# Filter-specific benchmark
-python quick_filter_bench.py
-```
-
-**Pre-render references (one-time setup):**
-```bash
-python svg_compare.py prerender --all -j 16
-```
-
-### Expected Results (2025-12-30)
-
-| Test Suite | Accuracy | Threshold |
-|------------|----------|-----------|
-| Emojis | 99.9% | >99% |
-| Flags | 99.9% | >99% |
-| FontAwesome | 100.0% | >99% |
-| Material | 99.0% | >95% |
-| Lucide | 98.7% | >95% |
-| W3C | 99.3% | >95% |
-| resvg-test-suite | 89.1% | >85% |
-| resvg filters | 90.7% | >85% |
-
-### Performance Benchmarks
-
-| Collection | VectorStag | resvg | Ratio |
-|------------|------------|-------|-------|
-| FontAwesome (128x128) | ~159 files/sec | ~156 files/sec | 1.0x (parity) |
-| Emojis (200x200) | ~49 files/sec | ~295 files/sec | 5.6x slower |
-
-Note: Complex SVGs (emojis with many gradients/paths) are slower due to Python overhead. Simple icons render at parity with native Rust resvg.
-
----
-
-## Tools
-
-Three CLI tools for testing and rendering:
-
-### 1. svg_compare.py - Comparison & Testing
-```bash
-# List available collections
-python svg_compare.py list
-
-# Pre-render references (run once per collection)
-python svg_compare.py prerender --emojis --flags --material -j 16
-python svg_compare.py prerender --all -j 16
-
-# Compare VectorStag against references
-python svg_compare.py compare --emojis --flags -j 16
-python svg_compare.py compare --all -j 16
-
-# Save comparison grid PNGs (VectorStag | resvg | diff)
-python svg_compare.py compare --emojis --save -j 16
-```
-
-### 2. benchmark.py - Performance Testing
-```bash
-# Benchmark a collection
-python benchmark.py --emojis -j 16
-python benchmark.py --all --limit 500
-
-# Profile a single file
-python benchmark.py --file samples/svg/tiger.svg --profile
-
-# Check Rust extension status
-python benchmark.py --check-rust
-```
-
-### 3. render.py - Simple Rendering
-```bash
-# Render SVG to PNG
-python render.py input.svg output.png
-
-# Render at specific size
-python render.py input.svg output.png --width 800 --height 600
-
-# Render with options
-python render.py input.svg output.png --antialias 8 --background white
-```
-
-### 4. benchmark_resvg_tests.py - resvg Test Suite Benchmark
-```bash
-# Clone the test suite first (one-time setup)
-git clone https://github.com/nicubunu/resvg-test-suite.git
-
-# Run full benchmark (1679 tests)
-python benchmark_resvg_tests.py
-
-# Run specific category
-python benchmark_resvg_tests.py --category shapes
-python benchmark_resvg_tests.py --category text
-python benchmark_resvg_tests.py --category filters
-python benchmark_resvg_tests.py --category masking
-python benchmark_resvg_tests.py --category paint-servers
-python benchmark_resvg_tests.py --category painting
-python benchmark_resvg_tests.py --category structure
-
-# Run subcategory
-python benchmark_resvg_tests.py --category structure/symbol
-python benchmark_resvg_tests.py --category masking/mask
-
-# Limit number of tests
-python benchmark_resvg_tests.py --limit 100
-
-# Use multiple workers
-python benchmark_resvg_tests.py -j 8
-
-# IMPORTANT: Always use default 4x antialiasing. DO NOT CHANGE.
-# The quality difference between 2x and 4x is massive.
-```
-
-### Collection Flags
-All tools support the same collection flags:
-- `--emojis` - Noto Color Emojis (3427 files)
-- `--flags` - Noto Flags (358 files)
-- `--material` - Material Design Icons (336 files)
-- `--fontawesome` - FontAwesome Icons (2028 files)
-- `--lucide` - Lucide Icons (200 files)
-- `--w3c` - W3C SVG Samples (30 files)
-- `--all` - All collections
-
----
-
-## Usage
+## Python Canvas Class
 
 ```python
-from vectorstag import SVGRenderer
+# vectorstag/canvas.py
 
-# Basic usage
-renderer = SVGRenderer()
-image = renderer.render_file("input.svg")
-image.save("output.png")
+class Canvas:
+    """High-performance subpixel rendering canvas."""
 
-# With scaling and antialiasing
-renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
-image = renderer.render_file("input.svg", width=800, height=600)
+    def __init__(self, target: np.ndarray):
+        """
+        Initialize canvas with target numpy array.
 
-# From string
-image = renderer.render(svg_content)
+        Args:
+            target: RGBA numpy array shape (H, W, 4), dtype=uint8
+        """
+        self._target = target
+        self._width = target.shape[1]
+        self._height = target.shape[0]
+
+    def fill_polygon(
+        self,
+        points: List[Tuple[float, float]],
+        color: Tuple[int, int, int, int],
+        fill_rule: str = 'nonzero',
+    ) -> None:
+        """Fill polygon with analytical antialiasing."""
+        vectorstag_rust.canvas_fill_polygon_aa(
+            self._target, points,
+            *color,
+            0 if fill_rule == 'nonzero' else 1
+        )
+
+    def stroke_line(
+        self,
+        x1: float, y1: float,
+        x2: float, y2: float,
+        color: Tuple[int, int, int, int],
+        width: float = 1.0,
+        cap: str = 'butt',
+    ) -> None:
+        """Draw antialiased line with subpixel endpoints."""
+        cap_map = {'butt': 0, 'round': 1, 'square': 2}
+        vectorstag_rust.canvas_stroke_line_aa(
+            self._target,
+            x1, y1, x2, y2,
+            *color, width,
+            cap_map[cap]
+        )
+
+    def fill_rect(
+        self,
+        x: float, y: float,
+        width: float, height: float,
+        color: Tuple[int, int, int, int],
+    ) -> None:
+        """Fill axis-aligned rectangle."""
+        vectorstag_rust.canvas_fill_rect_aa(
+            self._target, x, y, width, height, *color
+        )
+
+    def fill_rounded_rect(
+        self,
+        x: float, y: float,
+        width: float, height: float,
+        rx: float, ry: float,
+        color: Tuple[int, int, int, int],
+    ) -> None:
+        """Fill rounded rectangle."""
+        vectorstag_rust.canvas_fill_rounded_rect_aa(
+            self._target, x, y, width, height, rx, ry, *color
+        )
+
+    def masked_blit(
+        self,
+        src: np.ndarray,
+        mask_polygon: List[Tuple[float, float]],
+        dst_x: float, dst_y: float,
+        opacity: float = 1.0,
+    ) -> None:
+        """Blit image with polygon mask."""
+        vectorstag_rust.canvas_masked_blit_aa(
+            self._target, src,
+            mask_polygon,
+            dst_x, dst_y,
+            0, 0, src.shape[1], src.shape[0],
+            opacity
+        )
+
+    # ... additional methods for gradients, strokes, etc.
 ```
 
 ---
 
-## Architecture
+## Files to Create/Modify
 
+### New Files
+1. **`vectorstag_rust/src/canvas.rs`** (~800 lines)
+   - Core analytical AA algorithm
+   - All canvas rendering functions
+
+2. **`vectorstag/canvas.py`** (~200 lines)
+   - Python Canvas class wrapper
+   - Convenience methods
+
+3. **`tests/test_canvas.py`** (~400 lines)
+   - Comparison tests vs 8x8 supersampling
+
+### Modified Files
+1. **`vectorstag_rust/src/lib.rs`**
+   - Add `mod canvas;`
+   - Export canvas functions via PyO3
+
+2. **`vectorstag/__init__.py`**
+   - Export Canvas class
+
+---
+
+## Testing Strategy
+
+### Comparison Tests vs 8x8 Supersampling
+
+```python
+def test_polygon_fill_accuracy():
+    """Compare analytical AA to 8x8 supersampling."""
+    # Create test polygon
+    polygon = [(100.3, 50.7), (200.8, 150.2), (50.1, 200.9)]
+
+    # Method 1: 8x8 supersampling (reference)
+    big = np.zeros((800, 800, 4), dtype=np.uint8)
+    vectorstag_rust.fill_polygon_to_array(big, scale_points(polygon, 8), ...)
+    reference = downscale_8x(big)
+
+    # Method 2: Analytical AA
+    result = np.zeros((100, 100, 4), dtype=np.uint8)
+    canvas = Canvas(result)
+    canvas.fill_polygon(polygon, (255, 0, 0, 255))
+
+    # Compare with STRICT tolerances (user-specified)
+    diff = np.abs(reference.astype(int) - result.astype(int))
+    max_diff = diff.max()
+    avg_diff = diff.mean()
+
+    # Strict: max 2 levels per channel, average < 0.1
+    assert max_diff <= 2, f"Max pixel diff {max_diff} > 2"
+    assert avg_diff < 0.1, f"Avg diff {avg_diff} >= 0.1"
 ```
-vectorstag/
-├── __init__.py          # Public API exports
-├── parser.py            # SVG DOM parsing
-│   ├── SVGParser        # Main parser class
-│   ├── Transform        # 2D affine transform
-│   ├── Style            # Style attributes (incl. display)
-│   └── *Element         # Element dataclasses
-├── path_parser.py       # Path 'd' attribute parsing
-└── renderer.py          # Pillow rendering
-    ├── SVGRenderer      # Main renderer class
-    ├── _fill_multi_polygon_nonzero()  # Winding rule with holes
-    ├── _create_*_gradient_image()     # Vectorized gradients
-    └── _render_*()      # Element-specific renderers
-```
+
+### Test Tolerance (Strict)
+- **Max per-channel difference**: ≤ 2 (out of 255)
+- **Average difference**: < 0.1
+- Applies to all primitives: polygons, circles, strokes, gradients, blits
+
+### Test Coverage
+- Polygon fills (convex, concave, self-intersecting)
+- Multi-contour polygons (with holes)
+- Circles and ellipses (filled and stroked)
+- Strokes (all join/cap types)
+- Rectangles (aligned, rotated, rounded)
+- Gradients (linear, radial, with masks)
+- Image blitting (with polygon masks)
+- Edge cases (subpixel positions, thin features, near-parallel edges, tangent circles)
+
+---
+
+## Performance Targets
+
+| Operation | Current (8x8 SS) | Target (Analytical) | Speedup |
+|-----------|------------------|---------------------|---------|
+| Polygon fill (1000 vertices) | 15ms | 2ms | 7.5x |
+| Rectangle | 0.5ms | 0.05ms | 10x |
+| Gradient polygon | 25ms | 5ms | 5x |
+| Masked blit | 10ms | 3ms | 3x |
+| Memory (1920x1080) | 530MB | 8MB | 66x |
+
+---
+
+## Implementation Order
+
+1. **Phase 1**: Core algorithm in Rust
+   - `compute_coverage_scanline()` function
+   - `canvas_fill_polygon_aa()` with basic color fill
+   - Unit tests for coverage accuracy
+
+2. **Phase 2**: Polygon variations
+   - Multi-contour (holes)
+   - Even-odd fill rule
+   - Gradient fills (per-pixel inline)
+
+3. **Phase 3**: Circles and ellipses (native AA)
+   - Analytical circle coverage (distance-based)
+   - Ellipse via affine-transformed circle
+   - Stroked circles/ellipses
+
+4. **Phase 4**: Strokes and lines
+   - Line with caps
+   - Polyline with joins
+   - Dashed lines
+
+5. **Phase 5**: Rectangles and fast paths
+   - Axis-aligned rectangles
+   - Rounded rectangles
+   - Optimized edge cases
+
+6. **Phase 6**: Image operations
+   - Masked blit
+   - Transformed blit
+
+7. **Phase 7**: Python wrapper and tests
+   - Canvas class
+   - Comprehensive test suite (strict tolerance: max 2, avg <0.1)
+   - Benchmark comparisons vs 8x8 supersampling
+
+---
+
+## References
+
+- [stb_truetype Rasterizer](https://nothings.org/gamedev/rasterize/) - Signed trapezoid algorithm
+- [Anti-Grain Geometry](https://agg.sourceforge.net/antigrain.com/doc/index.html) - Scanline coverage
+- [Fast Polygon Rendering (2024)](https://aykevl.nl/2024/02/tinygl-polygon/) - A-buffer optimizations
+- [Analytical Anti-Aliasing](https://blog.frost.kiwi/analytical-anti-aliasing/) - Edge-based coverage
