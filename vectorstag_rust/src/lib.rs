@@ -542,88 +542,145 @@ fn render_stroke_closed_polygon<'py>(
         return Array2::<u8>::zeros((height, width)).into_pyarray(py);
     }
 
-    // Add epsilon to half_width for fill coverage
-    // This ensures pixels exactly at the stroke boundary are filled
-    // (compensates for scanline fill rounding and edge exclusion)
-    // Using 1.0 for better coverage of edge pixels
-    let fill_half_width = half_width + 1.0;
+    let mut quads: Vec<Vec<(f64, f64)>> = Vec::with_capacity(n * 2); // Segments + Joins
 
-    let use_bevel = linejoin == "round" || linejoin == "bevel";
+    // 1. Generate Segments (Rectangles)
+    // Each segment i goes from p[i] to p[i+1]
+    for i in 0..n {
+        let p1 = points[i];
+        let p2 = points[(i + 1) % n];
 
-    // Compute left and right edge points
-    let mut left_points: Vec<(f64, f64)> = Vec::with_capacity(n);
-    let mut right_points: Vec<(f64, f64)> = Vec::with_capacity(n);
+        // Direction and Perpendicular
+        let d = normalize(subtract(p2, p1));
+        let perp = (-d.1, d.0);
+
+        // Segment corners
+        // p1_left, p1_right, p2_right, p2_left
+        let p1_l = (p1.0 + perp.0 * half_width, p1.1 + perp.1 * half_width);
+        let p1_r = (p1.0 - perp.0 * half_width, p1.1 - perp.1 * half_width);
+        let p2_l = (p2.0 + perp.0 * half_width, p2.1 + perp.1 * half_width);
+        let p2_r = (p2.0 - perp.0 * half_width, p2.1 - perp.1 * half_width);
+
+        quads.push(vec![p1_l, p2_l, p2_r, p1_r]);
+    }
+
+    // 2. Generate Joins at Vertices
+    // Handle gaps on the outer side of the turn
+    let mut arcs: Vec<(f64, f64, f64, f64, f64)> = Vec::new(); // center_x, center_y, radius, start_angle, end_angle
 
     for i in 0..n {
         let p_prev = points[(i + n - 1) % n];
         let p_curr = points[i];
         let p_next = points[(i + 1) % n];
 
-        // Direction vectors
+        // Directions
         let d1 = normalize(subtract(p_curr, p_prev));
         let d2 = normalize(subtract(p_next, p_curr));
 
-        // Perpendiculars
+        // Cross product to determine turn direction
+        // Y-down: d1=(1,0), d2=(0,1) -> cross=1 (Right/CW turn)
+        let cross = d1.0 * d2.1 - d1.1 * d2.0;
+
+        if cross.abs() < 0.001 {
+            continue; // Collinear
+        }
+
+        // Perpendiculars (pointing "Left" relative to travel)
         let perp1 = (-d1.1, d1.0);
         let perp2 = (-d2.1, d2.0);
 
-        let cross = d1.0 * d2.1 - d1.1 * d2.0;
+        // Determine Inner/Outer side
+        // perp points Right relative to travel direction (Y-down)
+        // cross > 0 (Right Turn): Left is Outer (Convex)
+        // cross < 0 (Left Turn): Right is Outer (Convex)
+        
+        let is_right_turn = cross > 0.0;
 
-        let (left_pt, right_pt) = if cross.abs() > 0.001 {
-            if use_bevel {
-                // For round/bevel joins, use the average perpendicular (shorter corner)
-                let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
-                let left_pt = (p_curr.0 + avg_perp.0 * fill_half_width, p_curr.1 + avg_perp.1 * fill_half_width);
-                let right_pt = (p_curr.0 - avg_perp.0 * fill_half_width, p_curr.1 - avg_perp.1 * fill_half_width);
-                (left_pt, right_pt)
-            } else {
-                // Compute miter intersection
-                let left_p1 = (p_curr.0 + perp1.0 * fill_half_width, p_curr.1 + perp1.1 * fill_half_width);
-                let left_p2 = (p_curr.0 + perp2.0 * fill_half_width, p_curr.1 + perp2.1 * fill_half_width);
-                let right_p1 = (p_curr.0 - perp1.0 * fill_half_width, p_curr.1 - perp1.1 * fill_half_width);
-                let right_p2 = (p_curr.0 - perp2.0 * fill_half_width, p_curr.1 - perp2.1 * fill_half_width);
-
-                let mut left_pt = line_intersection(left_p1, d1, left_p2, d2).unwrap_or(left_p1);
-                let mut right_pt = line_intersection(right_p1, d1, right_p2, d2).unwrap_or(right_p1);
-
-                // Apply miterlimit (use original half_width for geometric correctness)
-                let max_miter = miterlimit * half_width;
-                let left_dist = ((left_pt.0 - p_curr.0).powi(2) + (left_pt.1 - p_curr.1).powi(2)).sqrt();
-                let right_dist = ((right_pt.0 - p_curr.0).powi(2) + (right_pt.1 - p_curr.1).powi(2)).sqrt();
-
-                if left_dist > max_miter {
-                    let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
-                    left_pt = (p_curr.0 + avg_perp.0 * fill_half_width, p_curr.1 + avg_perp.1 * fill_half_width);
-                }
-                if right_dist > max_miter {
-                    let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
-                    right_pt = (p_curr.0 - avg_perp.0 * fill_half_width, p_curr.1 - avg_perp.1 * fill_half_width);
-                }
-
-                (left_pt, right_pt)
-            }
+        // Outer points of the segments at this vertex
+        // Segment 1 ends at p_curr. Outer corner depends on turn.
+        // Segment 2 starts at p_curr.
+        
+        let (outer_p1, outer_p2) = if is_right_turn {
+            // Right turn -> Left side is Outer
+            // Seg 1 Left End: p + perp1 * w
+            // Seg 2 Left Start: p + perp2 * w
+            (
+                (p_curr.0 + perp1.0 * half_width, p_curr.1 + perp1.1 * half_width),
+                (p_curr.0 + perp2.0 * half_width, p_curr.1 + perp2.1 * half_width)
+            )
         } else {
-            // Nearly collinear
-            let avg_perp = normalize((perp1.0 + perp2.0, perp1.1 + perp2.1));
-            let left_pt = (p_curr.0 + avg_perp.0 * fill_half_width, p_curr.1 + avg_perp.1 * fill_half_width);
-            let right_pt = (p_curr.0 - avg_perp.0 * fill_half_width, p_curr.1 - avg_perp.1 * fill_half_width);
-            (left_pt, right_pt)
+            // Left turn -> Right side is Outer
+            // Seg 1 Right End: p - perp1 * w
+            // Seg 2 Right Start: p - perp2 * w
+            (
+                (p_curr.0 - perp1.0 * half_width, p_curr.1 - perp1.1 * half_width),
+                (p_curr.0 - perp2.0 * half_width, p_curr.1 - perp2.1 * half_width)
+            )
         };
 
-        left_points.push(left_pt);
-        right_points.push(right_pt);
-    }
+        // Fill the gap between outer_p1 and outer_p2
+        if linejoin == "round" {
+            // Draw arc
+            // Angles must match the Outer vectors used for outer_p1/outer_p2
+            let angle1 = if is_right_turn {
+                // Right Turn -> Outer is Left (-perp)
+                (-perp1.1).atan2(-perp1.0)
+            } else {
+                // Left Turn -> Outer is Right (+perp)
+                perp1.1.atan2(perp1.0)
+            };
+            
+            let angle2 = if is_right_turn {
+                (-perp2.1).atan2(-perp2.0)
+            } else {
+                perp2.1.atan2(perp2.0)
+            };
 
-    // Build quads for each edge
-    let mut quads: Vec<Vec<(f64, f64)>> = Vec::with_capacity(n);
-    for i in 0..n {
-        let j = (i + 1) % n;
-        quads.push(vec![
-            left_points[i],
-            left_points[j],
-            right_points[j],
-            right_points[i],
-        ]);
+            // Ensure we sweep the correct way (shortest path for convex corner)
+            // For outer corner, we always sweep "around" the corner.
+            
+            let start = angle1;
+            let end = angle2;
+            
+            // Normalize angles
+            let mut sweep = end - start;
+            while sweep > std::f64::consts::PI { sweep -= 2.0 * std::f64::consts::PI; }
+            while sweep < -std::f64::consts::PI { sweep += 2.0 * std::f64::consts::PI; }
+            
+            arcs.push((p_curr.0, p_curr.1, half_width, start, start + sweep));
+
+        } else if linejoin == "bevel" {
+            // Draw triangle (p, outer_p1, outer_p2)
+            quads.push(vec![p_curr, outer_p1, outer_p2]);
+        } else {
+            // Miter
+            // Compute intersection of the two outer lines
+            let miter_pt = if is_right_turn {
+                line_intersection(
+                    outer_p1, d1,
+                    outer_p2, d2
+                )
+            } else {
+                line_intersection(
+                    outer_p1, d1,
+                    outer_p2, d2
+                )
+            };
+
+            if let Some(mp) = miter_pt {
+                let dist = ((mp.0 - p_curr.0).powi(2) + (mp.1 - p_curr.1).powi(2)).sqrt();
+                if dist <= miterlimit * half_width {
+                    // Miter within limit: fill quadrilateral (p, outer_p1, mp, outer_p2)
+                    quads.push(vec![p_curr, outer_p1, mp, outer_p2]);
+                } else {
+                    // Fallback to bevel
+                    quads.push(vec![p_curr, outer_p1, outer_p2]);
+                }
+            } else {
+                // Parallel/degenerate, treat as bevel
+                quads.push(vec![p_curr, outer_p1, outer_p2]);
+            }
+        }
     }
 
     // Fill all quads using union
@@ -681,6 +738,68 @@ fn render_stroke_closed_polygon<'py>(
                     let x_start = (pair[0] - min_x as f64).max(0.0) as usize;
                     let x_end = ((pair[1] - min_x as f64) as usize + 1).min(width);
                     if x_start < x_end {
+                        for x in x_start..x_end {
+                            mask[[y, x]] = 255;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Draw arcs for round joins
+    for (cx, cy, r, start_angle, end_angle) in arcs {
+        // Generate arc polygon
+        let sweep = end_angle - start_angle;
+        let n_arc = ((sweep.abs() / (std::f64::consts::PI / 16.0)) as usize).max(8);
+        let mut arc_poly: Vec<(f64, f64)> = Vec::with_capacity(n_arc + 2);
+
+        // Start at center
+        arc_poly.push((cx - min_x as f64, cy - min_y as f64));
+
+        // Add arc points
+        for j in 0..=n_arc {
+            let t = j as f64 / n_arc as f64;
+            let angle = start_angle + t * sweep;
+            let px = cx + r * angle.cos() - min_x as f64;
+            let py = cy + r * angle.sin() - min_y as f64;
+            arc_poly.push((px, py));
+        }
+
+        // Fill the arc polygon using scanline
+        let poly_min_y = arc_poly.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let poly_max_y = arc_poly.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+
+        let y_start = (poly_min_y.max(0.0) as usize).min(height);
+        let y_end = ((poly_max_y + 1.0).max(0.0) as usize).min(height);
+
+        for y in y_start..y_end {
+            let screen_y = y as f64 + 0.5;
+            let mut intersections: Vec<f64> = Vec::new();
+
+            for k in 0..arc_poly.len() {
+                let (mut x1, mut y1) = arc_poly[k];
+                let (mut x2, mut y2) = arc_poly[(k + 1) % arc_poly.len()];
+
+                if (y1 - y2).abs() < 1e-10 {
+                    continue;
+                }
+                if y1 > y2 {
+                    std::mem::swap(&mut x1, &mut x2);
+                    std::mem::swap(&mut y1, &mut y2);
+                }
+                if y1 <= screen_y && screen_y < y2 {
+                    let t = (screen_y - y1) / (y2 - y1);
+                    intersections.push(x1 + t * (x2 - x1));
+                }
+            }
+
+            if intersections.len() >= 2 {
+                intersections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                for pair in intersections.chunks(2) {
+                    if pair.len() == 2 {
+                        let x_start = (pair[0].max(0.0) as usize).min(width);
+                        let x_end = ((pair[1] as usize) + 1).min(width);
                         for x in x_start..x_end {
                             mask[[y, x]] = 255;
                         }

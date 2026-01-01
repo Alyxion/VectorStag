@@ -1710,7 +1710,7 @@ class SVGRenderer:
                                             style.stroke_miterlimit, style.stroke_linejoin)
             else:
                 self._stroke_open_polygon(ctx, points, stroke, half_width,
-                                          style.stroke_linecap, style.stroke_linejoin)
+                                          style.stroke_linecap)
             return
 
         int_width = max(1, int(width))
@@ -1892,7 +1892,7 @@ class SVGRenderer:
 
     def _stroke_open_polygon(self, ctx: "RenderContext", points: List[Tuple[float, float]],
                              stroke: Tuple[int, int, int, int], half_width: float,
-                             linecap: str, linejoin: str = "miter"):
+                             linecap: str):
         """Render an open path stroke using polygon fill (gap-free)."""
         n = len(points)
         if n < 2:
@@ -1909,18 +1909,9 @@ class SVGRenderer:
         if n < 2:
             return
 
-        # Compute left and right edge points using miter-style intersections
-        # This prevents gaps at corners
-        # For round linejoin, we store arc points separately
+        # Compute left and right edge points
         left_points = []
         right_points = []
-        # Store round join arcs at corners: (index, side, arc_points)
-        # side: 'left' for outer arc on left, 'right' for outer arc on right
-        round_join_arcs = []
-
-        # Add small epsilon to half_width for fill coverage
-        # Use proportional expansion to work for both large and small icons
-        fill_half_width = half_width + 0.5
 
         for i in range(n):
             p_curr = points[i]
@@ -1928,105 +1919,26 @@ class SVGRenderer:
             if i == 0:
                 # First point - use direction to next point
                 d = self._normalize(self._subtract(points[1], points[0]))
-                perp = (-d[1], d[0])
-                left_pt = (p_curr[0] + perp[0] * fill_half_width, p_curr[1] + perp[1] * fill_half_width)
-                right_pt = (p_curr[0] - perp[0] * fill_half_width, p_curr[1] - perp[1] * fill_half_width)
             elif i == n - 1:
                 # Last point - use direction from previous point
                 d = self._normalize(self._subtract(points[n-1], points[n-2]))
-                perp = (-d[1], d[0])
-                left_pt = (p_curr[0] + perp[0] * fill_half_width, p_curr[1] + perp[1] * fill_half_width)
-                right_pt = (p_curr[0] - perp[0] * fill_half_width, p_curr[1] - perp[1] * fill_half_width)
             else:
-                # Middle point - compute miter intersection for gap-free corners
+                # Middle point - average of incoming and outgoing directions
                 d1 = self._normalize(self._subtract(p_curr, points[i-1]))
                 d2 = self._normalize(self._subtract(points[i+1], p_curr))
-                perp1 = (-d1[1], d1[0])
-                perp2 = (-d2[1], d2[0])
+                d = self._normalize((d1[0] + d2[0], d1[1] + d2[1]))
 
-                # Check if edges are nearly parallel
-                cross = d1[0] * d2[1] - d1[1] * d2[0]
-                if abs(cross) < 0.001:
-                    # Nearly parallel - use average perpendicular
-                    avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
-                    left_pt = (p_curr[0] + avg_perp[0] * fill_half_width, p_curr[1] + avg_perp[1] * fill_half_width)
-                    right_pt = (p_curr[0] - avg_perp[0] * fill_half_width, p_curr[1] - avg_perp[1] * fill_half_width)
-                else:
-                    # Compute edge endpoint positions
-                    left_p1 = (p_curr[0] + perp1[0] * fill_half_width, p_curr[1] + perp1[1] * fill_half_width)
-                    left_p2 = (p_curr[0] + perp2[0] * fill_half_width, p_curr[1] + perp2[1] * fill_half_width)
-                    right_p1 = (p_curr[0] - perp1[0] * fill_half_width, p_curr[1] - perp1[1] * fill_half_width)
-                    right_p2 = (p_curr[0] - perp2[0] * fill_half_width, p_curr[1] - perp2[1] * fill_half_width)
+            # Perpendicular
+            perp = (-d[1], d[0])
 
-                    # For round linejoin, use edge endpoints and add arc on outer side
-                    if linejoin == "round":
-                        # Determine which side is outer (cross > 0 means turning left, outer is right)
-                        if cross > 0:
-                            # Turning left - outer side is RIGHT
-                            # Use miter for left (inner), edge endpoints for right (outer)
-                            left_pt = self._line_intersection(left_p1, d1, left_p2, d2)
-                            if left_pt is None:
-                                left_pt = left_p1
-                            right_pt = right_p1  # Will add arc from right_p1 to right_p2
-
-                            # Generate arc from right_p1 to right_p2 around p_curr
-                            arc_pts = self._generate_corner_arc(p_curr, perp1, perp2, fill_half_width, -1)
-                            if arc_pts:
-                                round_join_arcs.append((i, 'right', arc_pts))
-                        else:
-                            # Turning right - outer side is LEFT
-                            # Use miter for right (inner), edge endpoints for left (outer)
-                            right_pt = self._line_intersection(right_p1, d1, right_p2, d2)
-                            if right_pt is None:
-                                right_pt = right_p1
-                            left_pt = left_p1  # Will add arc from left_p1 to left_p2
-
-                            # Generate arc from left_p1 to left_p2 around p_curr
-                            arc_pts = self._generate_corner_arc(p_curr, perp1, perp2, fill_half_width, 1)
-                            if arc_pts:
-                                round_join_arcs.append((i, 'left', arc_pts))
-                    else:
-                        # Miter or bevel join
-                        left_pt = self._line_intersection(left_p1, d1, left_p2, d2)
-                        right_pt = self._line_intersection(right_p1, d1, right_p2, d2)
-
-                        # Apply miter limit (default 4.0)
-                        miterlimit = 4.0
-                        max_miter = miterlimit * fill_half_width
-
-                        if left_pt is None:
-                            left_pt = left_p1
-                        else:
-                            left_dist = math.sqrt((left_pt[0] - p_curr[0])**2 + (left_pt[1] - p_curr[1])**2)
-                            if left_dist > max_miter:
-                                # Fall back to bevel
-                                avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
-                                left_pt = (p_curr[0] + avg_perp[0] * fill_half_width, p_curr[1] + avg_perp[1] * fill_half_width)
-
-                        if right_pt is None:
-                            right_pt = right_p1
-                        else:
-                            right_dist = math.sqrt((right_pt[0] - p_curr[0])**2 + (right_pt[1] - p_curr[1])**2)
-                            if right_dist > max_miter:
-                                avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
-                                right_pt = (p_curr[0] - avg_perp[0] * fill_half_width, p_curr[1] - avg_perp[1] * fill_half_width)
+            left_pt = (p_curr[0] + perp[0] * half_width, p_curr[1] + perp[1] * half_width)
+            right_pt = (p_curr[0] - perp[0] * half_width, p_curr[1] - perp[1] * half_width)
 
             left_points.append(left_pt)
             right_points.append(right_pt)
 
         # Build stroke polygon: left edge forward, end cap, right edge backward, start cap
-        # For round joins, we insert arc points at the corners
-        stroke_polygon = []
-
-        # Left edge forward with round join arcs
-        left_arcs_by_idx = {idx: pts for idx, side, pts in round_join_arcs if side == 'left'}
-        for i, pt in enumerate(left_points):
-            stroke_polygon.append(pt)
-            if i in left_arcs_by_idx:
-                # Add arc points (skip first since it's approximately at pt)
-                arc_pts = left_arcs_by_idx[i]
-                if len(arc_pts) > 1:
-                    stroke_polygon.extend(arc_pts[1:])
+        stroke_polygon = list(left_points)
 
         # End cap
         if linecap == "round":
@@ -2038,26 +1950,19 @@ class SVGRenderer:
             for j in range(1, n_cap):
                 angle = math.pi * j / n_cap
                 # Start from left side (perp direction), go around to right side (-perp direction)
-                cap_x = end_pt[0] + fill_half_width * (perp[0] * math.cos(angle) + d[0] * math.sin(angle))
-                cap_y = end_pt[1] + fill_half_width * (perp[1] * math.cos(angle) + d[1] * math.sin(angle))
+                cap_x = end_pt[0] + half_width * (perp[0] * math.cos(angle) + d[0] * math.sin(angle))
+                cap_y = end_pt[1] + half_width * (perp[1] * math.cos(angle) + d[1] * math.sin(angle))
                 stroke_polygon.append((cap_x, cap_y))
         elif linecap == "square":
-            # Extend by fill_half_width
+            # Extend by half_width
             d = self._normalize(self._subtract(points[-1], points[-2]))
-            stroke_polygon.append((left_points[-1][0] + d[0] * fill_half_width,
-                                   left_points[-1][1] + d[1] * fill_half_width))
-            stroke_polygon.append((right_points[-1][0] + d[0] * fill_half_width,
-                                   right_points[-1][1] + d[1] * fill_half_width))
+            stroke_polygon.append((left_points[-1][0] + d[0] * half_width,
+                                   left_points[-1][1] + d[1] * half_width))
+            stroke_polygon.append((right_points[-1][0] + d[0] * half_width,
+                                   right_points[-1][1] + d[1] * half_width))
 
-        # Right edge backward with round join arcs
-        right_arcs_by_idx = {idx: pts for idx, side, pts in round_join_arcs if side == 'right'}
-        for i in range(n - 1, -1, -1):
-            stroke_polygon.append(right_points[i])
-            if i in right_arcs_by_idx:
-                # Add arc points in reverse (skip first since it's approximately at right_points[i])
-                arc_pts = right_arcs_by_idx[i]
-                if len(arc_pts) > 1:
-                    stroke_polygon.extend(reversed(arc_pts[:-1]))
+        # Right edge backward
+        stroke_polygon.extend(reversed(right_points))
 
         # Start cap
         if linecap == "round":
@@ -2069,33 +1974,18 @@ class SVGRenderer:
             for j in range(1, n_cap):
                 angle = math.pi * j / n_cap
                 # Start from right side (-perp direction), go around to left side (perp direction)
-                cap_x = start_pt[0] + fill_half_width * (-perp[0] * math.cos(angle) - d[0] * math.sin(angle))
-                cap_y = start_pt[1] + fill_half_width * (-perp[1] * math.cos(angle) - d[1] * math.sin(angle))
+                cap_x = start_pt[0] + half_width * (-perp[0] * math.cos(angle) - d[0] * math.sin(angle))
+                cap_y = start_pt[1] + half_width * (-perp[1] * math.cos(angle) - d[1] * math.sin(angle))
                 stroke_polygon.append((cap_x, cap_y))
         elif linecap == "square":
             d = self._normalize(self._subtract(points[1], points[0]))
-            stroke_polygon.append((right_points[0][0] - d[0] * fill_half_width,
-                                   right_points[0][1] - d[1] * fill_half_width))
-            stroke_polygon.append((left_points[0][0] - d[0] * fill_half_width,
-                                   left_points[0][1] - d[1] * fill_half_width))
+            stroke_polygon.append((right_points[0][0] - d[0] * half_width,
+                                   right_points[0][1] - d[1] * half_width))
+            stroke_polygon.append((left_points[0][0] - d[0] * half_width,
+                                   left_points[0][1] - d[1] * half_width))
 
         # Draw the stroke polygon using fast path when available
         self._fill_polygon_with_rule(ctx, stroke_polygon, stroke, "nonzero")
-
-        # For round linejoin, also fill circles at each interior corner to ensure
-        # complete coverage. This handles gaps that may occur from polygon winding issues.
-        if linejoin == "round" and n > 2:
-            for i in range(1, n - 1):
-                # Generate a circle polygon at each corner
-                p = points[i]
-                n_circle = 16
-                circle_pts = []
-                for j in range(n_circle):
-                    angle = 2 * math.pi * j / n_circle
-                    cx = p[0] + fill_half_width * math.cos(angle)
-                    cy = p[1] + fill_half_width * math.sin(angle)
-                    circle_pts.append((cx, cy))
-                self._fill_polygon_with_rule(ctx, circle_pts, stroke, "nonzero")
 
     def _stroke_closed_polygon(self, ctx: "RenderContext", points: List[Tuple[float, float]],
                                stroke: Tuple[int, int, int, int], half_width: float,
@@ -2138,9 +2028,13 @@ class SVGRenderer:
                 has_reflex = True
                 break
 
-        # For round/bevel joins, use segmented approach to get correct per-edge perpendicular offsets
-        # The outline approach with averaged perpendiculars creates gaps at 90° corners
-        if has_reflex or linejoin in ("round", "bevel"):
+        # Routing strategy:
+        # - Convex shapes (circles, simple polygons): Use outline approach with Rust
+        #   The outline approach draws ellipses at corners for round joins (no gaps)
+        # - Non-convex shapes with reflex angles: Use segmented approach
+        #   Required to avoid self-intersection issues
+        # - Bevel joins: Use segmented approach for correct perpendicular offsets
+        if has_reflex or linejoin == "bevel":
             self._stroke_closed_polygon_segmented(ctx, points, stroke, half_width, miterlimit, linejoin)
         else:
             self._stroke_closed_polygon_outline(ctx, points, stroke, half_width, miterlimit, linejoin)
@@ -2154,12 +2048,14 @@ class SVGRenderer:
             return
 
         # Get bounding box for stroke area
+        # For round joins, need extra space for the round corners
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
-        min_x = max(0, int(min(xs) - half_width - 2))
-        min_y = max(0, int(min(ys) - half_width - 2))
-        max_x = min(ctx.image_width, int(max(xs) + half_width + 2))
-        max_y = min(ctx.image_height, int(max(ys) + half_width + 2))
+        padding = half_width * 1.5 if linejoin == "round" else half_width + 2
+        min_x = max(0, int(min(xs) - padding))
+        min_y = max(0, int(min(ys) - padding))
+        max_x = min(ctx.image_width, int(max(xs) + padding))
+        max_y = min(ctx.image_height, int(max(ys) + padding))
 
         if min_x >= max_x or min_y >= max_y:
             return
@@ -2168,18 +2064,14 @@ class SVGRenderer:
         height = max_y - min_y
 
         # Use Rust implementation if available
+        # Add small expansion to half_width for better sub-pixel edge coverage
+        stroke_expand = 0.3
         mask = vectorstag_rust.render_stroke_closed_polygon(
-            points, half_width, miterlimit, width, height, min_x, min_y, linejoin
+            points, half_width + stroke_expand, miterlimit, width, height, min_x, min_y, linejoin
         )
         mask_img = Image.fromarray(mask, "L")
 
-        # Handle round joins if needed
-        if linejoin == "round":
-            draw = ImageDraw.Draw(mask_img, "L")
-            for i in range(n):
-                x, y = points[i]
-                draw.ellipse([x - half_width - min_x, y - half_width - min_y,
-                              x + half_width - min_x, y + half_width - min_y], fill=255)
+        # Round joins are now handled in Rust by drawing circles at corners
 
         # Apply stroke color with mask
         fill_img = Image.new("RGBA", (width, height), stroke[:3] + (255,))

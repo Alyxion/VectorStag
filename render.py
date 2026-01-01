@@ -71,7 +71,7 @@ def main():
     parser.add_argument("output", help="Output PNG file (use '-' for stdout)")
 
     parser.add_argument("-w", "--width", type=int, help="Output width")
-    parser.add_argument("-h", "--height", type=int, dest="height", help="Output height")
+    parser.add_argument("-H", "--height", type=int, dest="height", help="Output height")
     parser.add_argument("-s", "--size", type=int, help="Output size (square)")
 
     parser.add_argument("-a", "--antialias", type=int, default=4,

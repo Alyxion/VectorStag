@@ -25,6 +25,7 @@ CairoSVG incorrectly fills this gap.
   - With negative viewBox origin: stretches to fill output dimensions
 
 ## Completed Fixes
+- **android.svg**: Fixed hard edges and gaps in stroke joins (Segment+Join approach). Score: 99.9%+
 - **paths-data-08/09-t**: Fixed evenodd multi-polygon fill (87% → 97%)
 - Triangle cutout now works correctly with fill-rule="evenodd"
 
@@ -97,6 +98,10 @@ python benchmark_resvg_tests.py
 python benchmark_resvg_tests.py --category shapes
 python benchmark_resvg_tests.py --category masking/mask
 ```
+
+## Accuracy Expectations
+- **Anti-aliasing differences account for AT MOST 0.1%** - anything beyond that indicates real rendering bugs
+- **Target: 99.9%+ for all SVGs** - especially simple shapes like android.svg
 
 ## Development Guidelines
 - **ALWAYS use 4x antialiasing**: The quality difference between 2x and 4x is massive. DO NOT CHANGE this default under any circumstances.

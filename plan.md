@@ -47,6 +47,36 @@ let inner_edges = build_edges(&left_points, -1);   // Inner = subtract winding
 - book-image.svg: 0 gap pixels
 - All 124 tests pass
 
+#### Session 3: Android Stroke Join Fix (Completed)
+**Problem**: Android logo body had hard rectangular edges despite `stroke-linejoin="round"`. Later, "lacking filling" artifacts appeared on corners.
+
+**Root Cause 1 (Hard Edges)**:
+- `render_stroke_closed_polygon` treated `round` joins as `miter` for the base polygon.
+- The sharp miter tip extended beyond the rounded arc, making the corner look sharp.
+- **Fix**: Treat `round` joins as `bevel` for the base polygon (cutting the corner short) so the arc determines the silhouette.
+
+**Root Cause 2 (Missing Fills/Gaps)**:
+- Incorrect logic for selecting "Inner" vs "Outer" side of the turn.
+- `perp` vector points *Right* relative to travel.
+- **Right Turn** (`cross > 0`): Outer side is *Left* (`p - perp`). Inner is *Right*.
+- **Left Turn** (`cross < 0`): Outer side is *Right* (`p + perp`). Inner is *Left*.
+- Previous logic had these swapped or inconsistent, causing:
+    - Arcs drawn on the inner side (invisible/useless).
+    - Miter connections missing on the inner side (gaps).
+
+**Refactoring**:
+- Rewrote `render_stroke_closed_polygon` to use a "Segment + Join" approach.
+- **Segments**: Full-width rectangles for each edge.
+- **Joins**: Explicit geometry filling the gap on the Outer side (Arc for round, Triangle for bevel, Quad for miter).
+- **Inner Side**: Naturally handled by segment overlap (implicit miter).
+
+**Results**:
+- `android.svg` renders correctly with rounded corners and no gaps.
+
+**Doubts / Future Improvements**:
+- **Tessellation on rounded corners**: The outer rounded corners (body) are approximated with 8 line segments per 90-degree turn. This may show minor faceting compared to analytical curves, though visually sufficient with AA.
+- Future optimization: The "Segment + Join" approach creates 2x segments and N joins. For simple miter joins, the original continuous polygon approach was faster. Consider hybrid approach or optimization for simple paths.
+
 ### Gap detection tool:
 ```bash
 python scripts/detect_gaps.py --categories lucide --limit 100
