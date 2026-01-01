@@ -65,9 +65,8 @@ When in doubt, use resvg as the reference renderer.
 
 ## Tools (Consolidated)
 - `svg_compare.py` - Main comparison tool (prerender, compare, list)
-- `benchmark.py` - Performance benchmarking and profiling
+- `scripts/benchmark.py` - Unified benchmark (all collections + resvg-test-suite)
 - `render.py` - Simple single-file rendering
-- `benchmark_resvg_tests.py` - Benchmark against resvg-test-suite (1679 tests)
 
 ## Testing
 
@@ -85,18 +84,22 @@ python svg_compare.py compare --all
 # - W3C: 99.3%
 ```
 
-### resvg-test-suite Benchmark
+### Full Benchmark (Collections + resvg-test-suite)
 ```bash
-# Full benchmark (1679 tests, ~10 minutes single-threaded)
-python benchmark_resvg_tests.py
+# Full benchmark with table output
+python scripts/benchmark.py -j 16
 
-# Expected: 90% average accuracy
-# Categories: shapes (97%), text (96%), painting (94%), masking (93%),
-#             paint-servers (90%), structure (88%), filters (80%)
+# Just icon collections
+python scripts/benchmark.py --collections -j 16
 
-# Test specific category
-python benchmark_resvg_tests.py --category shapes
-python benchmark_resvg_tests.py --category masking/mask
+# Just resvg test suite
+python scripts/benchmark.py --resvg -j 16
+
+# Specific resvg category
+python scripts/benchmark.py --resvg --resvg-category shapes -j 16
+
+# List available resvg categories
+python scripts/benchmark.py --list-resvg-categories
 ```
 
 ## Accuracy Expectations
