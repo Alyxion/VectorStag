@@ -5,24 +5,25 @@ from typing import Optional, Union, List, Tuple
 from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageFilter
 import numpy as np
 
-# Try to import Rust extension for performance
-try:
-    import vectorstag_rust
-    HAS_RUST = True
-except ImportError:
-    HAS_RUST = False
+# Rust extension is required for performance
+import vectorstag_rust
 
-from .parser import (
-    SVGParser, SVGDocument, SVGElement, Transform, Style,
-    RectElement, CircleElement, EllipseElement, LineElement,
-    PolylineElement, PolygonElement, PathElement, GroupElement,
-    TextElement, ImageElement, LinearGradient, RadialGradient, GradientStop, Pattern,
-    ClipPath, Mask, FILL_NOT_SET, Filter, FilterPrimitive,
+from .svg_parser import SVGParser
+from .core.transforms import Transform
+from .parser.elements import (
+    SVGDocument, SVGElement, RectElement, CircleElement, EllipseElement,
+    LineElement, PolylineElement, PolygonElement, PathElement, GroupElement,
+    TextElement, ImageElement, ClipPath, Mask,
+)
+from .parser.styles import Style, FILL_NOT_SET
+from .parser.gradients import LinearGradient, RadialGradient, GradientStop, Pattern
+from .parser.filters import (
+    Filter, FilterPrimitive,
     FeGaussianBlur, FeOffset, FeFlood, FeBlend, FeComposite, FeMerge, FeMergeNode,
     FeColorMatrix, FeComponentTransfer, FeMorphology, FeConvolveMatrix,
     FeTurbulence, FeDisplacementMap, FeImage, FeTile,
     FeDiffuseLighting, FeSpecularLighting, FeDropShadow,
-    FeDistantLight, FePointLight, FeSpotLight
+    FeDistantLight, FePointLight, FeSpotLight,
 )
 
 
@@ -49,6 +50,34 @@ class SVGRenderer:
         self.antialias = max(1, antialias)
         self.preserve_aspect_ratio = preserve_aspect_ratio
         self.parser = SVGParser()
+        self._image_registry: dict[str, Image.Image] = {}
+
+    def register_image(self, name: str, image: Union[Image.Image, np.ndarray]) -> str:
+        """
+        Register an in-memory image for use in SVG.
+
+        Args:
+            name: Unique name for the image
+            image: PIL Image or numpy array (RGBA)
+
+        Returns:
+            Reference string to use in SVG href attribute ('memory:name')
+
+        Example:
+            >>> renderer = SVGRenderer()
+            >>> renderer.register_image("photo", pil_image)
+            >>> # In SVG: <image href="memory:photo" width="100" height="100"/>
+        """
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image.astype(np.uint8))
+        if image.mode != 'RGBA':
+            image = image.convert('RGBA')
+        self._image_registry[name] = image
+        return f"memory:{name}"
+
+    def clear_images(self) -> None:
+        """Clear all registered images from the registry."""
+        self._image_registry.clear()
 
     def render(self, svg_content: str, width: Optional[int] = None,
                height: Optional[int] = None) -> Image.Image:
@@ -117,17 +146,11 @@ class SVGRenderer:
             )
 
         # Create numpy array directly (skip PIL Image.new for Rust path)
-        if HAS_RUST:
-            # Create numpy array with background color directly
-            image_arr = np.zeros((render_height, render_width, 4), dtype=np.uint8)
-            if self.background != (0, 0, 0, 0):
-                image_arr[:, :] = self.background
-            image = None  # We'll create PIL image at the end if needed
-        else:
-            # Fallback: create PIL image for non-Rust path
-            image = Image.new("RGBA", (render_width, render_height), self.background)
-            image_arr = None
-
+        # Create numpy array with background color directly
+        image_arr = np.zeros((render_height, render_width, 4), dtype=np.uint8)
+        if self.background != (0, 0, 0, 0):
+            image_arr[:, :] = self.background
+        image = None  # We'll create PIL image at the end if needed
         # Create render context with numpy array as primary (if Rust available)
         ctx = RenderContext(image, doc.gradients, transform, doc.clip_paths, doc.masks, doc.filters, doc.patterns, doc.elements_by_id, doc.path_data_by_id, viewport_width=src_w, viewport_height=src_h)
         ctx.image_arr = image_arr
@@ -137,7 +160,7 @@ class SVGRenderer:
             self._render_element(ctx, element)
 
         # Get the rendered array (either from ctx or convert from PIL)
-        if HAS_RUST and ctx.image_arr is not None:
+        if ctx.image_arr is not None:
             img_arr = ctx.image_arr
         else:
             img_arr = np.array(image)
@@ -192,16 +215,11 @@ class SVGRenderer:
 
         # Downscale for anti-aliasing effect
         if aa > 1:
-            if HAS_RUST:
-                # Use Rust box filter resize (faster for 4x downscale)
-                if not img_arr.flags['C_CONTIGUOUS']:
-                    img_arr = np.ascontiguousarray(img_arr)
-                resized_arr = vectorstag_rust.resize_rgba(img_arr, out_width, out_height)
-                return Image.fromarray(resized_arr, "RGBA")
-            else:
-                image = Image.fromarray(img_arr, "RGBA")
-                return image.resize((out_width, out_height), Image.LANCZOS)
-
+            # Use Rust box filter resize (faster for 4x downscale)
+            if not img_arr.flags['C_CONTIGUOUS']:
+                img_arr = np.ascontiguousarray(img_arr)
+            resized_arr = vectorstag_rust.resize_rgba(img_arr, out_width, out_height)
+            return Image.fromarray(resized_arr, "RGBA")
         # No resize needed - convert to PIL at the end
         return Image.fromarray(img_arr, "RGBA")
 
@@ -547,9 +565,7 @@ class SVGRenderer:
 
     def _get_source_alpha(self, src: np.ndarray) -> np.ndarray:
         """Get SourceAlpha - just the alpha channel as grayscale."""
-        if HAS_RUST:
-            return vectorstag_rust.get_source_alpha(src)
-        # Fallback
+        return vectorstag_rust.get_source_alpha(src)
         result = np.zeros_like(src)
         result[:, :, 3] = src[:, :, 3]
         return result
@@ -605,7 +621,7 @@ class SVGRenderer:
             else:
                 std_x = prim.std_deviation_x * scale
                 std_y = prim.std_deviation_y * scale
-            if HAS_RUST and std_x >= 0.5 or std_y >= 0.5:
+            if std_x >= 0.5 or std_y >= 0.5:
                 return vectorstag_rust.fe_gaussian_blur(in1, std_x, std_y)
             return in1
 
@@ -617,9 +633,7 @@ class SVGRenderer:
             else:
                 dx = int(prim.dx * scale)
                 dy = int(prim.dy * scale)
-            if HAS_RUST:
-                return vectorstag_rust.fe_offset(in1, dx, dy)
-            # Fallback
+            return vectorstag_rust.fe_offset(in1, dx, dy)
             result = np.zeros_like(in1)
             h, w = in1.shape[:2]
             for y in range(h):
@@ -632,8 +646,7 @@ class SVGRenderer:
             return result
 
         elif isinstance(prim, FeFlood):
-            if HAS_RUST:
-                return vectorstag_rust.fe_flood(width, height, *prim.flood_color)
+            return vectorstag_rust.fe_flood(width, height, *prim.flood_color)
             result = np.zeros((height, width, 4), dtype=np.uint8)
             result[:, :] = prim.flood_color
             return result
@@ -646,18 +659,14 @@ class SVGRenderer:
                        "soft-light": 9, "difference": 10, "exclusion": 11,
                        "hue": 12, "saturation": 13, "color": 14, "luminosity": 15}
             mode = mode_map.get(prim.mode, 0)
-            if HAS_RUST:
-                return vectorstag_rust.fe_blend(in1, in2, mode)
-            return in1  # Fallback - just return in1
+            return vectorstag_rust.fe_blend(in1, in2, mode)
 
         elif isinstance(prim, FeComposite):
             if in2 is None:
                 in2 = in1
             op_map = {"over": 0, "in": 1, "out": 2, "atop": 3, "xor": 4, "arithmetic": 5}
             op = op_map.get(prim.operator, 0)
-            if HAS_RUST:
-                return vectorstag_rust.fe_composite(in1, in2, op, prim.k1, prim.k2, prim.k3, prim.k4)
-            return in1
+            return vectorstag_rust.fe_composite(in1, in2, op, prim.k1, prim.k2, prim.k3, prim.k4)
 
         elif isinstance(prim, FeMerge):
             if not prim.nodes:
@@ -680,20 +689,16 @@ class SVGRenderer:
             # For matrix type with invalid values (empty or wrong count), pass through source
             if prim.type == "matrix" and len(prim.values) != 20:
                 return in1  # Pass through source for invalid matrix
-            if HAS_RUST:
-                return vectorstag_rust.fe_color_matrix(in1, mt, prim.values)
-            return in1
+            return vectorstag_rust.fe_color_matrix(in1, mt, prim.values)
 
         elif isinstance(prim, FeComponentTransfer):
-            if HAS_RUST:
-                def make_func_tuple(f):
-                    type_map = {"identity": 0, "table": 1, "discrete": 2, "linear": 3, "gamma": 4}
-                    return (type_map.get(f.type, 0), f.table_values, f.slope, f.intercept,
-                            f.amplitude, f.exponent, f.offset)
-                return vectorstag_rust.fe_component_transfer(
-                    in1, make_func_tuple(prim.func_r), make_func_tuple(prim.func_g),
-                    make_func_tuple(prim.func_b), make_func_tuple(prim.func_a))
-            return in1
+            def make_func_tuple(f):
+                type_map = {"identity": 0, "table": 1, "discrete": 2, "linear": 3, "gamma": 4}
+                return (type_map.get(f.type, 0), f.table_values, f.slope, f.intercept,
+                        f.amplitude, f.exponent, f.offset)
+            return vectorstag_rust.fe_component_transfer(
+                in1, make_func_tuple(prim.func_r), make_func_tuple(prim.func_g),
+                make_func_tuple(prim.func_b), make_func_tuple(prim.func_a))
 
         elif isinstance(prim, FeMorphology):
             if use_bbox_units:
@@ -708,35 +713,28 @@ class SVGRenderer:
             if prim.operator == "erode" and (rx >= w or ry >= h):
                 return np.zeros_like(in1)
             op = 0 if prim.operator == "erode" else 1
-            if HAS_RUST:
-                return vectorstag_rust.fe_morphology(in1, op, rx, ry)
-            return in1
+            return vectorstag_rust.fe_morphology(in1, op, rx, ry)
 
         elif isinstance(prim, FeConvolveMatrix):
-            if HAS_RUST:
-                divisor = prim.divisor if prim.divisor is not None else sum(prim.kernel_matrix) or 1.0
-                # Default target to center, clamp to valid range [0, order-1]
-                target_x = prim.target_x if prim.target_x is not None else prim.order_x // 2
-                target_y = prim.target_y if prim.target_y is not None else prim.order_y // 2
-                # Clamp to valid range to prevent errors with negative or out-of-range values
-                target_x = max(0, min(target_x, prim.order_x - 1))
-                target_y = max(0, min(target_y, prim.order_y - 1))
-                edge_map = {"duplicate": 0, "wrap": 1, "none": 2}
-                edge_mode = edge_map.get(prim.edge_mode, 0)
-                return vectorstag_rust.fe_convolve_matrix(
-                    in1, prim.order_x, prim.order_y, prim.kernel_matrix, divisor,
-                    prim.bias, target_x, target_y, edge_mode, prim.preserve_alpha)
-            return in1
+            divisor = prim.divisor if prim.divisor is not None else sum(prim.kernel_matrix) or 1.0
+            # Default target to center, clamp to valid range [0, order-1]
+            target_x = prim.target_x if prim.target_x is not None else prim.order_x // 2
+            target_y = prim.target_y if prim.target_y is not None else prim.order_y // 2
+            # Clamp to valid range to prevent errors with negative or out-of-range values
+            target_x = max(0, min(target_x, prim.order_x - 1))
+            target_y = max(0, min(target_y, prim.order_y - 1))
+            edge_map = {"duplicate": 0, "wrap": 1, "none": 2}
+            edge_mode = edge_map.get(prim.edge_mode, 0)
+            return vectorstag_rust.fe_convolve_matrix(
+                in1, prim.order_x, prim.order_y, prim.kernel_matrix, divisor,
+                prim.bias, target_x, target_y, edge_mode, prim.preserve_alpha)
 
         elif isinstance(prim, FeTurbulence):
             noise_type = 0 if prim.type == "turbulence" else 1
             stitch = prim.stitch_tiles == "stitch"
-            if HAS_RUST:
-                return vectorstag_rust.fe_turbulence(
-                    width, height, prim.base_frequency_x, prim.base_frequency_y,
-                    prim.num_octaves, prim.seed, noise_type, stitch)
-            # Fallback - return gray noise
-            return np.random.randint(0, 256, (height, width, 4), dtype=np.uint8)
+            return vectorstag_rust.fe_turbulence(
+                width, height, prim.base_frequency_x, prim.base_frequency_y,
+                prim.num_octaves, prim.seed, noise_type, stitch)
 
         elif isinstance(prim, FeDisplacementMap):
             if in2 is None:
@@ -744,80 +742,70 @@ class SVGRenderer:
             ch_map = {"R": 0, "G": 1, "B": 2, "A": 3}
             x_ch = ch_map.get(prim.x_channel_selector, 3)
             y_ch = ch_map.get(prim.y_channel_selector, 3)
-            if HAS_RUST:
-                return vectorstag_rust.fe_displacement_map(in1, in2, prim.scale * scale, x_ch, y_ch)
-            return in1
+            return vectorstag_rust.fe_displacement_map(in1, in2, prim.scale * scale, x_ch, y_ch)
 
         elif isinstance(prim, FeTile):
-            if HAS_RUST:
-                return vectorstag_rust.fe_tile(in1, width, height)
-            return in1
+            return vectorstag_rust.fe_tile(in1, width, height)
 
         elif isinstance(prim, FeDiffuseLighting):
-            if HAS_RUST:
-                light = prim.light_source
-                if light is None:
-                    # No light source = no lighting effect (transparent output)
-                    return np.zeros_like(in1)
-                if isinstance(light, FeDistantLight):
-                    lt, az, el = 0, light.azimuth, light.elevation
-                    lx, ly, lz, px, py, pz, se, lca = 0, 0, 0, 0, 0, 0, 1, 180
-                elif isinstance(light, FePointLight):
-                    lt, az, el = 1, 0, 0
-                    lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
-                    px, py, pz, se, lca = 0, 0, 0, 1, 180
-                elif isinstance(light, FeSpotLight):
-                    lt, az, el = 2, 0, 0
-                    lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
-                    px, py, pz = light.points_at_x * scale, light.points_at_y * scale, light.points_at_z * scale
-                    se = light.specular_exponent
-                    lca = light.limiting_cone_angle if light.limiting_cone_angle else 180
-                else:
-                    # Unknown light type - no effect
-                    return np.zeros_like(in1)
-                return vectorstag_rust.fe_diffuse_lighting(
-                    in1, prim.surface_scale * scale, prim.diffuse_constant, prim.lighting_color,
-                    lt, az, el, lx, ly, lz, px, py, pz, se, lca)
-            return in1
+            light = prim.light_source
+            if light is None:
+                # No light source = no lighting effect (transparent output)
+                return np.zeros_like(in1)
+            if isinstance(light, FeDistantLight):
+                lt, az, el = 0, light.azimuth, light.elevation
+                lx, ly, lz, px, py, pz, se, lca = 0, 0, 0, 0, 0, 0, 1, 180
+            elif isinstance(light, FePointLight):
+                lt, az, el = 1, 0, 0
+                lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
+                px, py, pz, se, lca = 0, 0, 0, 1, 180
+            elif isinstance(light, FeSpotLight):
+                lt, az, el = 2, 0, 0
+                lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
+                px, py, pz = light.points_at_x * scale, light.points_at_y * scale, light.points_at_z * scale
+                se = light.specular_exponent
+                lca = light.limiting_cone_angle if light.limiting_cone_angle else 180
+            else:
+                # Unknown light type - no effect
+                return np.zeros_like(in1)
+            return vectorstag_rust.fe_diffuse_lighting(
+                in1, prim.surface_scale * scale, prim.diffuse_constant, prim.lighting_color,
+                lt, az, el, lx, ly, lz, px, py, pz, se, lca)
 
         elif isinstance(prim, FeSpecularLighting):
-            if HAS_RUST:
-                # specularExponent must be in [1, 128] range per SVG spec
-                # Values outside this range produce no output (transparent)
-                if prim.specular_exponent < 1.0 or prim.specular_exponent > 128.0:
-                    return np.zeros_like(in1)
-                light = prim.light_source
-                if light is None:
-                    # No light source = no lighting effect (transparent output)
-                    return np.zeros_like(in1)
-                if isinstance(light, FeDistantLight):
-                    lt, az, el = 0, light.azimuth, light.elevation
-                    lx, ly, lz, px, py, pz, se, lca = 0, 0, 0, 0, 0, 0, 1, 180
-                elif isinstance(light, FePointLight):
-                    lt, az, el = 1, 0, 0
-                    lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
-                    px, py, pz, se, lca = 0, 0, 0, 1, 180
-                elif isinstance(light, FeSpotLight):
-                    lt, az, el = 2, 0, 0
-                    lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
-                    px, py, pz = light.points_at_x * scale, light.points_at_y * scale, light.points_at_z * scale
-                    se = light.specular_exponent
-                    lca = light.limiting_cone_angle if light.limiting_cone_angle else 180
-                else:
-                    # Unknown light type - no effect
-                    return np.zeros_like(in1)
-                return vectorstag_rust.fe_specular_lighting(
-                    in1, prim.surface_scale * scale, prim.specular_constant, prim.specular_exponent,
-                    prim.lighting_color, lt, az, el, lx, ly, lz, px, py, pz, se, lca)
-            return in1
+            # specularExponent must be in [1, 128] range per SVG spec
+            # Values outside this range produce no output (transparent)
+            if prim.specular_exponent < 1.0 or prim.specular_exponent > 128.0:
+                return np.zeros_like(in1)
+            light = prim.light_source
+            if light is None:
+                # No light source = no lighting effect (transparent output)
+                return np.zeros_like(in1)
+            if isinstance(light, FeDistantLight):
+                lt, az, el = 0, light.azimuth, light.elevation
+                lx, ly, lz, px, py, pz, se, lca = 0, 0, 0, 0, 0, 0, 1, 180
+            elif isinstance(light, FePointLight):
+                lt, az, el = 1, 0, 0
+                lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
+                px, py, pz, se, lca = 0, 0, 0, 1, 180
+            elif isinstance(light, FeSpotLight):
+                lt, az, el = 2, 0, 0
+                lx, ly, lz = light.x * scale, light.y * scale, light.z * scale
+                px, py, pz = light.points_at_x * scale, light.points_at_y * scale, light.points_at_z * scale
+                se = light.specular_exponent
+                lca = light.limiting_cone_angle if light.limiting_cone_angle else 180
+            else:
+                # Unknown light type - no effect
+                return np.zeros_like(in1)
+            return vectorstag_rust.fe_specular_lighting(
+                in1, prim.surface_scale * scale, prim.specular_constant, prim.specular_exponent,
+                prim.lighting_color, lt, az, el, lx, ly, lz, px, py, pz, se, lca)
 
         elif isinstance(prim, FeDropShadow):
-            if HAS_RUST:
-                return vectorstag_rust.fe_drop_shadow(
-                    in1, prim.dx * scale, prim.dy * scale,
-                    prim.std_deviation_x * scale, prim.std_deviation_y * scale,
-                    *prim.flood_color)
-            return in1
+            return vectorstag_rust.fe_drop_shadow(
+                in1, prim.dx * scale, prim.dy * scale,
+                prim.std_deviation_x * scale, prim.std_deviation_y * scale,
+                *prim.flood_color)
 
         elif isinstance(prim, FeImage):
             # Load image from href (data URL or element reference)
@@ -918,7 +906,7 @@ class SVGRenderer:
         """Execute filter chain with proper feMerge support and subregion handling."""
         # Apply color space conversion if needed (default is linearRGB)
         use_linear = filter_def.color_interpolation_filters == "linearRGB"
-        if use_linear and HAS_RUST:
+        if use_linear:
             source_graphic = vectorstag_rust.srgb_to_linear(source_graphic)
 
         buffers = {
@@ -942,7 +930,7 @@ class SVGRenderer:
                 # Empty feMerge produces transparent output
                 if not prim.nodes:
                     result = np.zeros_like(source_graphic)
-                elif HAS_RUST:
+                else:
                     layers = []
                     for node in prim.nodes:
                         node_in = buffers.get(node.input1, last_result)
@@ -951,8 +939,6 @@ class SVGRenderer:
                         result = vectorstag_rust.fe_merge(layers)
                     else:
                         result = np.zeros_like(source_graphic)
-                else:
-                    result = in1
             else:
                 in2_name = getattr(prim, 'input2', None)
                 in2 = buffers.get(in2_name, source_graphic) if in2_name else None
@@ -965,7 +951,7 @@ class SVGRenderer:
             last_result = result
 
         # Convert back to sRGB if we were working in linear space
-        if use_linear and HAS_RUST:
+        if use_linear:
             last_result = vectorstag_rust.linear_to_srgb(last_result)
 
         return last_result
@@ -1030,44 +1016,42 @@ class SVGRenderer:
         elif isinstance(prim, FeTile):
             # feTile tiles the entire input buffer (including transparent areas)
             # to fill the output region. The tile is the entire input buffer.
-            if HAS_RUST:
-                # Use the entire input as the tile source
-                tile_src = in1
-                th, tw = tile_src.shape[:2]
-                if th > 0 and tw > 0:
-                    # If subregion is specified, tile only to that region
-                    if clip_w < width or clip_h < height or clip_x > 0 or clip_y > 0:
-                        # Tile to fill the clipped region
-                        # Account for the offset from the logical origin
-                        offset_x = clip_x % tw
-                        offset_y = clip_y % th
+            # Use the entire input as the tile source
+            tile_src = in1
+            th, tw = tile_src.shape[:2]
+            if th > 0 and tw > 0:
+                # If subregion is specified, tile only to that region
+                if clip_w < width or clip_h < height or clip_x > 0 or clip_y > 0:
+                    # Tile to fill the clipped region
+                    # Account for the offset from the logical origin
+                    offset_x = clip_x % tw
+                    offset_y = clip_y % th
 
-                        tile_w = clip_w + offset_x
-                        tile_h = clip_h + offset_y
-                        tiled = vectorstag_rust.fe_tile(tile_src, tile_w, tile_h)
+                    tile_w = clip_w + offset_x
+                    tile_h = clip_h + offset_y
+                    tiled = vectorstag_rust.fe_tile(tile_src, tile_w, tile_h)
 
-                        result = np.zeros((height, width, 4), dtype=np.uint8)
-                        result[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w] = tiled[offset_y:offset_y+clip_h, offset_x:offset_x+clip_w]
-                        return result
-                    else:
-                        # Tile to fill the entire filter region
-                        return vectorstag_rust.fe_tile(tile_src, width, height)
+                    result = np.zeros((height, width, 4), dtype=np.uint8)
+                    result[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w] = tiled[offset_y:offset_y+clip_h, offset_x:offset_x+clip_w]
+                    return result
+                else:
+                    # Tile to fill the entire filter region
+                    return vectorstag_rust.fe_tile(tile_src, width, height)
             return in1
 
         elif isinstance(prim, FeTurbulence):
             # Generate noise for the full region, then mask to subregion
             noise_type = 0 if prim.type == "turbulence" else 1
             stitch = prim.stitch_tiles == "stitch"
-            if HAS_RUST:
-                full_noise = vectorstag_rust.fe_turbulence(
-                    width, height, prim.base_frequency_x, prim.base_frequency_y,
-                    prim.num_octaves, prim.seed, noise_type, stitch)
-                # If subregion is specified and not full size, mask it
-                if clip_w < width or clip_h < height or clip_x > 0 or clip_y > 0:
-                    result = np.zeros((height, width, 4), dtype=np.uint8)
-                    result[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w] = full_noise[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w]
-                    return result
-                return full_noise
+            full_noise = vectorstag_rust.fe_turbulence(
+                width, height, prim.base_frequency_x, prim.base_frequency_y,
+                prim.num_octaves, prim.seed, noise_type, stitch)
+            # If subregion is specified and not full size, mask it
+            if clip_w < width or clip_h < height or clip_x > 0 or clip_y > 0:
+                result = np.zeros((height, width, 4), dtype=np.uint8)
+                result[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w] = full_noise[clip_y:clip_y+clip_h, clip_x:clip_x+clip_w]
+                return result
+            return full_noise
             return np.random.randint(0, 256, (height, width, 4), dtype=np.uint8)
 
         # For other primitives, execute normally then apply subregion mask
@@ -1657,8 +1641,7 @@ class SVGRenderer:
                              n_samples: int = 16) -> list[tuple[float, float]]:
         """Sample points along a cubic bezier curve."""
         # Use Rust implementation if available
-        if HAS_RUST:
-            return vectorstag_rust.sample_cubic_bezier(x0, y0, x1, y1, x2, y2, x3, y3, n_samples)
+        return vectorstag_rust.sample_cubic_bezier(x0, y0, x1, y1, x2, y2, x3, y3, n_samples)
         # Fallback to Python implementation
         points = []
         for i in range(1, n_samples + 1):
@@ -1681,8 +1664,7 @@ class SVGRenderer:
                                  n_samples: int = 12) -> list[tuple[float, float]]:
         """Sample points along a quadratic bezier curve."""
         # Use Rust implementation if available
-        if HAS_RUST:
-            return vectorstag_rust.sample_quadratic_bezier(x0, y0, x1, y1, x2, y2, n_samples)
+        return vectorstag_rust.sample_quadratic_bezier(x0, y0, x1, y1, x2, y2, n_samples)
         # Fallback to Python implementation
         points = []
         for i in range(1, n_samples + 1):
@@ -2075,94 +2057,22 @@ class SVGRenderer:
         height = max_y - min_y
 
         # Use Rust implementation if available
-        if HAS_RUST:
-            mask = vectorstag_rust.render_stroke_closed_polygon(
-                points, half_width, miterlimit, width, height, min_x, min_y, linejoin
-            )
-            mask_img = Image.fromarray(mask, "L")
+        mask = vectorstag_rust.render_stroke_closed_polygon(
+            points, half_width, miterlimit, width, height, min_x, min_y, linejoin
+        )
+        mask_img = Image.fromarray(mask, "L")
 
-            # Handle round joins if needed
-            if linejoin == "round":
-                draw = ImageDraw.Draw(mask_img, "L")
-                for i in range(n):
-                    x, y = points[i]
-                    draw.ellipse([x - half_width - min_x, y - half_width - min_y,
-                                  x + half_width - min_x, y + half_width - min_y], fill=255)
-
-            # Apply stroke color with mask
-            fill_img = Image.new("RGBA", (width, height), stroke[:3] + (255,))
-            self._composite_masked_fill(ctx, fill_img, mask_img, min_x, min_y, stroke[3])
-        else:
-            # Python fallback
-            # Compute left and right edge points with miter joins
-            left_points = []
-            right_points = []
-
+        # Handle round joins if needed
+        if linejoin == "round":
+            draw = ImageDraw.Draw(mask_img, "L")
             for i in range(n):
-                p_prev = points[(i - 1) % n]
-                p_curr = points[i]
-                p_next = points[(i + 1) % n]
+                x, y = points[i]
+                draw.ellipse([x - half_width - min_x, y - half_width - min_y,
+                              x + half_width - min_x, y + half_width - min_y], fill=255)
 
-                d1 = self._normalize(self._subtract(p_curr, p_prev))
-                d2 = self._normalize(self._subtract(p_next, p_curr))
-
-                perp1 = (-d1[1], d1[0])
-                perp2 = (-d2[1], d2[0])
-
-                cross = d1[0] * d2[1] - d1[1] * d2[0]
-
-                if abs(cross) > 0.001:
-                    left_p1 = (p_curr[0] + perp1[0] * half_width, p_curr[1] + perp1[1] * half_width)
-                    left_p2 = (p_curr[0] + perp2[0] * half_width, p_curr[1] + perp2[1] * half_width)
-                    right_p1 = (p_curr[0] - perp1[0] * half_width, p_curr[1] - perp1[1] * half_width)
-                    right_p2 = (p_curr[0] - perp2[0] * half_width, p_curr[1] - perp2[1] * half_width)
-
-                    left_pt = self._line_intersection(left_p1, d1, left_p2, d2)
-                    right_pt = self._line_intersection(right_p1, d1, right_p2, d2)
-
-                    if left_pt is None:
-                        left_pt = left_p1
-                    if right_pt is None:
-                        right_pt = right_p1
-
-                    max_miter = miterlimit * half_width
-                    left_dist = math.sqrt((left_pt[0] - p_curr[0])**2 + (left_pt[1] - p_curr[1])**2)
-                    right_dist = math.sqrt((right_pt[0] - p_curr[0])**2 + (right_pt[1] - p_curr[1])**2)
-
-                    if left_dist > max_miter:
-                        avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
-                        left_pt = (p_curr[0] + avg_perp[0] * half_width, p_curr[1] + avg_perp[1] * half_width)
-                    if right_dist > max_miter:
-                        avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
-                        right_pt = (p_curr[0] - avg_perp[0] * half_width, p_curr[1] - avg_perp[1] * half_width)
-                else:
-                    avg_perp = self._normalize((perp1[0] + perp2[0], perp1[1] + perp2[1]))
-                    left_pt = (p_curr[0] + avg_perp[0] * half_width, p_curr[1] + avg_perp[1] * half_width)
-                    right_pt = (p_curr[0] - avg_perp[0] * half_width, p_curr[1] - avg_perp[1] * half_width)
-
-                left_points.append(left_pt)
-                right_points.append(right_pt)
-
-            # Cropped temp image
-            temp = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(temp, "RGBA")
-
-            for i in range(n):
-                j = (i + 1) % n
-                quad = [(left_points[i][0] - min_x, left_points[i][1] - min_y),
-                        (left_points[j][0] - min_x, left_points[j][1] - min_y),
-                        (right_points[j][0] - min_x, right_points[j][1] - min_y),
-                        (right_points[i][0] - min_x, right_points[i][1] - min_y)]
-                draw.polygon(quad, fill=stroke)
-
-            if linejoin == "round":
-                for i in range(n):
-                    x, y = points[i]
-                    draw.ellipse([x - half_width - min_x, y - half_width - min_y,
-                                  x + half_width - min_x, y + half_width - min_y], fill=stroke)
-
-            self._alpha_composite(ctx, temp, min_x, min_y)
-
+        # Apply stroke color with mask
+        fill_img = Image.new("RGBA", (width, height), stroke[:3] + (255,))
+        self._composite_masked_fill(ctx, fill_img, mask_img, min_x, min_y, stroke[3])
     def _stroke_closed_polygon_segmented(self, ctx: "RenderContext", points: List[Tuple[float, float]],
                                           stroke: Tuple[int, int, int, int], half_width: float,
                                           miterlimit: float = 4.0, linejoin: str = "miter"):
@@ -2659,7 +2569,7 @@ class SVGRenderer:
                                 fill_rule: str):
         """Fill a polygon with the specified fill rule."""
         # Fast path: use Rust to render directly to numpy array with AA
-        if HAS_RUST and ctx.image_arr is not None:
+        if ctx.image_arr is not None:
             fill_rule_code = 1 if fill_rule == "evenodd" else 0
             # Use anti-aliased version for better edge quality
             vectorstag_rust.fill_polygon_aa_to_array(
@@ -2697,8 +2607,7 @@ class SVGRenderer:
     def _is_self_intersecting(self, points: list[tuple[float, float]]) -> bool:
         """Check if a polygon has self-intersecting edges (optimized)."""
         # Use Rust implementation if available (140x faster)
-        if HAS_RUST:
-            return vectorstag_rust.is_self_intersecting(points)
+        return vectorstag_rust.is_self_intersecting(points)
 
         n = len(points)
         if n < 4:
@@ -2776,75 +2685,9 @@ class SVGRenderer:
         crop_height = max_y - min_y
 
         # Use Rust implementation if available (much faster)
-        if HAS_RUST:
-            mask_arr = vectorstag_rust.fill_polygon_nonzero(
-                points, crop_width, crop_height, min_x, min_y
-            )
-        else:
-            # Create mask using nonzero winding rule
-            mask_arr = np.zeros((crop_height, crop_width), dtype=np.uint8)
-
-            # Close the polygon
-            pts = np.vstack([pts_arr, pts_arr[0:1]]) if not np.allclose(pts_arr[0], pts_arr[-1]) else pts_arr
-
-            # Build edge arrays for vectorized processing
-            p1 = pts[:-1]
-            p2 = pts[1:]
-
-            # Filter non-horizontal edges
-            non_horiz = p1[:, 1] != p2[:, 1]
-            if not np.any(non_horiz):
-                return
-
-            p1_f = p1[non_horiz]
-            p2_f = p2[non_horiz]
-
-            # Determine direction and sort so p1.y < p2.y
-            swap = p1_f[:, 1] > p2_f[:, 1]
-            p1_f[swap], p2_f[swap] = p2_f[swap].copy(), p1_f[swap].copy()
-            directions = np.where(swap, -1, 1)
-
-            # Extract edge data
-            x1 = p1_f[:, 0]
-            y1 = p1_f[:, 1]
-            x2 = p2_f[:, 0]
-            y2 = p2_f[:, 1]
-            dy = y2 - y1
-            dx = x2 - x1
-
-            # Vectorized scanline fill
-            for y in range(crop_height):
-                screen_y = y + min_y + 0.5
-
-                # Find edges that cross this scanline
-                active = (y1 <= screen_y) & (screen_y < y2)
-                if not np.any(active):
-                    continue
-
-                # Compute x intersections for active edges
-                t = (screen_y - y1[active]) / dy[active]
-                x_intersects = x1[active] + t * dx[active]
-                dirs = directions[active]
-
-                # Sort by x
-                sort_idx = np.argsort(x_intersects)
-                x_sorted = x_intersects[sort_idx]
-                dirs_sorted = dirs[sort_idx]
-
-                # Fill using winding count (nonzero rule)
-                winding = 0
-                prev_x = None
-                for i in range(len(x_sorted)):
-                    x_int = x_sorted[i]
-                    direction = dirs_sorted[i]
-                    if winding != 0 and prev_x is not None:
-                        x_start = max(0, int(prev_x - min_x))
-                        x_end = min(crop_width, int(x_int - min_x))
-                        if x_start < x_end:
-                            mask_arr[y, x_start:x_end] = 255
-                    winding += direction
-                    prev_x = x_int
-
+        mask_arr = vectorstag_rust.fill_polygon_nonzero(
+            points, crop_width, crop_height, min_x, min_y
+        )
         # Apply fill using mask (memory-optimized: no full-size temp)
         mask_img = Image.fromarray(mask_arr, "L")
         fill_img = Image.new("RGBA", (crop_width, crop_height), fill[:3] + (255,))
@@ -2887,50 +2730,7 @@ class SVGRenderer:
         height = max_y - min_y
 
         # Use Rust implementation if available (much faster)
-        if HAS_RUST:
-            mask = vectorstag_rust.fill_multi_polygon_evenodd(polygons, width, height, min_x, min_y)
-        else:
-            # Create mask using scanline algorithm with even-odd rule across ALL polygons
-            mask = np.zeros((height, width), dtype=np.uint8)
-
-            # Build edge list from all polygons
-            all_edges = []
-            for poly in polygons:
-                closed_points = list(poly)
-                if closed_points[0] != closed_points[-1]:
-                    closed_points.append(closed_points[0])
-
-                n = len(closed_points) - 1
-                for i in range(n):
-                    p1 = closed_points[i]
-                    p2 = closed_points[i + 1]
-                    all_edges.append((p1, p2))
-
-            # For each scanline
-            for y in range(height):
-                screen_y = y + min_y + 0.5  # Center of pixel
-
-                # Find intersections with all edges from all polygons
-                intersections = []
-
-                for p1, p2 in all_edges:
-                    # Check if edge crosses this scanline
-                    if (p1[1] <= screen_y < p2[1]) or (p2[1] <= screen_y < p1[1]):
-                        # Compute x intersection
-                        if abs(p2[1] - p1[1]) > 1e-10:
-                            t = (screen_y - p1[1]) / (p2[1] - p1[1])
-                            x_intersect = p1[0] + t * (p2[0] - p1[0])
-                            intersections.append(x_intersect)
-
-                # Sort intersections
-                intersections.sort()
-
-                # Fill between pairs (even-odd rule)
-                for i in range(0, len(intersections) - 1, 2):
-                    x_start = max(0, int(intersections[i] - min_x))
-                    x_end = min(width, int(intersections[i + 1] - min_x) + 1)
-                    mask[y, x_start:x_end] = 255
-
+        mask = vectorstag_rust.fill_multi_polygon_evenodd(polygons, width, height, min_x, min_y)
         # Apply fill using mask (memory-optimized: no full-size temp)
         mask_img = Image.fromarray(mask, "L")
 
@@ -2997,59 +2797,7 @@ class SVGRenderer:
         height = max_y - min_y
 
         # Use Rust implementation if available (much faster)
-        if HAS_RUST:
-            mask = vectorstag_rust.fill_multi_polygon_nonzero(polygons, width, height, min_x, min_y)
-        else:
-            # Create mask using scanline algorithm with nonzero winding rule
-            mask = np.zeros((height, width), dtype=np.uint8)
-
-            # Build edge list with direction from all polygons
-            all_edges = []
-            for poly in polygons:
-                closed_points = list(poly)
-                if closed_points[0] != closed_points[-1]:
-                    closed_points.append(closed_points[0])
-
-                n = len(closed_points) - 1
-                for i in range(n):
-                    p1 = closed_points[i]
-                    p2 = closed_points[i + 1]
-                    if p1[1] != p2[1]:  # Skip horizontal edges
-                        # Determine direction: +1 if going up, -1 if going down
-                        if p1[1] > p2[1]:
-                            p1, p2 = p2, p1
-                            direction = -1
-                        else:
-                            direction = 1
-                        all_edges.append((p1[0], p1[1], p2[0], p2[1], direction))
-
-            # For each scanline
-            for y in range(height):
-                screen_y = y + min_y + 0.5  # Center of pixel
-
-                # Find intersections with direction
-                intersections = []
-                for x1, y1, x2, y2, direction in all_edges:
-                    if y1 <= screen_y < y2:
-                        t = (screen_y - y1) / (y2 - y1)
-                        x_intersect = x1 + t * (x2 - x1)
-                        intersections.append((x_intersect, direction))
-
-                # Sort by x
-                intersections.sort(key=lambda p: p[0])
-
-                # Fill using winding count (nonzero rule)
-                winding = 0
-                prev_x = None
-                for x_int, direction in intersections:
-                    if winding != 0 and prev_x is not None:
-                        x_start = max(0, int(prev_x - min_x))
-                        x_end = min(width, int(x_int - min_x))
-                        if x_start < x_end:
-                            mask[y, x_start:x_end] = 255
-                    winding += direction
-                    prev_x = x_int
-
+        mask = vectorstag_rust.fill_multi_polygon_nonzero(polygons, width, height, min_x, min_y)
         # Apply fill using mask (memory-optimized: no full-size temp)
         mask_img = Image.fromarray(mask, "L")
 
@@ -3076,7 +2824,7 @@ class SVGRenderer:
                 self._composite_gradient_masked(ctx, grad_img, mask_img, min_x, min_y)
         elif fill:
             # Solid fill - use Rust direct rendering if available
-            if HAS_RUST and ctx.image_arr is not None:
+            if ctx.image_arr is not None:
                 vectorstag_rust.fill_multi_polygon_aa_to_array(
                     ctx.image_arr, polygons,
                     fill[0], fill[1], fill[2], fill[3],
@@ -3130,47 +2878,7 @@ class SVGRenderer:
         height = max_y - min_y
 
         # Use Rust implementation if available (much faster)
-        if HAS_RUST:
-            mask = vectorstag_rust.fill_polygon_evenodd(points, width, height, min_x, min_y)
-        else:
-            # Create mask using scanline algorithm with even-odd rule
-            mask = np.zeros((height, width), dtype=np.uint8)
-
-            # Close the polygon
-            closed_points = list(points)
-            if closed_points[0] != closed_points[-1]:
-                closed_points.append(closed_points[0])
-
-            n = len(closed_points) - 1
-
-            # For each scanline
-            for y in range(height):
-                screen_y = y + min_y + 0.5  # Center of pixel
-
-                # Find intersections with all edges
-                intersections = []
-
-                for i in range(n):
-                    p1 = closed_points[i]
-                    p2 = closed_points[i + 1]
-
-                    # Check if edge crosses this scanline
-                    if (p1[1] <= screen_y < p2[1]) or (p2[1] <= screen_y < p1[1]):
-                        # Compute x intersection
-                        if abs(p2[1] - p1[1]) > 1e-10:
-                            t = (screen_y - p1[1]) / (p2[1] - p1[1])
-                            x_intersect = p1[0] + t * (p2[0] - p1[0])
-                            intersections.append(x_intersect)
-
-                # Sort intersections
-                intersections.sort()
-
-                # Fill between pairs (even-odd rule)
-                for i in range(0, len(intersections) - 1, 2):
-                    x_start = max(0, int(intersections[i] - min_x))
-                    x_end = min(width, int(intersections[i + 1] - min_x) + 1)
-                    mask[y, x_start:x_end] = 255
-
+        mask = vectorstag_rust.fill_polygon_evenodd(points, width, height, min_x, min_y)
         # Apply fill using mask (memory-optimized: no full-size temp)
         mask_img = Image.fromarray(mask, "L")
         fill_img = Image.new("RGBA", (width, height), fill[:3] + (255,))
@@ -3220,22 +2928,11 @@ class SVGRenderer:
                 element_transform
             )
 
-        # Create mask from polygon with fill-rule support using Rust if available
-        # Keep mask as numpy array for optimal performance
-        if HAS_RUST:
-            if fill_rule == "evenodd":
-                mask_arr = vectorstag_rust.fill_polygon_evenodd(points, grad_width, grad_height, min_x, min_y)
-            else:
-                mask_arr = vectorstag_rust.fill_polygon_nonzero(points, grad_width, grad_height, min_x, min_y)
-        elif fill_rule == "evenodd":
-            mask_img = self._create_evenodd_mask(points, min_x, min_y, grad_width, grad_height)
-            mask_arr = np.array(mask_img)
+        # Create mask from polygon with fill-rule support
+        if fill_rule == "evenodd":
+            mask_arr = vectorstag_rust.fill_polygon_evenodd(points, grad_width, grad_height, min_x, min_y)
         else:
-            mask_crop = Image.new("L", (grad_width, grad_height), 0)
-            mask_draw = ImageDraw.Draw(mask_crop)
-            local_points = [(x - min_x, y - min_y) for x, y in points]
-            mask_draw.polygon(local_points, fill=255)
-            mask_arr = np.array(mask_crop)
+            mask_arr = vectorstag_rust.fill_polygon_nonzero(points, grad_width, grad_height, min_x, min_y)
 
         # Apply gradient with mask (memory-optimized: no full-size temp)
         self._composite_gradient_masked(ctx, grad_img, mask_arr, min_x, min_y)
@@ -3408,18 +3105,10 @@ class SVGRenderer:
             pattern_img = Image.fromarray(pattern_arr, "RGBA")
 
         # Create mask from polygon
-        if HAS_RUST:
-            if fill_rule == "evenodd":
-                mask_arr = vectorstag_rust.fill_polygon_evenodd(points, fill_width, fill_height, min_x, min_y)
-            else:
-                mask_arr = vectorstag_rust.fill_polygon_nonzero(points, fill_width, fill_height, min_x, min_y)
+        if fill_rule == "evenodd":
+            mask_arr = vectorstag_rust.fill_polygon_evenodd(points, fill_width, fill_height, min_x, min_y)
         else:
-            mask_img = Image.new("L", (fill_width, fill_height), 0)
-            mask_draw = ImageDraw.Draw(mask_img)
-            local_points = [(x - min_x, y - min_y) for x, y in points]
-            mask_draw.polygon(local_points, fill=255)
-            mask_arr = np.array(mask_img)
-
+            mask_arr = vectorstag_rust.fill_polygon_nonzero(points, fill_width, fill_height, min_x, min_y)
         # Apply pattern with mask
         self._composite_gradient_masked(ctx, pattern_img, mask_arr, min_x, min_y)
 
@@ -3560,16 +3249,15 @@ class SVGRenderer:
             spread_code = 2
 
         # Use Rust implementation if available (much faster)
-        if HAS_RUST:
-            offsets = [float(s.offset) for s in stops]
-            colors = [tuple(s.color) for s in stops]
-            pixels = vectorstag_rust.create_linear_gradient_image(
-                width, height, offset_x, offset_y,
-                float(x1), float(y1), float(dx), float(dy), float(length),
-                offsets, colors, opacity, spread_code
-            )
-            # Return numpy array directly - avoid PIL conversion
-            return pixels
+        offsets = [float(s.offset) for s in stops]
+        colors = [tuple(s.color) for s in stops]
+        pixels = vectorstag_rust.create_linear_gradient_image(
+            width, height, offset_x, offset_y,
+            float(x1), float(y1), float(dx), float(dy), float(length),
+            offsets, colors, opacity, spread_code
+        )
+        # Return numpy array directly - avoid PIL conversion
+        return pixels
 
         # Python fallback
         t = np.empty((height, width), dtype=np.float32)
@@ -3668,17 +3356,16 @@ class SVGRenderer:
             spread_code = 2
 
         # Use Rust implementation if available (much faster)
-        if HAS_RUST:
-            offsets = [float(s.offset) for s in stops]
-            colors = [tuple(s.color) for s in stops]
-            pixels = vectorstag_rust.create_radial_gradient_image(
-                width, height, offset_x, offset_y,
-                float(cx), float(cy), float(r),
-                inv_a, inv_b, inv_c, inv_d, inv_e, inv_f,
-                offsets, colors, opacity, spread_code
-            )
-            # Return numpy array directly - avoid PIL conversion
-            return pixels
+        offsets = [float(s.offset) for s in stops]
+        colors = [tuple(s.color) for s in stops]
+        pixels = vectorstag_rust.create_radial_gradient_image(
+            width, height, offset_x, offset_y,
+            float(cx), float(cy), float(r),
+            inv_a, inv_b, inv_c, inv_d, inv_e, inv_f,
+            offsets, colors, opacity, spread_code
+        )
+        # Return numpy array directly - avoid PIL conversion
+        return pixels
 
         # Python fallback
         t = np.empty((height, width), dtype=np.float32)
@@ -3718,45 +3405,10 @@ class SVGRenderer:
             return np.zeros((height, width, 4), dtype=np.uint8)
 
         # Use Rust implementation if available (much faster)
-        if HAS_RUST:
-            offsets = [float(s.offset) for s in stops]
-            colors = [tuple(s.color) for s in stops]
-            t_float32 = t.astype(np.float32) if t.dtype != np.float32 else t
-            return vectorstag_rust.interpolate_gradient_colors(t_float32, offsets, colors, opacity)
-        else:
-            pixels = np.empty((height, width, 4), dtype=np.uint8)
-
-            # Build arrays of stop offsets and colors
-            offsets = np.array([s.offset for s in stops], dtype=np.float32)
-            colors = np.array([s.color for s in stops], dtype=np.float32)
-
-            # Use searchsorted to find which stop segment each pixel belongs to
-            indices = np.searchsorted(offsets, t, side='right') - 1
-            np.clip(indices, 0, len(stops) - 2, out=indices)
-
-            # Pre-compute ratios for all pixels
-            lower_offsets = offsets[indices]
-            upper_offsets = offsets[indices + 1]
-            denom = upper_offsets - lower_offsets
-
-            # Avoid division by zero
-            safe_denom = np.where(denom > 1e-10, denom, 1.0)
-            ratio = np.clip((t - lower_offsets) / safe_denom, 0, 1)
-            ratio = np.where(denom > 1e-10, ratio, 0.0).astype(np.float32)
-
-            # Interpolate each color channel
-            for c in range(4):
-                lower_colors = colors[indices, c]
-                upper_colors = colors[indices + 1, c]
-                interp = lower_colors + ratio * (upper_colors - lower_colors)
-                if c == 3:  # Alpha channel
-                    pixels[:, :, c] = (interp * opacity).astype(np.uint8)
-                else:
-                    pixels[:, :, c] = interp.astype(np.uint8)
-
-            del indices, lower_offsets, upper_offsets, denom, safe_denom, ratio
-            return pixels
-
+        offsets = [float(s.offset) for s in stops]
+        colors = [tuple(s.color) for s in stops]
+        t_float32 = t.astype(np.float32) if t.dtype != np.float32 else t
+        return vectorstag_rust.interpolate_gradient_colors(t_float32, offsets, colors, opacity)
     def _interpolate_gradient_color(self, stops: list[GradientStop],
                                     t: float) -> tuple[int, int, int, int]:
         """Interpolate color at position t along gradient."""
@@ -3793,42 +3445,10 @@ class SVGRenderer:
         if ctx.image is not None:
             # Use PIL's native compositing
             ctx.image.alpha_composite(src_img, (dest_x, dest_y))
-        elif HAS_RUST:
+        elif ctx.image_arr is not None:
             # Use Rust for fast compositing onto numpy array
             src_arr = np.ascontiguousarray(np.array(src_img))
             vectorstag_rust.alpha_composite_inplace(ctx.image_arr, src_arr, dest_x, dest_y)
-        else:
-            # Fallback: numpy alpha compositing
-            src_arr = np.array(src_img)
-            src_h, src_w = src_arr.shape[:2]
-            dst_h, dst_w = ctx.image_arr.shape[:2]
-
-            # Clip to destination bounds
-            x1, y1 = max(0, dest_x), max(0, dest_y)
-            x2, y2 = min(dst_w, dest_x + src_w), min(dst_h, dest_y + src_h)
-            if x2 <= x1 or y2 <= y1:
-                return
-
-            # Corresponding source region
-            sx1, sy1 = x1 - dest_x, y1 - dest_y
-            sx2, sy2 = sx1 + (x2 - x1), sy1 + (y2 - y1)
-
-            # Alpha composite formula: out = src + dst * (1 - src_alpha)
-            dst_region = ctx.image_arr[y1:y2, x1:x2]
-            src_region = src_arr[sy1:sy2, sx1:sx2]
-
-            src_alpha = src_region[:, :, 3:4].astype(np.float32) / 255.0
-            dst_alpha = dst_region[:, :, 3:4].astype(np.float32) / 255.0
-
-            # Porter-Duff 'over' compositing
-            out_alpha = src_alpha + dst_alpha * (1.0 - src_alpha)
-            out_alpha_safe = np.where(out_alpha == 0, 1.0, out_alpha)  # Avoid div by zero
-
-            out_rgb = (src_region[:, :, :3].astype(np.float32) * src_alpha +
-                      dst_region[:, :, :3].astype(np.float32) * dst_alpha * (1.0 - src_alpha)) / out_alpha_safe
-
-            ctx.image_arr[y1:y2, x1:x2, :3] = np.clip(out_rgb, 0, 255).astype(np.uint8)
-            ctx.image_arr[y1:y2, x1:x2, 3:4] = np.clip(out_alpha * 255, 0, 255).astype(np.uint8)
 
     def _composite_masked_fill(self, ctx: "RenderContext", fill_img: Image.Image,
                                mask_img: Image.Image, dest_x: int, dest_y: int,
@@ -3869,7 +3489,7 @@ class SVGRenderer:
         grad_arr[:, :, 3] = (grad_arr[:, :, 3].astype(np.uint16) * mask_arr // 255).astype(np.uint8)
 
         # Composite directly at destination - avoid PIL conversion when possible
-        if ctx.image is None and HAS_RUST:
+        if ctx.image is None:
             # Direct Rust compositing onto numpy array
             grad_arr = np.ascontiguousarray(grad_arr)
             vectorstag_rust.alpha_composite_inplace(ctx.image_arr, grad_arr, dest_x, dest_y)
@@ -4265,8 +3885,16 @@ class SVGRenderer:
             return
 
         try:
+            # Handle in-memory images from registry
+            if href.startswith("memory:"):
+                name = href[7:]  # Remove "memory:" prefix
+                if name in self._image_registry:
+                    img = self._image_registry[name].copy()
+                else:
+                    return  # Image not found in registry
+
             # Handle data URLs (embedded images)
-            if href.startswith("data:"):
+            elif href.startswith("data:"):
                 # Parse data URL: data:[<mediatype>][;base64],<data>
                 # Remove newlines and whitespace that may be in the data URL
                 href = href.replace("\n", "").replace("\r", "").replace(" ", "")

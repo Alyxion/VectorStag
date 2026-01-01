@@ -759,7 +759,7 @@ class TestRenderStrokeClosedPolygon:
         width, height = 100, 100
 
         rust_result = vectorstag_rust.render_stroke_closed_polygon(
-            points, half_width, miterlimit, width, height, 0, 0
+            points, half_width, miterlimit, width, height, 0, 0, "miter"
         )
 
         assert rust_result.shape == (height, width)
@@ -778,7 +778,7 @@ class TestRenderStrokeClosedPolygon:
         width, height = 100, 100
 
         rust_result = vectorstag_rust.render_stroke_closed_polygon(
-            points, half_width, miterlimit, width, height, 0, 0
+            points, half_width, miterlimit, width, height, 0, 0, "miter"
         )
 
         assert rust_result.shape == (height, width)

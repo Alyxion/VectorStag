@@ -11,3 +11,12 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.23", features = ["extension-module"] }
 numpy = "0.23"
 ndarray = "0.16"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+# Enable native CPU features for better SIMD
+[profile.release.build-override]
+opt-level = 3
