@@ -300,9 +300,16 @@ class SVGRenderer:
         elem_bbox = self._get_element_bbox(element, ctx.base_transform)
         mask = self._create_clip_mask(ctx, clip_path, element.transform, elem_bbox)
 
-        # Apply the mask and composite onto main image
-        temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], mask))
-        self._alpha_composite(ctx, temp_image, 0, 0)
+        # Apply the mask and composite onto main image using Rust (fast path)
+        if ctx.image_arr is not None:
+            # Use Rust function for combined mask + composite
+            temp_arr = np.ascontiguousarray(np.array(temp_image))
+            mask_arr = np.ascontiguousarray(np.array(mask))
+            vectorstag_rust.apply_mask_and_composite(ctx.image_arr, temp_arr, mask_arr, 0, 0)
+        else:
+            # Fallback to PIL (slower)
+            temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], mask))
+            self._alpha_composite(ctx, temp_image, 0, 0)
 
     def _render_element_with_mask(self, ctx: "RenderContext", element: SVGElement, depth: int = 0):
         """Render an element with an SVG mask applied."""

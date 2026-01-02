@@ -270,11 +270,118 @@ pub fn linear_to_srgb<'py>(
     dst.into_pyarray(py)
 }
 
+/// Apply a grayscale clip mask to an RGBA image's alpha channel (in-place)
+/// This replaces: temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], mask))
+#[pyfunction]
+pub fn apply_clip_mask<'py>(
+    _py: Python<'py>,
+    mut img: numpy::PyReadwriteArray3<'py, u8>,
+    mask: numpy::PyReadonlyArray2<'py, u8>,
+) {
+    let mask_arr = mask.as_array();
+    let mut img_arr = img.as_array_mut();
+
+    let (img_h, img_w, _) = (img_arr.shape()[0], img_arr.shape()[1], img_arr.shape()[2]);
+    let (mask_h, mask_w) = (mask_arr.shape()[0], mask_arr.shape()[1]);
+
+    // Dimensions must match
+    if img_h != mask_h || img_w != mask_w {
+        return;
+    }
+
+    for y in 0..img_h {
+        for x in 0..img_w {
+            let img_alpha = img_arr[[y, x, 3]] as u32;
+            let mask_val = mask_arr[[y, x]] as u32;
+            // Multiply alpha by mask value (both 0-255, result 0-255)
+            img_arr[[y, x, 3]] = ((img_alpha * mask_val) / 255) as u8;
+        }
+    }
+}
+
+/// Apply a grayscale mask and alpha composite onto destination in one pass
+/// Combines apply_clip_mask + alpha_composite_inplace for clip path rendering
+#[pyfunction]
+pub fn apply_mask_and_composite<'py>(
+    _py: Python<'py>,
+    mut dst: numpy::PyReadwriteArray3<'py, u8>,
+    src: numpy::PyReadonlyArray3<'py, u8>,
+    mask: numpy::PyReadonlyArray2<'py, u8>,
+    offset_x: i32,
+    offset_y: i32,
+) {
+    let src_arr = src.as_array();
+    let mask_arr = mask.as_array();
+    let mut dst_arr = dst.as_array_mut();
+
+    let (dst_h, dst_w, _) = (dst_arr.shape()[0], dst_arr.shape()[1], dst_arr.shape()[2]);
+    let (src_h, src_w, _) = (src_arr.shape()[0], src_arr.shape()[1], src_arr.shape()[2]);
+    let (mask_h, mask_w) = (mask_arr.shape()[0], mask_arr.shape()[1]);
+
+    // Dimensions must match between src and mask
+    if src_h != mask_h || src_w != mask_w {
+        return;
+    }
+
+    let start_x = offset_x.max(0) as usize;
+    let start_y = offset_y.max(0) as usize;
+    let end_x = ((offset_x + src_w as i32) as usize).min(dst_w);
+    let end_y = ((offset_y + src_h as i32) as usize).min(dst_h);
+
+    let src_start_x = (-offset_x).max(0) as usize;
+    let src_start_y = (-offset_y).max(0) as usize;
+
+    for dy in start_y..end_y {
+        let sy = src_start_y + (dy - start_y);
+        if sy >= src_h { break; }
+
+        for dx in start_x..end_x {
+            let sx = src_start_x + (dx - start_x);
+            if sx >= src_w { break; }
+
+            // Apply mask to source alpha
+            let src_a_orig = src_arr[[sy, sx, 3]] as u32;
+            let mask_val = mask_arr[[sy, sx]] as u32;
+            let src_a = (src_a_orig * mask_val / 255) as u32;
+
+            if src_a == 0 { continue; }
+
+            if src_a == 255 {
+                dst_arr[[dy, dx, 0]] = src_arr[[sy, sx, 0]];
+                dst_arr[[dy, dx, 1]] = src_arr[[sy, sx, 1]];
+                dst_arr[[dy, dx, 2]] = src_arr[[sy, sx, 2]];
+                dst_arr[[dy, dx, 3]] = 255;
+            } else {
+                let dst_a = dst_arr[[dy, dx, 3]] as u32;
+                let inv_src_a = 255 - src_a;
+                let out_a = src_a + (dst_a * inv_src_a / 255);
+
+                if out_a == 0 {
+                    dst_arr[[dy, dx, 0]] = 0;
+                    dst_arr[[dy, dx, 1]] = 0;
+                    dst_arr[[dy, dx, 2]] = 0;
+                    dst_arr[[dy, dx, 3]] = 0;
+                } else {
+                    for c in 0..3 {
+                        let src_c = src_arr[[sy, sx, c]] as u32;
+                        let dst_c = dst_arr[[dy, dx, c]] as u32;
+                        let out_c = (src_c * src_a + dst_c * dst_a * inv_src_a / 255) / out_a;
+                        dst_arr[[dy, dx, c]] = out_c.min(255) as u8;
+                    }
+                    dst_arr[[dy, dx, 3]] = out_a.min(255) as u8;
+                }
+            }
+        }
+    }
+}
+
 /// Register image module functions
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(alpha_composite_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(resize_rgba, m)?)?;
     m.add_function(wrap_pyfunction!(srgb_to_linear, m)?)?;
     m.add_function(wrap_pyfunction!(linear_to_srgb, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_clip_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_mask_and_composite, m)?)?;
     Ok(())
 }

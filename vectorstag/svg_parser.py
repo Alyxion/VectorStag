@@ -49,6 +49,103 @@ def _safe_float(val: str, default: float = 0.0) -> float:
 # are now imported from submodules above.
 
 
+# Pre-parsed CSS selector for fast matching (avoids regex at match time)
+@dataclass(frozen=True, slots=True)
+class ParsedSelector:
+    """A pre-parsed CSS simple selector for fast matching."""
+    tag: Optional[str] = None  # Required tag name, or None for any
+    id: Optional[str] = None   # Required ID, or None
+    classes: tuple = ()        # Required classes (tuple for hashability)
+    attrs: tuple = ()          # Required attrs as ((name, value_or_None), ...)
+
+
+def _parse_simple_selector(selector: str) -> ParsedSelector:
+    """Parse a simple CSS selector (no combinators) into a ParsedSelector.
+
+    This is called ONCE per selector when CSS is loaded, not during matching.
+    """
+    if selector == '*':
+        return ParsedSelector()
+
+    remaining = selector
+
+    # Extract ID - find # not inside []
+    required_id = None
+    id_start = -1
+    bracket_depth = 0
+    for i, c in enumerate(remaining):
+        if c == '[':
+            bracket_depth += 1
+        elif c == ']':
+            bracket_depth -= 1
+        elif c == '#' and bracket_depth == 0:
+            id_start = i
+            break
+
+    if id_start >= 0:
+        # Find end of ID (next . [ or end)
+        id_end = len(remaining)
+        for i in range(id_start + 1, len(remaining)):
+            if remaining[i] in '.#[:':
+                id_end = i
+                break
+        required_id = remaining[id_start + 1:id_end]
+        remaining = remaining[:id_start] + remaining[id_end:]
+
+    # Extract classes - find . not inside []
+    required_classes = []
+    while True:
+        class_start = -1
+        bracket_depth = 0
+        for i, c in enumerate(remaining):
+            if c == '[':
+                bracket_depth += 1
+            elif c == ']':
+                bracket_depth -= 1
+            elif c == '.' and bracket_depth == 0:
+                class_start = i
+                break
+
+        if class_start < 0:
+            break
+
+        # Find end of class name
+        class_end = len(remaining)
+        for i in range(class_start + 1, len(remaining)):
+            if remaining[i] in '.#[:':
+                class_end = i
+                break
+        required_classes.append(remaining[class_start + 1:class_end])
+        remaining = remaining[:class_start] + remaining[class_end:]
+
+    # Extract attribute selectors [...]
+    required_attrs = []
+    while '[' in remaining:
+        start = remaining.index('[')
+        end = remaining.index(']', start)
+        attr_content = remaining[start + 1:end]
+
+        if '=' in attr_content:
+            eq_pos = attr_content.index('=')
+            attr_name = attr_content[:eq_pos].rstrip('~|^$*')
+            attr_val = attr_content[eq_pos + 1:].strip('"\'')
+            required_attrs.append((attr_name, attr_val))
+        else:
+            required_attrs.append((attr_content, None))
+
+        remaining = remaining[:start] + remaining[end + 1:]
+
+    # Remaining should be tag name
+    required_tag = remaining.strip() if remaining.strip() and remaining.strip() != '*' else None
+
+    return ParsedSelector(
+        tag=required_tag,
+        id=required_id,
+        classes=tuple(required_classes),
+        attrs=tuple(required_attrs)
+    )
+
+
 # Old dataclass definitions removed - now imported from parser submodules.
 # The following code continues with the SVGParser class.
 
@@ -220,6 +317,8 @@ class SVGParser:
         self.css_classes: dict[str, dict[str, str]] = {}
         # Track <use> references being parsed to detect circular references
         self._use_stack: set[str] = set()
+        # Cache for stripped namespace tags (performance optimization)
+        self._tag_cache: dict[str, str] = {}
 
     def parse(self, svg_content: str) -> SVGDocument:
         """Parse SVG content string into SVGDocument."""
@@ -353,10 +452,19 @@ class SVGParser:
             return self.parse(f.read())
 
     def _strip_ns(self, tag: str) -> str:
-        """Remove namespace from tag."""
+        """Remove namespace from tag (with caching for performance)."""
+        # Use cache to avoid repeated string operations
+        cached = self._tag_cache.get(tag)
+        if cached is not None:
+            return cached
+
         if tag.startswith("{"):
-            return tag.split("}", 1)[1]
-        return tag
+            result = tag.split("}", 1)[1]
+        else:
+            result = tag
+
+        self._tag_cache[tag] = result
+        return result
 
     def _parse_css_styles(self, root: ET.Element):
         """Parse CSS from <style> blocks."""
@@ -397,8 +505,11 @@ class SVGParser:
             # Calculate specificity: (ids, classes+attrs, elements)
             specificity = self._calculate_specificity(selector)
 
-            # Store rule with specificity and order
-            self.css_rules.append((selector, properties, specificity, self.css_rule_order))
+            # Pre-parse selector into parts for fast matching (no regex at match time)
+            selector_parts = tuple(_parse_simple_selector(part) for part in selector.split())
+
+            # Store rule with pre-parsed selector, specificity and order
+            self.css_rules.append((selector_parts, properties, specificity, self.css_rule_order))
             self.css_rule_order += 1
 
             # Also store simple selectors for fast lookup
@@ -440,28 +551,42 @@ class SVGParser:
 
         return (ids, classes_attrs, elements)
 
-    def _selector_matches(self, selector: str, elem: ET.Element, ancestors: list) -> bool:
-        """Check if a CSS selector matches an element."""
-        # Split selector into parts (descendant combinator)
-        parts = selector.split()
-        if not parts:
+    def _selector_matches(self, selector_parts: tuple, elem: ET.Element, ancestors: list) -> bool:
+        """Check if pre-parsed CSS selector parts match an element.
+
+        Args:
+            selector_parts: Tuple of ParsedSelector objects (already pre-parsed)
+            elem: Element to match
+            ancestors: List of ancestor elements (closest first)
+        """
+        if not selector_parts:
             return False
+
+        # Get element info once (avoid repeated attribute lookups)
+        tag = self._strip_ns(elem.tag)
+        elem_id = elem.get('id', '')
+        elem_classes = elem.get('class', '').split() if elem.get('class') else []
 
         # The last part must match the current element
-        if not self._simple_selector_matches(parts[-1], elem):
+        if not self._simple_selector_matches_parsed(selector_parts[-1], tag, elem_id, elem_classes, elem):
             return False
 
-        if len(parts) == 1:
+        if len(selector_parts) == 1:
             return True
 
         # Check ancestor chain for remaining parts (right to left)
-        remaining_parts = parts[:-1]
+        remaining_parts = selector_parts[:-1]
         ancestor_idx = 0
 
-        for part in reversed(remaining_parts):
+        for parsed_sel in reversed(remaining_parts):
             matched = False
             while ancestor_idx < len(ancestors):
-                if self._simple_selector_matches(part, ancestors[ancestor_idx]):
+                anc = ancestors[ancestor_idx]
+                anc_tag = self._strip_ns(anc.tag)
+                anc_id = anc.get('id', '')
+                anc_classes = anc.get('class', '').split() if anc.get('class') else []
+
+                if self._simple_selector_matches_parsed(parsed_sel, anc_tag, anc_id, anc_classes, anc):
                     matched = True
                     ancestor_idx += 1
                     break
@@ -472,60 +597,46 @@ class SVGParser:
 
         return True
 
-    def _simple_selector_matches(self, selector: str, elem: ET.Element) -> bool:
-        """Check if a simple selector (no combinators) matches an element."""
-        if selector == '*':
-            return True
+    def _simple_selector_matches_parsed(self, parsed: ParsedSelector, tag: str, elem_id: str, elem_classes: list, elem: ET.Element) -> bool:
+        """Check if a pre-parsed selector matches element data.
 
-        tag = self._strip_ns(elem.tag)
-        elem_id = elem.get('id', '')
-        elem_classes = elem.get('class', '').split()
-
-        # Parse selector parts
-        # e.g., "g#id.class" -> tag=g, id=id, class=class
-        remaining = selector
-
-        # Extract ID
-        id_match = re.search(r'#([a-zA-Z0-9_-]+)', remaining)
-        required_id = id_match.group(1) if id_match else None
-        remaining = re.sub(r'#[a-zA-Z0-9_-]+', '', remaining)
-
-        # Extract classes
-        required_classes = re.findall(r'\.([a-zA-Z0-9_-]+)', remaining)
-        remaining = re.sub(r'\.[a-zA-Z0-9_-]+', '', remaining)
-
-        # Extract attribute selectors
-        required_attrs = re.findall(r'\[([^\]]+)\]', remaining)
-        remaining = re.sub(r'\[[^\]]+\]', '', remaining)
-
-        # Remaining should be the tag name
-        required_tag = remaining.strip() if remaining.strip() else None
-
-        # Check tag
-        if required_tag and required_tag != '*' and required_tag != tag:
+        This is the fast path - no regex, no string parsing.
+        """
+        # Check tag first (most common filter)
+        if parsed.tag is not None and parsed.tag != tag:
             return False
 
         # Check ID
-        if required_id and required_id != elem_id:
+        if parsed.id is not None and parsed.id != elem_id:
             return False
 
         # Check classes
-        for req_class in required_classes:
+        for req_class in parsed.classes:
             if req_class not in elem_classes:
                 return False
 
-        # Check attributes
-        for attr_sel in required_attrs:
-            if '=' in attr_sel:
-                attr_name, attr_val = attr_sel.split('=', 1)
-                attr_val = attr_val.strip('"\'')
+        # Check attributes (least common, check last)
+        for attr_name, attr_val in parsed.attrs:
+            if attr_val is not None:
                 if elem.get(attr_name) != attr_val:
                     return False
             else:
-                if elem.get(attr_sel) is None:
+                if elem.get(attr_name) is None:
                     return False
 
         return True
+
+    # Keep old method for backward compatibility (if any code still uses string selectors)
+    def _simple_selector_matches(self, selector: str, elem: ET.Element) -> bool:
+        """Check if a simple selector (no combinators) matches an element.
+
+        DEPRECATED: Use pre-parsed selectors for performance.
+        """
+        parsed = _parse_simple_selector(selector)
+        tag = self._strip_ns(elem.tag)
+        elem_id = elem.get('id', '')
+        elem_classes = elem.get('class', '').split() if elem.get('class') else []
+        return self._simple_selector_matches_parsed(parsed, tag, elem_id, elem_classes, elem)
 
     def _get_css_transform(self, elem: ET.Element) -> Optional[str]:
         """Get CSS transform property for an element.
@@ -1557,8 +1668,8 @@ class SVGParser:
 
         # Apply complex CSS rules sorted by specificity (lowest first, so higher overrides)
         matching_rules = []
-        for selector, properties, specificity, order in self.css_rules:
-            if self._selector_matches(selector, elem, ancestors):
+        for selector_parts, properties, specificity, order in self.css_rules:
+            if self._selector_matches(selector_parts, elem, ancestors):
                 matching_rules.append((specificity, order, properties))
 
         # Sort by specificity then order (both ascending, so later/more specific wins)
