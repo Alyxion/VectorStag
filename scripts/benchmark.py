@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from vectorstag import SVGRenderer
 
 # Constants
-WORKER_TIMEOUT = 30  # seconds per test
+DEFAULT_TIMEOUT = 30  # seconds per test
 BATCH_SIZE = 100  # restart workers after this many tests
 
 
@@ -60,6 +60,7 @@ class BenchmarkResult:
     category: str
     similarity: Optional[float] = None
     render_time_ms: float = 0.0
+    resvg_time_ms: float = 0.0
     error: Optional[str] = None
 
 
@@ -76,6 +77,8 @@ class CategoryStats:
     bucket_below_95: int = 0
     avg_time_ms: float = 0.0
     max_time_ms: float = 0.0
+    avg_resvg_time_ms: float = 0.0
+    max_resvg_time_ms: float = 0.0
     total_time_s: float = 0.0
 
 
@@ -240,10 +243,10 @@ def get_unique_name(svg_path: Path, base_dir: Path) -> str:
 
 def benchmark_collection_worker(args) -> BenchmarkResult:
     """Worker function for collection benchmark."""
-    svg_path, base_dir, resvg_ref_dir, cairo_ref_dir, size, category = args
+    svg_path, base_dir, resvg_ref_dir, cairo_ref_dir, size, category, compare_resvg = args
     name = get_unique_name(svg_path, base_dir)
 
-    start_time = time.perf_counter()
+    resvg_time = 0.0
 
     try:
         # Load references
@@ -253,14 +256,26 @@ def benchmark_collection_worker(args) -> BenchmarkResult:
         resvg_img = Image.open(resvg_path).convert("RGBA") if resvg_path.exists() else None
         cairo_img = Image.open(cairo_path).convert("RGBA") if cairo_path and cairo_path.exists() else None
 
+        # Benchmark resvg if requested
+        if compare_resvg:
+            try:
+                from resvg_python import svg_to_png
+                with open(svg_path, 'r') as f:
+                    svg_content = f.read()
+                resvg_start = time.perf_counter()
+                _ = svg_to_png(svg_content)
+                resvg_time = (time.perf_counter() - resvg_start) * 1000
+            except Exception:
+                resvg_time = 0.0
+
         # Render with VectorStag
+        start_time = time.perf_counter()
         renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
         vs_img = renderer.render_file(str(svg_path))
-
         render_time = (time.perf_counter() - start_time) * 1000
 
         if vs_img is None:
-            return BenchmarkResult(name, category, error="Render failed", render_time_ms=render_time)
+            return BenchmarkResult(name, category, error="Render failed", render_time_ms=render_time, resvg_time_ms=resvg_time)
 
         vs_img = fit_to_canvas(vs_img, size)
 
@@ -272,14 +287,13 @@ def benchmark_collection_worker(args) -> BenchmarkResult:
         del renderer, vs_img, resvg_img, cairo_img
         gc.collect()
 
-        return BenchmarkResult(name, category, similarity=sim, render_time_ms=render_time)
+        return BenchmarkResult(name, category, similarity=sim, render_time_ms=render_time, resvg_time_ms=resvg_time)
 
     except Exception as e:
-        render_time = (time.perf_counter() - start_time) * 1000
-        return BenchmarkResult(name, category, error=str(e)[:100], render_time_ms=render_time)
+        return BenchmarkResult(name, category, error=str(e)[:100], render_time_ms=0.0, resvg_time_ms=resvg_time)
 
 
-def benchmark_collection(collection: Collection, num_workers: int) -> CategoryStats:
+def benchmark_collection(collection: Collection, num_workers: int, timeout: float = DEFAULT_TIMEOUT, compare_resvg: bool = False) -> CategoryStats:
     """Benchmark a single collection."""
     svg_files = sorted(collection.svg_dir.glob("**/*.svg"))
 
@@ -296,7 +310,7 @@ def benchmark_collection(collection: Collection, num_workers: int) -> CategorySt
     cairo_ref_dir_arg = cairo_ref_dir if cairo_ref_dir.exists() else None
 
     tasks = [(svg_path, collection.svg_dir, resvg_ref_dir, cairo_ref_dir_arg,
-              collection.size, collection.name) for svg_path in svg_files]
+              collection.size, collection.name, compare_resvg) for svg_path in svg_files]
 
     results: List[BenchmarkResult] = []
     start_time = time.time()
@@ -309,7 +323,7 @@ def benchmark_collection(collection: Collection, num_workers: int) -> CategorySt
             completed += 1
 
             try:
-                result = future.result(timeout=WORKER_TIMEOUT)
+                result = future.result(timeout=timeout)
                 results.append(result)
             except FuturesTimeoutError:
                 svg_path = futures[future][0]
@@ -340,6 +354,7 @@ def benchmark_collection(collection: Collection, num_workers: int) -> CategorySt
     if valid_results:
         similarities = [r.similarity for r in valid_results]
         times = [r.render_time_ms for r in valid_results]
+        resvg_times = [r.resvg_time_ms for r in valid_results if r.resvg_time_ms > 0]
 
         stats.avg_similarity = sum(similarities) / len(similarities)
         stats.bucket_99_100 = sum(1 for s in similarities if s >= 0.99)
@@ -347,6 +362,10 @@ def benchmark_collection(collection: Collection, num_workers: int) -> CategorySt
         stats.bucket_below_95 = sum(1 for s in similarities if s < 0.95)
         stats.avg_time_ms = sum(times) / len(times)
         stats.max_time_ms = max(times)
+
+        if resvg_times:
+            stats.avg_resvg_time_ms = sum(resvg_times) / len(resvg_times)
+            stats.max_resvg_time_ms = max(resvg_times)
 
     return stats
 
@@ -418,7 +437,7 @@ def get_resvg_categories(test_dir: Path) -> List[str]:
     return sorted(categories)
 
 
-def benchmark_resvg_suite(num_workers: int, category_filter: str = None) -> List[CategoryStats]:
+def benchmark_resvg_suite(num_workers: int, category_filter: str = None, timeout: float = DEFAULT_TIMEOUT) -> List[CategoryStats]:
     """Benchmark against resvg-test-suite, returning stats per category."""
     test_dir = Path("resvg-test-suite/tests")
     if not test_dir.exists():
@@ -444,9 +463,9 @@ def benchmark_resvg_suite(num_workers: int, category_filter: str = None) -> List
             futures = {executor.submit(benchmark_resvg_worker, (t[0], t[1], 4)): t
                       for t in batch_tests}
 
-            for future in as_completed(futures, timeout=WORKER_TIMEOUT * len(batch_tests)):
+            for future in as_completed(futures, timeout=timeout * len(batch_tests)):
                 try:
-                    result = future.result(timeout=WORKER_TIMEOUT)
+                    result = future.result(timeout=timeout)
                     results.append(result)
                 except FuturesTimeoutError:
                     svg_path = futures[future][0]
@@ -507,15 +526,27 @@ def benchmark_resvg_suite(num_workers: int, category_filter: str = None) -> List
 # Output Formatting
 # =============================================================================
 
-def print_table(all_stats: List[CategoryStats]):
+def print_table(all_stats: List[CategoryStats], compare_resvg: bool = False):
     """Print formatted results table."""
-    print("\n" + "=" * 105)
-    print("BENCHMARK RESULTS")
-    print("=" * 105)
+    # Check if we have resvg timing data
+    has_resvg = compare_resvg and any(s.avg_resvg_time_ms > 0 for s in all_stats)
 
-    # Header
-    print(f"\n| {'Category':<14} | {'Count':>6} | {'Avg':>6} | {'99-100%':>15} | {'95-99%':>13} | {'<95%':>10} | {'Avg ms':>7} | {'Max ms':>7} |")
-    print("|" + "-" * 16 + "|" + "-" * 8 + "|" + "-" * 8 + "|" + "-" * 17 + "|" + "-" * 15 + "|" + "-" * 12 + "|" + "-" * 9 + "|" + "-" * 9 + "|")
+    if has_resvg:
+        width = 135
+        print("\n" + "=" * width)
+        print("BENCHMARK RESULTS (with resvg comparison)")
+        print("=" * width)
+        # Header with resvg columns
+        print(f"\n| {'Category':<14} | {'Count':>6} | {'Avg':>6} | {'99-100%':>15} | {'95-99%':>13} | {'<95%':>10} | {'VS avg':>7} | {'VS max':>7} | {'resvg avg':>9} | {'resvg max':>9} |")
+        print("|" + "-" * 16 + "|" + "-" * 8 + "|" + "-" * 8 + "|" + "-" * 17 + "|" + "-" * 15 + "|" + "-" * 12 + "|" + "-" * 9 + "|" + "-" * 9 + "|" + "-" * 11 + "|" + "-" * 11 + "|")
+    else:
+        width = 105
+        print("\n" + "=" * width)
+        print("BENCHMARK RESULTS")
+        print("=" * width)
+        # Header without resvg columns
+        print(f"\n| {'Category':<14} | {'Count':>6} | {'Avg':>6} | {'99-100%':>15} | {'95-99%':>13} | {'<95%':>10} | {'Avg ms':>7} | {'Max ms':>7} |")
+        print("|" + "-" * 16 + "|" + "-" * 8 + "|" + "-" * 8 + "|" + "-" * 17 + "|" + "-" * 15 + "|" + "-" * 12 + "|" + "-" * 9 + "|" + "-" * 9 + "|")
 
     total_count = 0
     total_valid = 0
@@ -540,10 +571,18 @@ def print_table(all_stats: List[CategoryStats]):
         pct_95_99 = f"{stats.bucket_95_99} ({100*stats.bucket_95_99/stats.valid:.1f}%)" if stats.valid else "0"
         pct_below_95 = f"{stats.bucket_below_95}" if stats.valid else "0"
 
-        print(f"| {stats.name:<14} | {stats.count:>6} | {stats.avg_similarity:>5.1%} | {pct_99_100:>15} | {pct_95_99:>13} | {pct_below_95:>10} | {stats.avg_time_ms:>6.1f} | {stats.max_time_ms:>6.0f} |")
+        if has_resvg:
+            resvg_avg = f"{stats.avg_resvg_time_ms:.1f}" if stats.avg_resvg_time_ms > 0 else "-"
+            resvg_max = f"{stats.max_resvg_time_ms:.0f}" if stats.max_resvg_time_ms > 0 else "-"
+            print(f"| {stats.name:<14} | {stats.count:>6} | {stats.avg_similarity:>5.1%} | {pct_99_100:>15} | {pct_95_99:>13} | {pct_below_95:>10} | {stats.avg_time_ms:>6.1f} | {stats.max_time_ms:>6.0f} | {resvg_avg:>9} | {resvg_max:>9} |")
+        else:
+            print(f"| {stats.name:<14} | {stats.count:>6} | {stats.avg_similarity:>5.1%} | {pct_99_100:>15} | {pct_95_99:>13} | {pct_below_95:>10} | {stats.avg_time_ms:>6.1f} | {stats.max_time_ms:>6.0f} |")
 
     # Total row
-    print("|" + "-" * 16 + "|" + "-" * 8 + "|" + "-" * 8 + "|" + "-" * 17 + "|" + "-" * 15 + "|" + "-" * 12 + "|" + "-" * 9 + "|" + "-" * 9 + "|")
+    if has_resvg:
+        print("|" + "-" * 16 + "|" + "-" * 8 + "|" + "-" * 8 + "|" + "-" * 17 + "|" + "-" * 15 + "|" + "-" * 12 + "|" + "-" * 9 + "|" + "-" * 9 + "|" + "-" * 11 + "|" + "-" * 11 + "|")
+    else:
+        print("|" + "-" * 16 + "|" + "-" * 8 + "|" + "-" * 8 + "|" + "-" * 17 + "|" + "-" * 15 + "|" + "-" * 12 + "|" + "-" * 9 + "|" + "-" * 9 + "|")
 
     total_avg = weighted_sim_sum / total_valid if total_valid else 0
     pct_99_100 = f"{total_99_100} ({100*total_99_100/total_valid:.1f}%)" if total_valid else "0"
@@ -553,12 +592,33 @@ def print_table(all_stats: List[CategoryStats]):
     avg_time = sum(s.avg_time_ms * s.valid for s in all_stats) / total_valid if total_valid else 0
     max_time = max((s.max_time_ms for s in all_stats if s.valid), default=0)
 
-    print(f"| {'TOTAL':<14} | {total_count:>6} | {total_avg:>5.1%} | {pct_99_100:>15} | {pct_95_99:>13} | {pct_below_95:>10} | {avg_time:>6.1f} | {max_time:>6.0f} |")
+    if has_resvg:
+        resvg_valid = [s for s in all_stats if s.avg_resvg_time_ms > 0]
+        total_resvg_valid = sum(s.valid for s in resvg_valid)
+        avg_resvg = sum(s.avg_resvg_time_ms * s.valid for s in resvg_valid) / total_resvg_valid if total_resvg_valid else 0
+        max_resvg = max((s.max_resvg_time_ms for s in resvg_valid), default=0)
+        print(f"| {'TOTAL':<14} | {total_count:>6} | {total_avg:>5.1%} | {pct_99_100:>15} | {pct_95_99:>13} | {pct_below_95:>10} | {avg_time:>6.1f} | {max_time:>6.0f} | {avg_resvg:>8.1f} | {max_resvg:>8.0f} |")
+    else:
+        print(f"| {'TOTAL':<14} | {total_count:>6} | {total_avg:>5.1%} | {pct_99_100:>15} | {pct_95_99:>13} | {pct_below_95:>10} | {avg_time:>6.1f} | {max_time:>6.0f} |")
 
     # Summary
     total_time = sum(s.total_time_s for s in all_stats)
     print(f"\nTotal benchmark time: {total_time:.1f}s")
     print(f"Overall throughput: {total_count/total_time:.1f} files/sec")
+
+    # Speed comparison summary
+    if has_resvg:
+        resvg_valid = [s for s in all_stats if s.avg_resvg_time_ms > 0]
+        if resvg_valid:
+            total_resvg_valid = sum(s.valid for s in resvg_valid)
+            avg_vs = sum(s.avg_time_ms * s.valid for s in resvg_valid) / total_resvg_valid
+            avg_resvg = sum(s.avg_resvg_time_ms * s.valid for s in resvg_valid) / total_resvg_valid
+            if avg_resvg > 0:
+                ratio = avg_vs / avg_resvg
+                if ratio > 1:
+                    print(f"VectorStag is {ratio:.1f}x slower than resvg on average")
+                else:
+                    print(f"VectorStag is {1/ratio:.1f}x faster than resvg on average")
 
 
 # =============================================================================
@@ -595,8 +655,38 @@ def profile_file(svg_path: Path, size: int = 400) -> str:
     return stream.getvalue()
 
 
+def find_slow_files(collection: Collection, threshold_ms: float, timeout: float) -> List[Tuple[str, float]]:
+    """Find files taking longer than threshold_ms to render."""
+    svg_files = sorted(collection.svg_dir.glob("**/*.svg"))
+
+    slow_files = []
+    renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
+
+    print(f"Scanning {len(svg_files)} files in {collection.name}...")
+
+    for i, svg_path in enumerate(svg_files):
+        if (i + 1) % 100 == 0:
+            print(f"  {i+1}/{len(svg_files)}...")
+
+        start = time.perf_counter()
+        try:
+            img = renderer.render_file(str(svg_path), collection.size, collection.size)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+
+            if elapsed_ms > threshold_ms:
+                slow_files.append((svg_path.name, elapsed_ms))
+                print(f"  SLOW: {svg_path.name}: {elapsed_ms:.0f}ms")
+
+            if elapsed_ms > timeout * 1000:
+                print(f"  TIMEOUT: {svg_path.name} exceeded {timeout}s")
+
+        except Exception as e:
+            print(f"  ERROR: {svg_path.name}: {str(e)[:50]}")
+
+    return sorted(slow_files, key=lambda x: -x[1])
+
+
 def check_rust_extension():
-    """Check if Rust extension is available and working."""
     print("Checking Rust extension...")
     print("=" * 50)
 
@@ -646,10 +736,16 @@ def main():
     # Options
     parser.add_argument("-j", "--workers", type=int, default=16,
                         help="Number of workers (default: 16)")
+    parser.add_argument("--timeout", type=float, default=30.0,
+                        help="Per-file timeout in seconds (default: 30)")
     parser.add_argument("--resvg-category", type=str,
                         help="Filter resvg tests by category (e.g., 'shapes', 'filters')")
     parser.add_argument("--list-resvg-categories", action="store_true",
                         help="List available resvg test categories and exit")
+    parser.add_argument("--find-slow", type=float, metavar="MS",
+                        help="Find files taking longer than MS milliseconds")
+    parser.add_argument("--compare-resvg", action="store_true",
+                        help="Include resvg timing for performance comparison")
 
     # Single file options
     parser.add_argument("--file", type=str, help="Benchmark/profile a single file")
@@ -696,6 +792,38 @@ def main():
             print(profile_file(svg_path, args.size))
         return
 
+    # Find slow files mode
+    if args.find_slow:
+        collections = get_collections()
+        run_collections = []
+
+        for name in ['emojis', 'flags', 'material', 'fontawesome', 'lucide', 'w3c']:
+            if getattr(args, name, False):
+                if name in collections:
+                    run_collections.append(collections[name])
+
+        if args.collections or not run_collections:
+            run_collections = list(collections.values())
+
+        print(f"Finding files slower than {args.find_slow}ms")
+        print("=" * 70)
+
+        all_slow = []
+        for collection in run_collections:
+            if not collection.svg_dir.exists():
+                continue
+            slow = find_slow_files(collection, args.find_slow, args.timeout)
+            for name, ms in slow:
+                all_slow.append((collection.name, name, ms))
+
+        print("\n" + "=" * 70)
+        print(f"SLOW FILES (>{args.find_slow}ms)")
+        print("=" * 70)
+        for cat, name, ms in sorted(all_slow, key=lambda x: -x[2]):
+            print(f"  {ms:>8.0f}ms  {cat}/{name}")
+        print(f"\nTotal: {len(all_slow)} slow files")
+        return
+
     # Determine what to run
     run_collections = []
     run_resvg = False
@@ -727,8 +855,10 @@ def main():
     print("VECTORSTAG BENCHMARK")
     print("=" * 105)
     print(f"Workers: {args.workers}")
+    print(f"Timeout: {args.timeout}s")
     print(f"Collections: {len(run_collections)}")
     print(f"resvg-test-suite: {'Yes' if run_resvg else 'No'}")
+    print(f"Compare resvg timing: {'Yes' if args.compare_resvg else 'No'}")
     print()
 
     all_stats: List[CategoryStats] = []
@@ -740,17 +870,17 @@ def main():
             continue
 
         print(f"\n--- {collection.name.upper()} ---")
-        stats = benchmark_collection(collection, args.workers)
+        stats = benchmark_collection(collection, args.workers, args.timeout, args.compare_resvg)
         all_stats.append(stats)
 
     # Run resvg test suite
     if run_resvg:
         print(f"\n--- RESVG-TEST-SUITE ---")
-        resvg_stats = benchmark_resvg_suite(args.workers, args.resvg_category)
+        resvg_stats = benchmark_resvg_suite(args.workers, args.resvg_category, args.timeout)
         all_stats.extend(resvg_stats)
 
     # Print summary table
-    print_table(all_stats)
+    print_table(all_stats, args.compare_resvg)
 
 
 if __name__ == "__main__":
