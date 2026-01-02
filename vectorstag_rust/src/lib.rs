@@ -8,6 +8,7 @@
 //! - Image operations (compositing, resizing, color space conversion)
 //! - SVG filter primitives (blur, morphology, lighting, etc.)
 //! - CSS selector parsing and matching
+//! - Full SVG rendering pipeline (SvgRenderer class)
 
 use pyo3::prelude::*;
 
@@ -20,6 +21,7 @@ mod filters;
 mod css;
 mod canvas;
 mod owned_canvas;
+mod renderer;
 
 /// A Python module implemented in Rust for fast SVG rendering operations.
 #[pymodule]
@@ -34,5 +36,6 @@ fn vectorstag_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     css::register(m)?;
     canvas::register(m)?;
     owned_canvas::register(m)?;
+    renderer::register(m)?;
     Ok(())
 }

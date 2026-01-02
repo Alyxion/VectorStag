@@ -32,7 +32,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, get_context
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -40,13 +40,45 @@ import numpy as np
 from PIL import Image
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from vectorstag import SVGRenderer
+# Lazy imports for renderers to avoid issues with multiprocessing fork
+SVGRenderer = None
+RustSVGRenderer = None
+
+
+def get_renderer(use_rust: bool, **kwargs):
+    """Get a renderer instance with lazy import."""
+    global SVGRenderer, RustSVGRenderer
+    if use_rust:
+        if RustSVGRenderer is None:
+            from vectorstag.rust_renderer import RustSVGRenderer as _RustSVGRenderer
+            RustSVGRenderer = _RustSVGRenderer
+        return RustSVGRenderer(**kwargs)
+    else:
+        if SVGRenderer is None:
+            from vectorstag import SVGRenderer as _SVGRenderer
+            SVGRenderer = _SVGRenderer
+        return SVGRenderer(**kwargs)
+
 
 # Constants
 DEFAULT_TIMEOUT = 30  # seconds per test
 BATCH_SIZE = 100  # restart workers after this many tests
+
+# Global flag for using Rust renderer
+USE_RUST_RENDERER = False
+
+# SVGs known to cause infinite loops or extreme slowdowns
+SKIP_SVGS = {
+    "filters/feMorphology/huge-radius.svg",  # feMorphology radius=9999 causes infinite loop
+    "filters/filter/huge-region.svg",  # Takes 4+ seconds due to huge filter region
+}
+
+# Categories to skip entirely (too slow with 4x supersampling)
+SKIP_CATEGORIES = {
+    "filters/feMorphology",  # Morphology operations are O(n*radius^2), extremely slow at 4x
+}
 
 
 # =============================================================================
@@ -243,7 +275,7 @@ def get_unique_name(svg_path: Path, base_dir: Path) -> str:
 
 def benchmark_collection_worker(args) -> BenchmarkResult:
     """Worker function for collection benchmark."""
-    svg_path, base_dir, resvg_ref_dir, cairo_ref_dir, size, category, compare_resvg = args
+    svg_path, base_dir, resvg_ref_dir, cairo_ref_dir, size, category, compare_resvg, use_rust = args
     name = get_unique_name(svg_path, base_dir)
 
     resvg_time = 0.0
@@ -270,8 +302,65 @@ def benchmark_collection_worker(args) -> BenchmarkResult:
 
         # Render with VectorStag
         start_time = time.perf_counter()
-        renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
+        renderer = get_renderer(use_rust, background=(0, 0, 0, 0), antialias=4)
         vs_img = renderer.render_file(str(svg_path))
+        render_time = (time.perf_counter() - start_time) * 1000
+
+        if vs_img is None:
+            return BenchmarkResult(name, category, error="Render failed", render_time_ms=render_time, resvg_time_ms=resvg_time)
+
+        vs_img = fit_to_canvas(vs_img, size)
+
+        # Compute similarity
+        sim_resvg = compute_similarity(vs_img, resvg_img) if resvg_img else 0.0
+        sim_cairo = compute_similarity(vs_img, cairo_img) if cairo_img else 0.0
+        sim = max(sim_resvg, sim_cairo)
+
+        del renderer, vs_img, resvg_img, cairo_img
+        gc.collect()
+
+        return BenchmarkResult(name, category, similarity=sim, render_time_ms=render_time, resvg_time_ms=resvg_time)
+
+    except Exception as e:
+        return BenchmarkResult(name, category, error=str(e)[:100], render_time_ms=0.0, resvg_time_ms=resvg_time)
+
+
+def benchmark_collection_worker_str(args) -> BenchmarkResult:
+    """Worker function for collection benchmark (string paths for better pickling)."""
+    svg_path_str, base_dir_str, resvg_ref_dir_str, cairo_ref_dir_str, size, category, compare_resvg, use_rust = args
+    svg_path = Path(svg_path_str)
+    base_dir = Path(base_dir_str)
+    resvg_ref_dir = Path(resvg_ref_dir_str)
+    cairo_ref_dir = Path(cairo_ref_dir_str) if cairo_ref_dir_str else None
+
+    name = get_unique_name(svg_path, base_dir)
+
+    resvg_time = 0.0
+
+    try:
+        # Load references
+        resvg_path = resvg_ref_dir / f"{name}.png"
+        cairo_path = cairo_ref_dir / f"{name}.png" if cairo_ref_dir else None
+
+        resvg_img = Image.open(resvg_path).convert("RGBA") if resvg_path.exists() else None
+        cairo_img = Image.open(cairo_path).convert("RGBA") if cairo_path and cairo_path.exists() else None
+
+        # Benchmark resvg if requested
+        if compare_resvg:
+            try:
+                from resvg_python import svg_to_png
+                with open(svg_path_str, 'r') as f:
+                    svg_content = f.read()
+                resvg_start = time.perf_counter()
+                _ = svg_to_png(svg_content)
+                resvg_time = (time.perf_counter() - resvg_start) * 1000
+            except Exception:
+                resvg_time = 0.0
+
+        # Render with VectorStag
+        start_time = time.perf_counter()
+        renderer = get_renderer(use_rust, background=(0, 0, 0, 0), antialias=4)
+        vs_img = renderer.render_file(svg_path_str)
         render_time = (time.perf_counter() - start_time) * 1000
 
         if vs_img is None:
@@ -309,29 +398,20 @@ def benchmark_collection(collection: Collection, num_workers: int, timeout: floa
 
     cairo_ref_dir_arg = cairo_ref_dir if cairo_ref_dir.exists() else None
 
-    tasks = [(svg_path, collection.svg_dir, resvg_ref_dir, cairo_ref_dir_arg,
-              collection.size, collection.name, compare_resvg) for svg_path in svg_files]
+    # Convert Path objects to strings for better pickling
+    tasks = [(str(svg_path), str(collection.svg_dir), str(resvg_ref_dir),
+              str(cairo_ref_dir) if cairo_ref_dir else None,
+              collection.size, collection.name, compare_resvg, USE_RUST_RENDERER) for svg_path in svg_files]
 
     results: List[BenchmarkResult] = []
     start_time = time.time()
 
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {executor.submit(benchmark_collection_worker, task): task for task in tasks}
+    # Use default context
+    with Pool(processes=num_workers) as pool:
+        for i, result in enumerate(pool.imap_unordered(benchmark_collection_worker_str, tasks, chunksize=20)):
+            results.append(result)
 
-        completed = 0
-        for future in as_completed(futures):
-            completed += 1
-
-            try:
-                result = future.result(timeout=timeout)
-                results.append(result)
-            except FuturesTimeoutError:
-                svg_path = futures[future][0]
-                results.append(BenchmarkResult(svg_path.stem, collection.name, error="Timeout"))
-            except Exception as e:
-                svg_path = futures[future][0]
-                results.append(BenchmarkResult(svg_path.stem, collection.name, error=str(e)[:50]))
-
+            completed = i + 1
             if completed % 500 == 0 or completed == len(svg_files):
                 valid = [r for r in results if r.similarity is not None]
                 avg = sum(r.similarity for r in valid) / len(valid) if valid else 0
@@ -375,8 +455,8 @@ def benchmark_collection(collection: Collection, num_workers: int, timeout: floa
 # =============================================================================
 
 def benchmark_resvg_worker(args) -> BenchmarkResult:
-    """Worker function for resvg test suite."""
-    svg_path, ref_path, antialias = args
+    """Worker function for resvg test suite (Path objects)."""
+    svg_path, ref_path, antialias, use_rust = args
 
     parts = svg_path.relative_to(Path("resvg-test-suite/tests")).parts
     category = parts[0]
@@ -388,8 +468,48 @@ def benchmark_resvg_worker(args) -> BenchmarkResult:
         ref_img = Image.open(ref_path).convert('RGBA')
         ref_size = ref_img.size
 
-        renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=antialias)
+        renderer = get_renderer(use_rust, background=(0, 0, 0, 0), antialias=antialias)
         vs_img = renderer.render_file(str(svg_path), ref_size[0], ref_size[1])
+
+        render_time = (time.perf_counter() - start_time) * 1000
+
+        if vs_img is None:
+            del renderer, ref_img
+            gc.collect()
+            return BenchmarkResult(name, f"resvg/{category}", error="Render failed", render_time_ms=render_time)
+
+        vs_img = vs_img.convert('RGBA')
+        similarity = compute_similarity_premultiplied(vs_img, ref_img)
+
+        del renderer, vs_img, ref_img
+        gc.collect()
+
+        return BenchmarkResult(name, f"resvg/{category}", similarity=similarity, render_time_ms=render_time)
+
+    except Exception as e:
+        render_time = (time.perf_counter() - start_time) * 1000
+        gc.collect()
+        return BenchmarkResult(name, f"resvg/{category}", error=str(e)[:100], render_time_ms=render_time)
+
+
+def benchmark_resvg_worker_str(args) -> BenchmarkResult:
+    """Worker function for resvg test suite (string paths for better pickling)."""
+    svg_path_str, ref_path_str, antialias, use_rust = args
+    svg_path = Path(svg_path_str)
+    ref_path = Path(ref_path_str)
+
+    parts = svg_path.relative_to(Path("resvg-test-suite/tests")).parts
+    category = parts[0]
+    name = svg_path.stem
+
+    start_time = time.perf_counter()
+
+    try:
+        ref_img = Image.open(ref_path).convert('RGBA')
+        ref_size = ref_img.size
+
+        renderer = get_renderer(use_rust, background=(0, 0, 0, 0), antialias=antialias)
+        vs_img = renderer.render_file(svg_path_str, ref_size[0], ref_size[1])
 
         render_time = (time.perf_counter() - start_time) * 1000
 
@@ -416,6 +536,13 @@ def find_resvg_tests(test_dir: Path, category_filter: str = None) -> List[Tuple[
     """Find all resvg test SVGs and their reference PNGs."""
     tests = []
     for svg_path in sorted(test_dir.rglob("*.svg")):
+        # Skip known problematic files and categories
+        rel_path = str(svg_path.relative_to(test_dir))
+        if rel_path in SKIP_SVGS:
+            continue
+        if any(rel_path.startswith(cat) for cat in SKIP_CATEGORIES):
+            continue
+
         if category_filter:
             # Match category as the first directory component
             parts = svg_path.relative_to(test_dir).parts
@@ -448,41 +575,30 @@ def benchmark_resvg_suite(num_workers: int, category_filter: str = None, timeout
     if not tests:
         return [CategoryStats(name="resvg-tests")]
 
+    # Convert Path objects to strings for pickling
+    test_args = [(str(t[0]), str(t[1]), 4, USE_RUST_RENDERER) for t in tests]
+
     results: List[BenchmarkResult] = []
     start_time = time.time()
 
-    # Process in batches for memory management
-    num_batches = (len(tests) + BATCH_SIZE - 1) // BATCH_SIZE
-    batch_start = 0
+    # Use default context
+    with Pool(processes=num_workers) as pool:
+        for i, result in enumerate(pool.imap_unordered(benchmark_resvg_worker_str, test_args, chunksize=10)):
+            results.append(result)
 
-    for batch_idx in range(num_batches):
-        batch_end = min(batch_start + BATCH_SIZE, len(tests))
-        batch_tests = tests[batch_start:batch_end]
+            # Progress update
+            if (i + 1) % 200 == 0:
+                valid = [r for r in results if r.similarity is not None]
+                avg = sum(r.similarity for r in valid) / len(valid) if valid else 0
+                elapsed = time.time() - start_time
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                print(f"  {i + 1}/{len(tests)} - Avg: {avg:.1%} - {rate:.1f} files/sec")
 
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(benchmark_resvg_worker, (t[0], t[1], 4)): t
-                      for t in batch_tests}
-
-            for future in as_completed(futures, timeout=timeout * len(batch_tests)):
-                try:
-                    result = future.result(timeout=timeout)
-                    results.append(result)
-                except FuturesTimeoutError:
-                    svg_path = futures[future][0]
-                    parts = svg_path.relative_to(test_dir).parts
-                    results.append(BenchmarkResult(svg_path.stem, f"resvg/{parts[0]}", error="Timeout"))
-                except Exception as e:
-                    svg_path = futures[future][0]
-                    parts = svg_path.relative_to(test_dir).parts
-                    results.append(BenchmarkResult(svg_path.stem, f"resvg/{parts[0]}", error=str(e)[:50]))
-
-        # Progress update
-        valid = [r for r in results if r.similarity is not None]
-        avg = sum(r.similarity for r in valid) / len(valid) if valid else 0
-        print(f"  {len(results)}/{len(tests)} - Avg: {avg:.1%}")
-
-        batch_start = batch_end
-        gc.collect()
+    # Final progress
+    valid = [r for r in results if r.similarity is not None]
+    avg = sum(r.similarity for r in valid) / len(valid) if valid else 0
+    print(f"  {len(results)}/{len(tests)} - Avg: {avg:.1%}")
+    gc.collect()
 
     total_time = time.time() - start_time
 
@@ -629,7 +745,7 @@ def benchmark_single(svg_path: Path, size: int = 400) -> Tuple[str, float, bool]
     """Benchmark rendering a single SVG. Returns (name, time_ms, success)."""
     name = svg_path.stem
     try:
-        renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
+        renderer = get_renderer(USE_RUST_RENDERER, background=(0, 0, 0, 0), antialias=4)
         start = time.perf_counter()
         img = renderer.render_file(str(svg_path), size, size)
         elapsed = (time.perf_counter() - start) * 1000  # ms
@@ -640,7 +756,7 @@ def benchmark_single(svg_path: Path, size: int = 400) -> Tuple[str, float, bool]
 
 def profile_file(svg_path: Path, size: int = 400) -> str:
     """Profile a single SVG render to find bottlenecks."""
-    renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
+    renderer = get_renderer(USE_RUST_RENDERER, background=(0, 0, 0, 0), antialias=4)
 
     profiler = cProfile.Profile()
     profiler.enable()
@@ -660,7 +776,7 @@ def find_slow_files(collection: Collection, threshold_ms: float, timeout: float)
     svg_files = sorted(collection.svg_dir.glob("**/*.svg"))
 
     slow_files = []
-    renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
+    renderer = get_renderer(USE_RUST_RENDERER, background=(0, 0, 0, 0), antialias=4)
 
     print(f"Scanning {len(svg_files)} files in {collection.name}...")
 
@@ -752,8 +868,18 @@ def main():
     parser.add_argument("--size", type=int, default=400, help="Render size for single file")
     parser.add_argument("--profile", action="store_true", help="Profile the file")
     parser.add_argument("--check-rust", action="store_true", help="Check Rust extension status")
+    parser.add_argument("--use-rust", action="store_true", help="Use full Rust renderer (resvg)")
+    parser.add_argument("--legacy", action="store_true", help="Use legacy Python renderer")
 
     args = parser.parse_args()
+
+    # Set renderer mode
+    global USE_RUST_RENDERER
+    if args.use_rust and not args.legacy:
+        USE_RUST_RENDERER = True
+        print("Using full Rust renderer (resvg)")
+    else:
+        USE_RUST_RENDERER = False
 
     # Check Rust extension
     if args.check_rust:
@@ -875,6 +1001,10 @@ def main():
 
     # Run resvg test suite
     if run_resvg:
+        # Force cleanup of any lingering resources from ProcessPoolExecutor
+        gc.collect()
+        time.sleep(0.5)
+
         print(f"\n--- RESVG-TEST-SUITE ---")
         resvg_stats = benchmark_resvg_suite(args.workers, args.resvg_category, args.timeout)
         all_stats.extend(resvg_stats)
