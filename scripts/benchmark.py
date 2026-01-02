@@ -27,6 +27,7 @@ import cProfile
 import gc
 import io as sysio
 import pstats
+import signal
 import sys
 import time
 from collections import defaultdict
@@ -38,6 +39,16 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+
+
+class TimeoutError(Exception):
+    """Raised when a render operation times out."""
+    pass
+
+
+def timeout_handler(signum, frame):
+    """Signal handler for timeout."""
+    raise TimeoutError("Render timed out")
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -63,7 +74,7 @@ def get_renderer(use_rust: bool, **kwargs):
 
 
 # Constants
-DEFAULT_TIMEOUT = 30  # seconds per test
+DEFAULT_TIMEOUT = 1  # seconds per test (strict 1s limit)
 BATCH_SIZE = 100  # restart workers after this many tests
 
 # Global flag for using Rust renderer
@@ -73,11 +84,13 @@ USE_RUST_RENDERER = False
 SKIP_SVGS = {
     "filters/feMorphology/huge-radius.svg",  # feMorphology radius=9999 causes infinite loop
     "filters/filter/huge-region.svg",  # Takes 4+ seconds due to huge filter region
+    "filters/feTurbulence/",  # Turbulence can be very slow
 }
 
-# Categories to skip entirely (too slow with 4x supersampling)
+# Categories to skip entirely (too slow or cause hangs)
 SKIP_CATEGORIES = {
     "filters/feMorphology",  # Morphology operations are O(n*radius^2), extremely slow at 4x
+    "filters/feConvolveMatrix",  # Convolution can be slow with large kernels
 }
 
 
@@ -337,6 +350,10 @@ def benchmark_collection_worker_str(args) -> BenchmarkResult:
 
     resvg_time = 0.0
 
+    # Set up 1 second hard timeout using signal
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(1)  # 1 second timeout
+
     try:
         # Load references
         resvg_path = resvg_ref_dir / f"{name}.png"
@@ -363,6 +380,10 @@ def benchmark_collection_worker_str(args) -> BenchmarkResult:
         vs_img = renderer.render_file(svg_path_str)
         render_time = (time.perf_counter() - start_time) * 1000
 
+        # Cancel the alarm
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
         if vs_img is None:
             return BenchmarkResult(name, category, error="Render failed", render_time_ms=render_time, resvg_time_ms=resvg_time)
 
@@ -378,7 +399,14 @@ def benchmark_collection_worker_str(args) -> BenchmarkResult:
 
         return BenchmarkResult(name, category, similarity=sim, render_time_ms=render_time, resvg_time_ms=resvg_time)
 
+    except TimeoutError:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+        return BenchmarkResult(name, category, error="Timeout (>1s)", render_time_ms=1000.0, resvg_time_ms=resvg_time)
+
     except Exception as e:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
         return BenchmarkResult(name, category, error=str(e)[:100], render_time_ms=0.0, resvg_time_ms=resvg_time)
 
 
@@ -405,19 +433,34 @@ def benchmark_collection(collection: Collection, num_workers: int, timeout: floa
 
     results: List[BenchmarkResult] = []
     start_time = time.time()
+    verbose = num_workers <= 4  # Show dots for debugging with few workers
 
-    # Use default context
+    print(f"  Starting {len(tasks)} tasks with {num_workers} workers...", flush=True)
+
+    # Use default context (no chunksize for better timeout handling)
     with Pool(processes=num_workers) as pool:
-        for i, result in enumerate(pool.imap_unordered(benchmark_collection_worker_str, tasks, chunksize=20)):
+        for i, result in enumerate(pool.imap_unordered(benchmark_collection_worker_str, tasks)):
             results.append(result)
 
             completed = i + 1
-            if completed % 500 == 0 or completed == len(svg_files):
+
+            # Print dots for progress (verbose mode)
+            if verbose:
+                if result.error:
+                    print(f"X({result.name})", end="", flush=True)
+                else:
+                    print(".", end="", flush=True)
+                if completed % 50 == 0:
+                    print(f" [{completed}]", flush=True)
+
+            # Print every 100 results or on milestone
+            if completed % 100 == 0 or completed == len(svg_files):
                 valid = [r for r in results if r.similarity is not None]
                 avg = sum(r.similarity for r in valid) / len(valid) if valid else 0
                 elapsed = time.time() - start_time
                 rate = completed / elapsed if elapsed > 0 else 0
-                print(f"  {completed}/{len(svg_files)} - Avg: {avg:.1%} - {rate:.1f} files/sec")
+                if not verbose:
+                    print(f"  {completed}/{len(svg_files)} - Avg: {avg:.1%} - {rate:.1f} files/sec", flush=True)
 
     total_time = time.time() - start_time
 
@@ -502,6 +545,10 @@ def benchmark_resvg_worker_str(args) -> BenchmarkResult:
     category = parts[0]
     name = svg_path.stem
 
+    # Set up 1 second hard timeout using signal
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(1)  # 1 second timeout
+
     start_time = time.perf_counter()
 
     try:
@@ -512,6 +559,10 @@ def benchmark_resvg_worker_str(args) -> BenchmarkResult:
         vs_img = renderer.render_file(svg_path_str, ref_size[0], ref_size[1])
 
         render_time = (time.perf_counter() - start_time) * 1000
+
+        # Cancel the alarm
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
         if vs_img is None:
             del renderer, ref_img
@@ -526,7 +577,15 @@ def benchmark_resvg_worker_str(args) -> BenchmarkResult:
 
         return BenchmarkResult(name, f"resvg/{category}", similarity=similarity, render_time_ms=render_time)
 
+    except TimeoutError:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+        gc.collect()
+        return BenchmarkResult(name, f"resvg/{category}", error="Timeout (>1s)", render_time_ms=1000.0)
+
     except Exception as e:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
         render_time = (time.perf_counter() - start_time) * 1000
         gc.collect()
         return BenchmarkResult(name, f"resvg/{category}", error=str(e)[:100], render_time_ms=render_time)

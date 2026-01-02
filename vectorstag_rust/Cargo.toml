@@ -13,11 +13,9 @@ numpy = "0.23"
 ndarray = { version = "0.16", features = ["rayon"] }
 rayon = "1.10"
 
-# SVG parsing and rendering
-resvg = "0.37"
-usvg = { version = "0.37", default-features = false, features = ["text"] }
-fontdb = "0.16"
-tiny-skia = "0.11"
+# SVG parsing (own implementation)
+roxmltree = "0.20"
+regex = "1"
 
 [profile.release]
 lto = true

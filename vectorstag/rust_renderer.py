@@ -1,8 +1,8 @@
 """High-performance SVG renderer using the full Rust pipeline.
 
 This module provides a drop-in replacement for SVGRenderer that uses
-resvg for rendering entirely in Rust, eliminating Python/Rust boundary
-crossing overhead.
+VectorStag's own Rust implementation for rendering entirely in Rust,
+eliminating Python/Rust boundary crossing overhead.
 """
 
 from PIL import Image
@@ -11,7 +11,7 @@ import vectorstag_rust
 
 
 class RustSVGRenderer:
-    """High-performance SVG renderer using resvg in Rust.
+    """High-performance SVG renderer using VectorStag's Rust implementation.
 
     This renderer processes SVGs entirely in Rust, providing significant
     speedups compared to the Python-based SVGRenderer.
@@ -30,7 +30,7 @@ class RustSVGRenderer:
             background: Background color as (r, g, b, a) tuple
             antialias: Antialiasing factor (default 4x supersampling)
         """
-        self._renderer = vectorstag_rust.SvgRenderer()
+        self._renderer = vectorstag_rust.VectorStagRenderer()
         self.scale = scale
         self.background = background
         self.antialias = antialias

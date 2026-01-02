@@ -5,11 +5,12 @@ use pyo3::types::PyList;
 
 /// SVG Path Command types for return values
 #[derive(Debug, Clone)]
-enum PathCmd {
+pub enum PathCmd {
     M(f64, f64),
     L(f64, f64),
     C(f64, f64, f64, f64, f64, f64),
     Q(f64, f64, f64, f64),
+    A(f64, f64, f64, bool, bool, f64, f64),  // rx, ry, rotation, large-arc, sweep, x, y
     Z,
 }
 
@@ -79,6 +80,10 @@ pub fn parse_path<'py>(py: Python<'py>, d: &str) -> Bound<'py, PyList> {
             PathCmd::L(x, y) => ("L", x, y, 0.0, 0.0, 0.0, 0.0),
             PathCmd::C(x1, y1, x2, y2, x, y) => ("C", x1, y1, x2, y2, x, y),
             PathCmd::Q(x1, y1, x, y) => ("Q", x1, y1, x, y, 0.0, 0.0),
+            PathCmd::A(rx, ry, rotation, large_arc, sweep, x, y) => {
+                // Return arc as "A" with parameters encoded
+                ("A", rx, ry, rotation, if large_arc { 1.0 } else { 0.0 }, if sweep { 1.0 } else { 0.0 }, x)
+            }
             PathCmd::Z => ("Z", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         };
         result.append(tuple).unwrap();
@@ -87,8 +92,8 @@ pub fn parse_path<'py>(py: Python<'py>, d: &str) -> Bound<'py, PyList> {
     result
 }
 
-/// Internal path parsing function
-fn parse_path_internal(d: &str) -> Vec<PathCmd> {
+/// Internal path parsing function (public for use by svg_renderer)
+pub fn parse_path_internal(d: &str) -> Vec<PathCmd> {
     let mut commands = Vec::new();
     let mut current_x: f64 = 0.0;
     let mut current_y: f64 = 0.0;
