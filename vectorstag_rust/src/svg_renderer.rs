@@ -342,6 +342,215 @@ impl RenderContext {
         }
     }
 
+    /// Interpolate gradient color at position t (0.0 to 1.0)
+    fn interpolate_gradient_color(stops: &[(f64, u8, u8, u8, u8)], t: f64) -> Color {
+        if stops.is_empty() {
+            return Color::from_rgba(0, 0, 0, 255);
+        }
+        if stops.len() == 1 {
+            let s = &stops[0];
+            return Color::from_rgba(s.1, s.2, s.3, s.4);
+        }
+
+        let t = t.clamp(0.0, 1.0);
+
+        // Find the two stops to interpolate between
+        let mut prev_stop = &stops[0];
+        for stop in stops.iter() {
+            if stop.0 >= t {
+                // Interpolate between prev_stop and stop
+                let range = stop.0 - prev_stop.0;
+                if range < 0.001 {
+                    return Color::from_rgba(stop.1, stop.2, stop.3, stop.4);
+                }
+                let local_t = (t - prev_stop.0) / range;
+                let r = (prev_stop.1 as f64 + (stop.1 as f64 - prev_stop.1 as f64) * local_t) as u8;
+                let g = (prev_stop.2 as f64 + (stop.2 as f64 - prev_stop.2 as f64) * local_t) as u8;
+                let b = (prev_stop.3 as f64 + (stop.3 as f64 - prev_stop.3 as f64) * local_t) as u8;
+                let a = (prev_stop.4 as f64 + (stop.4 as f64 - prev_stop.4 as f64) * local_t) as u8;
+                return Color::from_rgba(r, g, b, a);
+            }
+            prev_stop = stop;
+        }
+
+        // Past the last stop
+        let last = stops.last().unwrap();
+        Color::from_rgba(last.1, last.2, last.3, last.4)
+    }
+
+    /// Fill polygon with a gradient
+    fn fill_polygon_gradient(&mut self, points: &[(f64, f64)], gradient: &GradientDef,
+                             transform: &Transform, fill_rule: FillRule, opacity: f64) {
+        if points.len() < 3 {
+            return;
+        }
+
+        // Get bounding box
+        let min_x = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        let max_x = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+        let min_y = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let max_y = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+
+        // Early exit if polygon is completely outside the canvas
+        if max_x < 0.0 || min_x >= self.width as f64 ||
+           max_y < 0.0 || min_y >= self.height as f64 {
+            return;
+        }
+
+        let y_start = (min_y.floor() as i32).max(0) as usize;
+        let y_end = (max_y.ceil() as i32).min(self.height as i32) as usize;
+        let x_start = (min_x.floor() as i32).max(0) as usize;
+        let x_end = (max_x.ceil() as i32).min(self.width as i32) as usize;
+
+        if y_start >= y_end || x_start >= x_end {
+            return;
+        }
+
+        // Build edges
+        let n = points.len();
+        if n > MAX_POLYGON_POINTS {
+            return;
+        }
+        let mut edges: Vec<(f64, f64, f64, f64, i32)> = Vec::new();
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let (x1, y1) = points[i];
+            let (x2, y2) = points[j];
+
+            if (y1 - y2).abs() < 1e-10 {
+                continue;
+            }
+
+            let (x1, y1, x2, y2, dir) = if y1 < y2 {
+                (x1, y1, x2, y2, 1)
+            } else {
+                (x2, y2, x1, y1, -1)
+            };
+
+            edges.push((x1, y1, x2, y2, dir));
+        }
+
+        // Compute gradient parameters based on bounding box (for objectBoundingBox units)
+        let (gx1, gy1, gx2, gy2, gcx, gcy, gr) = if gradient.user_space {
+            // userSpaceOnUse - apply transform to gradient coords
+            let (gx1, gy1) = transform.apply(gradient.x1, gradient.y1);
+            let (gx2, gy2) = transform.apply(gradient.x2, gradient.y2);
+            let (gcx, gcy) = transform.apply(gradient.cx, gradient.cy);
+            // Scale radius by average scale factor
+            let scale = ((transform.a * transform.a + transform.b * transform.b).sqrt() +
+                        (transform.c * transform.c + transform.d * transform.d).sqrt()) / 2.0;
+            let gr = gradient.r * scale;
+            (gx1, gy1, gx2, gy2, gcx, gcy, gr)
+        } else {
+            // objectBoundingBox - coords are 0-1 relative to bounding box (or 0-100 for percentage)
+            let bbox_w = max_x - min_x;
+            let bbox_h = max_y - min_y;
+            let normalize = |v: f64| if v > 1.0 { v / 100.0 } else { v };
+            let gx1 = min_x + normalize(gradient.x1) * bbox_w;
+            let gy1 = min_y + normalize(gradient.y1) * bbox_h;
+            let gx2 = min_x + normalize(gradient.x2) * bbox_w;
+            let gy2 = min_y + normalize(gradient.y2) * bbox_h;
+            let gcx = min_x + normalize(gradient.cx) * bbox_w;
+            let gcy = min_y + normalize(gradient.cy) * bbox_h;
+            let gr = normalize(gradient.r) * bbox_w.max(bbox_h);
+            (gx1, gy1, gx2, gy2, gcx, gcy, gr)
+        };
+
+        // Precompute linear gradient direction
+        let grad_dx = gx2 - gx1;
+        let grad_dy = gy2 - gy1;
+        let grad_len_sq = grad_dx * grad_dx + grad_dy * grad_dy;
+
+        // Scanline fill with gradient
+        for y in y_start..y_end {
+            let scan_y = y as f64 + 0.5;
+            let mut intersections: Vec<(f64, i32)> = Vec::new();
+
+            for &(x1, y1, x2, y2, dir) in &edges {
+                if y1 <= scan_y && scan_y < y2 {
+                    let t = (scan_y - y1) / (y2 - y1);
+                    let x = x1 + t * (x2 - x1);
+                    intersections.push((x, dir));
+                }
+            }
+
+            intersections.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+            match fill_rule {
+                FillRule::NonZero => {
+                    let mut winding = 0;
+                    let mut last_x: Option<f64> = None;
+
+                    for (x, dir) in intersections {
+                        if winding != 0 {
+                            if let Some(lx) = last_x {
+                                let x_s = (lx.floor() as usize).max(x_start);
+                                let x_e = (x.ceil() as usize).min(x_end);
+                                for px in x_s..x_e {
+                                    let t = if gradient.is_radial {
+                                        // Radial gradient: distance from center
+                                        let dx = px as f64 + 0.5 - gcx;
+                                        let dy = scan_y - gcy;
+                                        let dist = (dx * dx + dy * dy).sqrt();
+                                        if gr > 0.0 { dist / gr } else { 0.0 }
+                                    } else {
+                                        // Linear gradient: project onto gradient line
+                                        if grad_len_sq > 0.001 {
+                                            let dx = px as f64 + 0.5 - gx1;
+                                            let dy = scan_y - gy1;
+                                            (dx * grad_dx + dy * grad_dy) / grad_len_sq
+                                        } else {
+                                            0.0
+                                        }
+                                    };
+                                    let mut color = Self::interpolate_gradient_color(&gradient.stops, t);
+                                    color.a = (color.a as f64 * opacity) as u8;
+                                    self.blend_pixel(px, y, color);
+                                }
+                            }
+                        }
+                        winding += dir;
+                        last_x = Some(x);
+                    }
+                }
+                FillRule::EvenOdd => {
+                    let mut inside = false;
+                    let mut last_x: Option<f64> = None;
+
+                    for (x, _) in intersections {
+                        if inside {
+                            if let Some(lx) = last_x {
+                                let x_s = (lx.floor() as usize).max(x_start);
+                                let x_e = (x.ceil() as usize).min(x_end);
+                                for px in x_s..x_e {
+                                    let t = if gradient.is_radial {
+                                        let dx = px as f64 + 0.5 - gcx;
+                                        let dy = scan_y - gcy;
+                                        let dist = (dx * dx + dy * dy).sqrt();
+                                        if gr > 0.0 { dist / gr } else { 0.0 }
+                                    } else {
+                                        if grad_len_sq > 0.001 {
+                                            let dx = px as f64 + 0.5 - gx1;
+                                            let dy = scan_y - gy1;
+                                            (dx * grad_dx + dy * grad_dy) / grad_len_sq
+                                        } else {
+                                            0.0
+                                        }
+                                    };
+                                    let mut color = Self::interpolate_gradient_color(&gradient.stops, t);
+                                    color.a = (color.a as f64 * opacity) as u8;
+                                    self.blend_pixel(px, y, color);
+                                }
+                            }
+                        }
+                        inside = !inside;
+                        last_x = Some(x);
+                    }
+                }
+            }
+        }
+    }
+
     fn downsample(&self, out_width: usize, out_height: usize) -> Vec<u8> {
         if self.antialias == 1 {
             return self.buffer.clone();
@@ -388,6 +597,11 @@ fn parse_color(s: &str) -> Option<Color> {
 
     if s == "none" || s == "transparent" {
         return None;
+    }
+
+    // currentColor defaults to black (the inherited text color)
+    if s == "currentColor" {
+        return Some(Color::from_rgba(0, 0, 0, 255));
     }
 
     if s.starts_with('#') {
@@ -741,7 +955,7 @@ fn path_to_polygons(d: &str, transform: &Transform) -> Vec<Vec<(f64, f64)>> {
                 current_y = y;
             }
             crate::path::PathCmd::Z => {
-                if current_poly.len() >= 3 {
+                if current_poly.len() >= 2 {
                     polygons.push(current_poly);
                 }
                 current_poly = Vec::new();
@@ -750,11 +964,27 @@ fn path_to_polygons(d: &str, transform: &Transform) -> Vec<Vec<(f64, f64)>> {
         }
     }
 
-    if current_poly.len() >= 3 {
+    if current_poly.len() >= 2 {
         polygons.push(current_poly);
     }
 
     polygons
+}
+
+/// Find an element by ID in the document tree
+fn find_element_by_id<'a>(root: &Node<'a, '_>, id: &str) -> Option<Node<'a, 'a>> {
+    // First check if root matches
+    if root.attribute("id") == Some(id) {
+        return Some(*root);
+    }
+
+    // Search descendants
+    for desc in root.descendants() {
+        if desc.attribute("id") == Some(id) {
+            return Some(desc);
+        }
+    }
+    None
 }
 
 /// Maximum recursion depth to prevent infinite loops
@@ -767,7 +997,7 @@ const MAX_SHAPES: usize = 500;
 const MAX_POLYGON_POINTS: usize = 10000;
 
 /// Render a node and its children
-fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transform, parent_style: &Style, depth: usize) {
+fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transform, parent_style: &Style, depth: usize, root: &Node) {
     // Prevent infinite recursion
     if depth > MAX_DEPTH {
         return;
@@ -819,7 +1049,7 @@ fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transfor
         "g" | "svg" => {
             // Group - render children
             for child in node.children() {
-                render_node(ctx, &child, &transform, &style, depth + 1);
+                render_node(ctx, &child, &transform, &style, depth + 1, root);
             }
         }
         "path" => {
@@ -846,13 +1076,111 @@ fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transfor
             render_polygon_elem(ctx, node, &transform, &style);
         }
         "use" => {
-            // Skip use elements for now (would need to resolve href and render referenced element)
-            // TODO: implement use element resolution
+            // Resolve href attribute (try both href and xlink:href)
+            let href = node.attribute("href")
+                .or_else(|| node.attribute(("http://www.w3.org/1999/xlink", "href")));
+
+            if let Some(href) = href {
+                // Strip # prefix if present
+                let target_id = href.trim_start_matches('#');
+
+                // Find the referenced element
+                if let Some(target) = find_element_by_id(root, target_id) {
+                    // Get x/y offset for positioning
+                    let x = node.attribute("x")
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let y = node.attribute("y")
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+
+                    // Create transform with x/y translation
+                    let use_transform = if x != 0.0 || y != 0.0 {
+                        let translate = Transform {
+                            a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: x, f: y,
+                        };
+                        transform.multiply(&translate)
+                    } else {
+                        transform.clone()
+                    };
+
+                    // For symbol elements, render their children with symbol's viewBox
+                    // For other elements, render directly
+                    let target_tag = target.tag_name().name();
+                    if target_tag == "symbol" {
+                        // Get use element width/height (defaults to symbol or parent viewBox)
+                        let use_width: f64 = node.attribute("width")
+                            .and_then(|s| s.trim_end_matches("px").parse().ok())
+                            .unwrap_or(0.0);
+                        let use_height: f64 = node.attribute("height")
+                            .and_then(|s| s.trim_end_matches("px").parse().ok())
+                            .unwrap_or(0.0);
+
+                        // Parse symbol viewBox if present
+                        if let Some(viewbox_str) = target.attribute("viewBox") {
+                            let parts: Vec<f64> = viewbox_str
+                                .split(|c: char| c == ',' || c.is_whitespace())
+                                .filter_map(|s| s.trim().parse().ok())
+                                .collect();
+                            if parts.len() == 4 {
+                                let (vb_x, vb_y, vb_w, vb_h) = (parts[0], parts[1], parts[2], parts[3]);
+
+                                // Get parent viewport size from root SVG viewBox
+                                // (use defaults to 100% of viewport if no width/height specified)
+                                let (viewport_w, viewport_h) = root.attribute("viewBox")
+                                    .and_then(|vb| {
+                                        let p: Vec<f64> = vb.split(|c: char| c == ',' || c.is_whitespace())
+                                            .filter_map(|s| s.trim().parse().ok())
+                                            .collect();
+                                        if p.len() == 4 { Some((p[2], p[3])) } else { None }
+                                    })
+                                    .unwrap_or((vb_w, vb_h));
+
+                                // Determine target size (from use element or default to viewport)
+                                let target_w = if use_width > 0.0 { use_width } else { viewport_w };
+                                let target_h = if use_height > 0.0 { use_height } else { viewport_h };
+
+                                // Calculate scale to map viewBox to target size
+                                let scale_x = target_w / vb_w;
+                                let scale_y = target_h / vb_h;
+                                let scale = scale_x.min(scale_y);
+
+                                // Offset to center the scaled content (for preserveAspectRatio=xMidYMid)
+                                let scaled_w = vb_w * scale;
+                                let scaled_h = vb_h * scale;
+                                let center_offset_x = (target_w - scaled_w) / 2.0;
+                                let center_offset_y = (target_h - scaled_h) / 2.0;
+
+                                // The viewBox transform: translate to account for viewBox origin, then scale
+                                // Points at (vb_x, vb_y) should map to (0, 0) after scaling
+                                let symbol_transform = use_transform
+                                    .multiply(&Transform::translate(center_offset_x, center_offset_y))
+                                    .multiply(&Transform::scale(scale, scale))
+                                    .multiply(&Transform::translate(-vb_x, -vb_y));
+
+                                for child in target.children() {
+                                    render_node(ctx, &child, &symbol_transform, &style, depth + 1, root);
+                                }
+                            } else {
+                                for child in target.children() {
+                                    render_node(ctx, &child, &use_transform, &style, depth + 1, root);
+                                }
+                            }
+                        } else {
+                            for child in target.children() {
+                                render_node(ctx, &child, &use_transform, &style, depth + 1, root);
+                            }
+                        }
+                    } else {
+                        render_node(ctx, &target, &use_transform, &style, depth + 1, root);
+                    }
+                }
+            }
         }
         "a" => {
             // Links - render children
             for child in node.children() {
-                render_node(ctx, &child, &transform, &style, depth + 1);
+                render_node(ctx, &child, &transform, &style, depth + 1, root);
             }
         }
         _ => {
@@ -938,6 +1266,90 @@ fn collect_defs(ctx: &mut RenderContext, node: &Node) {
     }
 }
 
+/// Recursively collect all gradients from the entire document tree
+fn collect_all_gradients(ctx: &mut RenderContext, node: &Node) {
+    if !node.is_element() {
+        return;
+    }
+
+    let tag = node.tag_name().name();
+
+    // Collect gradients regardless of where they appear
+    if tag == "linearGradient" || tag == "radialGradient" {
+        if let Some(id) = node.attribute("id") {
+            let is_radial = tag == "radialGradient";
+
+            let mut grad = GradientDef {
+                id: id.to_string(),
+                is_radial,
+                x1: node.attribute("x1").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(0.0),
+                y1: node.attribute("y1").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(0.0),
+                x2: node.attribute("x2").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(100.0),
+                y2: node.attribute("y2").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(0.0),
+                cx: node.attribute("cx").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(50.0),
+                cy: node.attribute("cy").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(50.0),
+                r: node.attribute("r").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(50.0),
+                fx: node.attribute("fx").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(50.0),
+                fy: node.attribute("fy").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(50.0),
+                stops: Vec::new(),
+                user_space: node.attribute("gradientUnits") == Some("userSpaceOnUse"),
+                transform: node.attribute("gradientTransform")
+                    .map(parse_transform)
+                    .unwrap_or_default(),
+            };
+
+            // Collect stops
+            for stop in node.children() {
+                if stop.is_element() && stop.tag_name().name() == "stop" {
+                    let offset: f64 = stop.attribute("offset")
+                        .and_then(|s| s.trim_end_matches('%').parse().ok())
+                        .map(|v: f64| if v > 1.0 { v / 100.0 } else { v })
+                        .unwrap_or(0.0);
+
+                    let mut color = Color::from_rgba(0, 0, 0, 255);
+                    let mut opacity = 1.0f64;
+
+                    if let Some(style) = stop.attribute("style") {
+                        for part in style.split(';') {
+                            if let Some(colon) = part.find(':') {
+                                let prop = part[..colon].trim();
+                                let val = part[colon + 1..].trim();
+                                if prop == "stop-color" {
+                                    if let Some(c) = parse_color(val) {
+                                        color = c;
+                                    }
+                                } else if prop == "stop-opacity" {
+                                    if let Ok(o) = val.parse() {
+                                        opacity = o;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(c) = stop.attribute("stop-color").and_then(parse_color) {
+                        color = c;
+                    }
+                    if let Some(o) = stop.attribute("stop-opacity").and_then(|s| s.parse().ok()) {
+                        opacity = o;
+                    }
+
+                    let a = (color.a as f64 * opacity) as u8;
+                    grad.stops.push((offset, color.r, color.g, color.b, a));
+                }
+            }
+
+            ctx.gradients.insert(id.to_string(), grad);
+        }
+        return; // Don't recurse into gradient children (stops already handled)
+    }
+
+    // Recurse into children
+    for child in node.children() {
+        collect_all_gradients(ctx, &child);
+    }
+}
+
 fn render_path(ctx: &mut RenderContext, d: &str, transform: &Transform, style: &Style) {
     // Check shape limit
     if !ctx.can_render_more() {
@@ -960,9 +1372,12 @@ fn render_path(ctx: &mut RenderContext, d: &str, transform: &Transform, style: &
                     c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
                     ctx.fill_polygon(poly, c, style.fill_rule);
                 }
-                Paint::Gradient(_id) => {
-                    // TODO: gradient fill
-                    ctx.fill_polygon(poly, Color::from_rgba(128, 128, 128, 255), style.fill_rule);
+                Paint::Gradient(id) => {
+                    // Look up gradient and fill
+                    if let Some(gradient) = ctx.gradients.get(id).cloned() {
+                        let opacity = style.fill_opacity * style.opacity;
+                        ctx.fill_polygon_gradient(poly, &gradient, transform, style.fill_rule, opacity);
+                    }
                 }
                 Paint::None => {}
             }
@@ -981,14 +1396,16 @@ fn render_path(ctx: &mut RenderContext, d: &str, transform: &Transform, style: &
                     if poly.len() > MAX_POLYGON_POINTS {
                         continue;
                     }
-                    render_stroke(ctx, poly, c, style.stroke_width * transform.a.abs());
+                    // Paths are typically open (not closed) unless explicitly looped
+                    render_stroke(ctx, poly, c, style.stroke_width * transform.a.abs(),
+                        style.stroke_linecap, style.stroke_linejoin, false);
                 }
             }
         }
     }
 }
 
-fn render_stroke(ctx: &mut RenderContext, points: &[(f64, f64)], color: Color, width: f64) {
+fn render_stroke(ctx: &mut RenderContext, points: &[(f64, f64)], color: Color, width: f64, linecap: LineCap, linejoin: LineJoin, closed: bool) {
     if points.len() < 2 || color.a == 0 {
         return;
     }
@@ -996,7 +1413,8 @@ fn render_stroke(ctx: &mut RenderContext, points: &[(f64, f64)], color: Color, w
     let half_width = width / 2.0;
 
     // Draw stroke as thick line segments
-    for i in 0..points.len() {
+    let n = if closed { points.len() } else { points.len() - 1 };
+    for i in 0..n {
         let j = (i + 1) % points.len();
         let (x1, y1) = points[i];
         let (x2, y2) = points[j];
@@ -1020,6 +1438,84 @@ fn render_stroke(ctx: &mut RenderContext, points: &[(f64, f64)], color: Color, w
 
         ctx.fill_polygon(&quad, color, FillRule::NonZero);
     }
+
+    // Draw round linejoins at internal vertices
+    if matches!(linejoin, LineJoin::Round) && points.len() > 2 {
+        let start = if closed { 0 } else { 1 };
+        let end = if closed { points.len() } else { points.len() - 1 };
+        for i in start..end {
+            let (cx, cy) = points[i];
+            draw_circle(ctx, cx, cy, half_width, color);
+        }
+    }
+
+    // Draw linecaps on open paths
+    if !closed {
+        match linecap {
+            LineCap::Round => {
+                // Draw circles at start and end
+                let (x1, y1) = points[0];
+                let (x2, y2) = points[points.len() - 1];
+                draw_circle(ctx, x1, y1, half_width, color);
+                draw_circle(ctx, x2, y2, half_width, color);
+            }
+            LineCap::Square => {
+                // Extend the stroke by half_width at each end
+                if points.len() >= 2 {
+                    // Start cap
+                    let (x1, y1) = points[0];
+                    let (x2, y2) = points[1];
+                    let dx = x2 - x1;
+                    let dy = y2 - y1;
+                    let len = (dx * dx + dy * dy).sqrt();
+                    if len > 0.001 {
+                        let ext_x = -dx / len * half_width;
+                        let ext_y = -dy / len * half_width;
+                        let perp_x = -dy / len * half_width;
+                        let perp_y = dx / len * half_width;
+                        let cap = vec![
+                            (x1 + perp_x, y1 + perp_y),
+                            (x1 - perp_x, y1 - perp_y),
+                            (x1 + ext_x - perp_x, y1 + ext_y - perp_y),
+                            (x1 + ext_x + perp_x, y1 + ext_y + perp_y),
+                        ];
+                        ctx.fill_polygon(&cap, color, FillRule::NonZero);
+                    }
+                    // End cap
+                    let (x1, y1) = points[points.len() - 2];
+                    let (x2, y2) = points[points.len() - 1];
+                    let dx = x2 - x1;
+                    let dy = y2 - y1;
+                    let len = (dx * dx + dy * dy).sqrt();
+                    if len > 0.001 {
+                        let ext_x = dx / len * half_width;
+                        let ext_y = dy / len * half_width;
+                        let perp_x = -dy / len * half_width;
+                        let perp_y = dx / len * half_width;
+                        let cap = vec![
+                            (x2 + perp_x, y2 + perp_y),
+                            (x2 - perp_x, y2 - perp_y),
+                            (x2 + ext_x - perp_x, y2 + ext_y - perp_y),
+                            (x2 + ext_x + perp_x, y2 + ext_y + perp_y),
+                        ];
+                        ctx.fill_polygon(&cap, color, FillRule::NonZero);
+                    }
+                }
+            }
+            LineCap::Butt => {}
+        }
+    }
+}
+
+fn draw_circle(ctx: &mut RenderContext, cx: f64, cy: f64, radius: f64, color: Color) {
+    // Create circle polygon
+    let segments = 16;
+    let mut circle: Vec<(f64, f64)> = Vec::with_capacity(segments);
+    for i in 0..segments {
+        let angle = 2.0 * std::f64::consts::PI * (i as f64) / (segments as f64);
+        circle.push((cx + radius * angle.cos(), cy + radius * angle.sin()));
+    }
+    ctx.fill_polygon(&circle, color, FillRule::NonZero);
 }
 
 fn render_rect(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style) {
@@ -1034,18 +1530,76 @@ fn render_rect(ctx: &mut RenderContext, node: &Node, transform: &Transform, styl
         return;
     }
 
-    let corners = vec![
-        transform.apply(x, y),
-        transform.apply(x + w, y),
-        transform.apply(x + w, y + h),
-        transform.apply(x, y + h),
-    ];
+    // Parse rx/ry for rounded corners
+    let mut rx: f64 = node.attribute("rx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let mut ry: f64 = node.attribute("ry").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+
+    // Per SVG spec: if only rx or ry is specified, the other defaults to it
+    if rx > 0.0 && ry == 0.0 { ry = rx; }
+    if ry > 0.0 && rx == 0.0 { rx = ry; }
+
+    // Clamp to half width/height
+    rx = rx.min(w / 2.0);
+    ry = ry.min(h / 2.0);
+
+    let corners = if rx > 0.0 && ry > 0.0 {
+        // Rounded rectangle
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        let segments = 8; // Segments per corner
+
+        // Top-right corner
+        for i in 0..=segments {
+            let angle = std::f64::consts::PI * 1.5 + (std::f64::consts::PI / 2.0) * (i as f64 / segments as f64);
+            let px = x + w - rx + rx * angle.cos();
+            let py = y + ry + ry * angle.sin();
+            pts.push(transform.apply(px, py));
+        }
+        // Bottom-right corner
+        for i in 0..=segments {
+            let angle = (std::f64::consts::PI / 2.0) * (i as f64 / segments as f64);
+            let px = x + w - rx + rx * angle.cos();
+            let py = y + h - ry + ry * angle.sin();
+            pts.push(transform.apply(px, py));
+        }
+        // Bottom-left corner
+        for i in 0..=segments {
+            let angle = std::f64::consts::PI / 2.0 + (std::f64::consts::PI / 2.0) * (i as f64 / segments as f64);
+            let px = x + rx + rx * angle.cos();
+            let py = y + h - ry + ry * angle.sin();
+            pts.push(transform.apply(px, py));
+        }
+        // Top-left corner
+        for i in 0..=segments {
+            let angle = std::f64::consts::PI + (std::f64::consts::PI / 2.0) * (i as f64 / segments as f64);
+            let px = x + rx + rx * angle.cos();
+            let py = y + ry + ry * angle.sin();
+            pts.push(transform.apply(px, py));
+        }
+        pts
+    } else {
+        // Regular rectangle
+        vec![
+            transform.apply(x, y),
+            transform.apply(x + w, y),
+            transform.apply(x + w, y + h),
+            transform.apply(x, y + h),
+        ]
+    };
 
     if let Some(ref fill) = style.fill {
-        if let Paint::Color(color) = fill {
-            let mut c = *color;
-            c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
-            ctx.fill_polygon(&corners, c, style.fill_rule);
+        match fill {
+            Paint::Color(color) => {
+                let mut c = *color;
+                c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
+                ctx.fill_polygon(&corners, c, style.fill_rule);
+            }
+            Paint::Gradient(id) => {
+                if let Some(gradient) = ctx.gradients.get(id).cloned() {
+                    let opacity = style.fill_opacity * style.opacity;
+                    ctx.fill_polygon_gradient(&corners, &gradient, transform, style.fill_rule, opacity);
+                }
+            }
+            Paint::None => {}
         }
     }
 
@@ -1054,7 +1608,8 @@ fn render_rect(ctx: &mut RenderContext, node: &Node, transform: &Transform, styl
             if let Paint::Color(color) = stroke {
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
-                render_stroke(ctx, &corners, c, style.stroke_width * transform.a.abs());
+                render_stroke(ctx, &corners, c, style.stroke_width * transform.a.abs(),
+                    style.stroke_linecap, style.stroke_linejoin, true);
             }
         }
     }
@@ -1082,10 +1637,19 @@ fn render_circle(ctx: &mut RenderContext, node: &Node, transform: &Transform, st
     }
 
     if let Some(ref fill) = style.fill {
-        if let Paint::Color(color) = fill {
-            let mut c = *color;
-            c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
-            ctx.fill_polygon(&points, c, style.fill_rule);
+        match fill {
+            Paint::Color(color) => {
+                let mut c = *color;
+                c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
+                ctx.fill_polygon(&points, c, style.fill_rule);
+            }
+            Paint::Gradient(id) => {
+                if let Some(gradient) = ctx.gradients.get(id).cloned() {
+                    let opacity = style.fill_opacity * style.opacity;
+                    ctx.fill_polygon_gradient(&points, &gradient, transform, style.fill_rule, opacity);
+                }
+            }
+            Paint::None => {}
         }
     }
 
@@ -1094,7 +1658,8 @@ fn render_circle(ctx: &mut RenderContext, node: &Node, transform: &Transform, st
             if let Paint::Color(color) = stroke {
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
-                render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs());
+                render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs(),
+                    style.stroke_linecap, style.stroke_linejoin, true);
             }
         }
     }
@@ -1122,10 +1687,19 @@ fn render_ellipse(ctx: &mut RenderContext, node: &Node, transform: &Transform, s
     }
 
     if let Some(ref fill) = style.fill {
-        if let Paint::Color(color) = fill {
-            let mut c = *color;
-            c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
-            ctx.fill_polygon(&points, c, style.fill_rule);
+        match fill {
+            Paint::Color(color) => {
+                let mut c = *color;
+                c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
+                ctx.fill_polygon(&points, c, style.fill_rule);
+            }
+            Paint::Gradient(id) => {
+                if let Some(gradient) = ctx.gradients.get(id).cloned() {
+                    let opacity = style.fill_opacity * style.opacity;
+                    ctx.fill_polygon_gradient(&points, &gradient, transform, style.fill_rule, opacity);
+                }
+            }
+            Paint::None => {}
         }
     }
 
@@ -1134,7 +1708,8 @@ fn render_ellipse(ctx: &mut RenderContext, node: &Node, transform: &Transform, s
             if let Paint::Color(color) = stroke {
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
-                render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs());
+                render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs(),
+                    style.stroke_linecap, style.stroke_linejoin, true);
             }
         }
     }
@@ -1155,7 +1730,8 @@ fn render_line(ctx: &mut RenderContext, node: &Node, transform: &Transform, styl
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
                 let p1 = transform.apply(x1, y1);
                 let p2 = transform.apply(x2, y2);
-                render_stroke(ctx, &[p1, p2], c, style.stroke_width * transform.a.abs());
+                render_stroke(ctx, &[p1, p2], c, style.stroke_width * transform.a.abs(),
+                    style.stroke_linecap, style.stroke_linejoin, false);
             }
         }
     }
@@ -1175,10 +1751,9 @@ fn render_polyline(ctx: &mut RenderContext, node: &Node, transform: &Transform, 
             if let Paint::Color(color) = stroke {
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
-                // Open polyline - stroke only
-                for i in 0..points.len() - 1 {
-                    render_stroke(ctx, &[points[i], points[i + 1]], c, style.stroke_width * transform.a.abs());
-                }
+                // Open polyline - render as single stroke
+                render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs(),
+                    style.stroke_linecap, style.stroke_linejoin, false);
             }
         }
     }
@@ -1194,10 +1769,19 @@ fn render_polygon_elem(ctx: &mut RenderContext, node: &Node, transform: &Transfo
     }
 
     if let Some(ref fill) = style.fill {
-        if let Paint::Color(color) = fill {
-            let mut c = *color;
-            c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
-            ctx.fill_polygon(&points, c, style.fill_rule);
+        match fill {
+            Paint::Color(color) => {
+                let mut c = *color;
+                c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
+                ctx.fill_polygon(&points, c, style.fill_rule);
+            }
+            Paint::Gradient(id) => {
+                if let Some(gradient) = ctx.gradients.get(id).cloned() {
+                    let opacity = style.fill_opacity * style.opacity;
+                    ctx.fill_polygon_gradient(&points, &gradient, transform, style.fill_rule, opacity);
+                }
+            }
+            Paint::None => {}
         }
     }
 
@@ -1206,7 +1790,8 @@ fn render_polygon_elem(ctx: &mut RenderContext, node: &Node, transform: &Transfo
             if let Paint::Color(color) = stroke {
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
-                render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs());
+                render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs(),
+                    style.stroke_linecap, style.stroke_linejoin, true);
             }
         }
     }
@@ -1335,10 +1920,17 @@ impl VectorStagRenderer {
         let base_transform = Transform::translate(offset_x, offset_y)
             .multiply(&Transform::scale(scale_factor, scale_factor));
 
-        // Render tree
-        let default_style = Style::new();
+        // First pass: collect all gradients from the entire document
         for child in root.children() {
-            render_node(&mut ctx, &child, &base_transform, &default_style, 0);
+            collect_all_gradients(&mut ctx, &child);
+        }
+
+        // Second pass: render tree
+        // Parse style from root SVG element (many SVGs like Lucide define stroke/fill on root)
+        let base_style = Style::new();
+        let root_style = parse_style(&root, &base_style);
+        for child in root.children() {
+            render_node(&mut ctx, &child, &base_transform, &root_style, 0, &root);
         }
 
         // Downsample
