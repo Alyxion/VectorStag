@@ -1088,3 +1088,19 @@ pub fn canvas_masked_blit_aa(
 
     Ok(())
 }
+
+
+/// Register canvas module functions
+pub fn register(m: &pyo3::prelude::Bound<'_, pyo3::prelude::PyModule>) -> pyo3::PyResult<()> {
+    m.add_function(pyo3::wrap_pyfunction!(canvas_fill_polygon_aa, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(canvas_fill_multi_polygon_aa, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(canvas_fill_polygon_linear_gradient_aa, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(canvas_fill_polygon_radial_gradient_aa, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(canvas_fill_rect_aa, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(canvas_fill_circle_aa, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(canvas_fill_ellipse_aa, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(canvas_stroke_line_aa, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(canvas_masked_blit_aa, m)?)?;
+    Ok(())
+}
+

@@ -1,5 +1,12 @@
 # VectorStag Development Notes
 
+The goal is to development an SVG rendering Library in Python and RUST which is in regards
+of quality on par with the libraries RESVG and Cairo. For rust we are building the sub package
+vectorstag_rust. We can benchmark this quality with the tools below.
+
+When we are working on a larger plan we always document our steps in plan.md. We are using
+the poetry package manager for our environment.
+
 ## Rendering Accuracy Notes
 
 ### Verified with resvg (Rust-based accurate renderer)
@@ -7,99 +14,29 @@ We installed resvg-python as an alternative reference renderer. resvg confirms:
 - **clippath.svg**: Our RED rendering is correct. CairoSVG's BLACK is wrong.
 - **lineargradient1/2.svg**: Our gap rendering is correct. CairoSVG filling it is wrong.
 
-### clippath.svg - IGNORE IN RATING
-Our clippath rendering is **CORRECT** (verified: Chrome, Firefox, resvg).
-CairoSVG renders it incorrectly (shows black instead of red for intersection).
-
-### lineargradient1/2.svg - IGNORE IN RATING
-The SVG has a **real gap** (~3 units) between adjacent rectangles.
-Our rendering is **CORRECT** (verified: Chrome, Firefox, resvg).
-CairoSVG incorrectly fills this gap.
-
-### Known CairoSVG Bugs/Quirks
-- CairoSVG clippath intersection rendering is buggy (renders black instead of red)
-- CairoSVG fills gaps between adjacent elements that don't exist in SVG
-- CairoSVG doesn't properly apply Gaussian blur filters
-- CairoSVG stretches content when viewBox has NEGATIVE origin coordinates (e.g., BR.svg)
-  - With positive viewBox origin: preserves aspect ratio
-  - With negative viewBox origin: stretches to fill output dimensions
-
-## Completed Fixes
-- **android.svg**: Fixed hard edges and gaps in stroke joins (Segment+Join approach). Score: 99.9%+
-- **paths-data-08/09-t**: Fixed evenodd multi-polygon fill (87% → 97%)
-- Triangle cutout now works correctly with fill-rule="evenodd"
-
-## BR.svg (Brazilian Flag) - IGNORE IN RATING
-Our rendering is **CORRECT**. CairoSVG sizes it incorrectly.
-When in doubt, use resvg as the reference renderer.
-
-## Comparison Settings
-- Use at least 3x resolution for comparisons to preserve details
-- Use resvg as reference when CairoSVG results are questionable
-
-## Flag/Emoji Rendering Issues (To Fix)
-
-### Stars Not Filled (fill-rule issue?)
-- BA.svg: stars should be filled
-- CF.svg: star should be filled
-- CN.svg: star should be filled
-- CU.svg: star should be filled
-- DZ.svg: star should be filled
-- GF.svg: star should be filled
-- GH.svg: star should be filled
-- KM.svg: stars should be filled
-- LY.svg: star should be filled
-
-### Line Thickness Issues
-- AF.svg: lack of transparency or too thick lines
-- AR.svg: too thick lines, sun details are finer
-- BL.svg: too thick lines
-
-### Color/Rendering Issues
-- AS.svg: complete failure - eagle on blue flag not visible
-- EC.svg: colors of symbol slightly off
-- GB.svg: Union Jack issues - red bleeding on top/bottom of horizontal red stripes
-- GL.svg: lower half of circle should be white on top of red stripe
-- MX-SON.svg: triangle in center top should be white, not black
-- NP.svg: blue/white triangle on center left where it doesn't belong
-
 ## Tools (Consolidated)
-- `svg_compare.py` - Main comparison tool (prerender, compare, list)
-- `scripts/benchmark.py` - Unified benchmark (all collections + resvg-test-suite)
+- `scripts/benchmark.py` - Full benchmark (all collections + resvg-test-suite)
+- `svg_compare.py` - Main comparison tool for errors on single images
 - `render.py` - Simple single-file rendering
 
 ## Testing
 
-### Quick Regression Check
-```bash
-# Check all icon collections (should maintain 98%+ accuracy)
-python svg_compare.py compare --all
-
-# Expected results:
-# - Flags: 99.9%
-# - Emojis: 99.9%
-# - Material: 99.0%
-# - Lucide: 98.6%
-# - FontAwesome: 100%
-# - W3C: 99.3%
-```
-
 ### Full Benchmark (Collections + resvg-test-suite)
 ```bash
 # Full benchmark with table output
-python scripts/benchmark.py -j 16
+poetry run python scripts/benchmark.py -j 16
 
 # Just icon collections
-python scripts/benchmark.py --collections -j 16
+poetry run python scripts/benchmark.py --collections -j 16
 
 # Just resvg test suite
-python scripts/benchmark.py --resvg -j 16
+poetry run python scripts/benchmark.py --resvg -j 16
 
 # Specific resvg category
-python scripts/benchmark.py --resvg --resvg-category shapes -j 16
+poetry run python scripts/benchmark.py --resvg --resvg-category shapes -j 16
 
 # List available resvg categories
-python scripts/benchmark.py --list-resvg-categories
+poetry run python scripts/benchmark.py --list-resvg-categories
 ```
 
 ## Accuracy Expectations
@@ -112,5 +49,3 @@ python scripts/benchmark.py --list-resvg-categories
 - Use 4-8 workers if memory pressure occurs on complex SVGs: `-j 4` or `-j 8`
 - Use `ProcessPoolExecutor` with `as_completed()` for timeout support
 - Worker timeout is 30 seconds (WORKER_TIMEOUT in svg_compare.py)
-- Parser/renderer have MAX_PARSE_DEPTH=100 and MAX_RENDER_DEPTH=100 limits
-- Circular `<use>` references are detected and prevented via `_use_stack`

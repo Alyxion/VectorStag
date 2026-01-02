@@ -281,6 +281,26 @@ class SVGRenderer:
         """Render an element with a clip path applied."""
         clip_path = ctx.clip_paths[element.clip_path_id]
 
+        # Get element bounding box for objectBoundingBox units (needed for cache key)
+        elem_bbox = self._get_element_bbox(element, ctx.base_transform)
+
+        # Create cache key: (clip_path_id, transform_tuple, units, bbox_tuple)
+        t = element.transform
+        transform_tuple = (t.a, t.b, t.c, t.d, t.e, t.f) if t else (1, 0, 0, 1, 0, 0)
+        if clip_path.units == "objectBoundingBox" and elem_bbox:
+            cache_key = (element.clip_path_id, transform_tuple, "obb", elem_bbox)
+        else:
+            cache_key = (element.clip_path_id, transform_tuple, "usu", None)
+
+        # Check cache for pre-computed mask
+        if cache_key in ctx.clip_mask_cache:
+            mask_arr = ctx.clip_mask_cache[cache_key]
+        else:
+            # Create clip mask and cache it
+            mask = self._create_clip_mask(ctx, clip_path, element.transform, elem_bbox)
+            mask_arr = np.array(mask)  # PIL arrays are already C-contiguous
+            ctx.clip_mask_cache[cache_key] = mask_arr
+
         # Create a temporary image for the element
         temp_image = Image.new("RGBA", ctx.image_size, (0, 0, 0, 0))
         temp_ctx = RenderContext(temp_image, ctx.gradients, ctx.base_transform, ctx.clip_paths, ctx.masks, ctx.filters, ctx.patterns, ctx.elements_by_id, ctx.path_elements)
@@ -295,19 +315,14 @@ class SVGRenderer:
         # Restore clip path
         element.clip_path_id = old_clip_path_id
 
-        # Create clip mask from clip path shapes
-        # Get element bounding box for objectBoundingBox units
-        elem_bbox = self._get_element_bbox(element, ctx.base_transform)
-        mask = self._create_clip_mask(ctx, clip_path, element.transform, elem_bbox)
-
-        # Apply the mask and composite onto main image using Rust (fast path)
+        # Apply the mask and composite onto main image
         if ctx.image_arr is not None:
-            # Use Rust function for combined mask + composite
-            temp_arr = np.ascontiguousarray(np.array(temp_image))
-            mask_arr = np.ascontiguousarray(np.array(mask))
+            # Use Rust function for combined mask + composite (fast path)
+            temp_arr = np.array(temp_image)  # PIL arrays are already C-contiguous
             vectorstag_rust.apply_mask_and_composite(ctx.image_arr, temp_arr, mask_arr, 0, 0)
         else:
-            # Fallback to PIL (slower)
+            # Fallback: PIL-based mask application
+            mask = Image.fromarray(mask_arr)
             temp_image.putalpha(ImageChops.multiply(temp_image.split()[3], mask))
             self._alpha_composite(ctx, temp_image, 0, 0)
 
@@ -1112,18 +1127,49 @@ class SVGRenderer:
             combined = transform.multiply(element.transform)
             xs, ys = [], []
             for cmd in element.commands:
-                if hasattr(cmd, 'x'):
+                if isinstance(cmd, tuple) and len(cmd) >= 3:
+                    # Commands are tuples: ('M', x, y, ...), ('C', x, y, x1, y1, x2, y2), etc.
+                    cmd_type = cmd[0]
+                    if cmd_type in ('M', 'L', 'T'):
+                        tx, ty = combined.apply(cmd[1], cmd[2])
+                        xs.append(tx)
+                        ys.append(ty)
+                    elif cmd_type in ('C', 'S', 'Q'):
+                        # Cubic/quadratic curves: include all control points for bbox
+                        for i in range(1, len(cmd) - 1, 2):
+                            if i + 1 < len(cmd):
+                                tx, ty = combined.apply(cmd[i], cmd[i + 1])
+                                xs.append(tx)
+                                ys.append(ty)
+                    elif cmd_type == 'A':
+                        # Arc: at minimum include endpoint
+                        if len(cmd) >= 8:
+                            tx, ty = combined.apply(cmd[6], cmd[7])
+                            xs.append(tx)
+                            ys.append(ty)
+                    elif cmd_type == 'H':
+                        # Horizontal line: only x changes
+                        if xs:  # Need previous y
+                            tx, _ = combined.apply(cmd[1], 0)
+                            xs.append(tx)
+                    elif cmd_type == 'V':
+                        # Vertical line: only y changes
+                        if ys:  # Need previous x
+                            _, ty = combined.apply(0, cmd[1])
+                            ys.append(ty)
+                elif hasattr(cmd, 'x'):
+                    # Object-style commands (fallback)
                     tx, ty = combined.apply(cmd.x, cmd.y)
                     xs.append(tx)
                     ys.append(ty)
-                if hasattr(cmd, 'x1'):
-                    tx, ty = combined.apply(cmd.x1, cmd.y1)
-                    xs.append(tx)
-                    ys.append(ty)
-                if hasattr(cmd, 'x2'):
-                    tx, ty = combined.apply(cmd.x2, cmd.y2)
-                    xs.append(tx)
-                    ys.append(ty)
+                    if hasattr(cmd, 'x1'):
+                        tx, ty = combined.apply(cmd.x1, cmd.y1)
+                        xs.append(tx)
+                        ys.append(ty)
+                    if hasattr(cmd, 'x2'):
+                        tx, ty = combined.apply(cmd.x2, cmd.y2)
+                        xs.append(tx)
+                        ys.append(ty)
             if xs and ys:
                 return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
             return None
@@ -3501,7 +3547,7 @@ class SVGRenderer:
             ctx.image.alpha_composite(src_img, (dest_x, dest_y))
         elif ctx.image_arr is not None:
             # Use Rust for fast compositing onto numpy array
-            src_arr = np.ascontiguousarray(np.array(src_img))
+            src_arr = np.array(src_img)  # PIL arrays are already C-contiguous
             vectorstag_rust.alpha_composite_inplace(ctx.image_arr, src_arr, dest_x, dest_y)
 
     def _composite_masked_fill(self, ctx: "RenderContext", fill_img: Image.Image,
@@ -4371,6 +4417,8 @@ class RenderContext:
         # Viewport dimensions for userSpaceOnUse gradient percentages
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
+        # Cache for clip masks: key = (clip_path_id, transform_tuple, bbox_tuple)
+        self.clip_mask_cache: dict[tuple, np.ndarray] = {}
 
     @property
     def image_width(self) -> int:

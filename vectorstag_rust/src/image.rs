@@ -3,6 +3,7 @@
 use pyo3::prelude::*;
 use numpy::IntoPyArray;
 use ndarray::Array3;
+use rayon::prelude::*;
 
 /// Alpha blend a single pixel (inline for SIMD-friendly code)
 #[inline(always)]
@@ -301,7 +302,9 @@ pub fn apply_clip_mask<'py>(
 
 /// Apply a grayscale mask and alpha composite onto destination in one pass
 /// Combines apply_clip_mask + alpha_composite_inplace for clip path rendering
+/// Optional bounds (min_x, min_y, max_x, max_y) to limit processing region
 #[pyfunction]
+#[pyo3(signature = (dst, src, mask, offset_x, offset_y, bounds=None))]
 pub fn apply_mask_and_composite<'py>(
     _py: Python<'py>,
     mut dst: numpy::PyReadwriteArray3<'py, u8>,
@@ -309,6 +312,7 @@ pub fn apply_mask_and_composite<'py>(
     mask: numpy::PyReadonlyArray2<'py, u8>,
     offset_x: i32,
     offset_y: i32,
+    bounds: Option<(i32, i32, i32, i32)>,
 ) {
     let src_arr = src.as_array();
     let mask_arr = mask.as_array();
@@ -323,10 +327,28 @@ pub fn apply_mask_and_composite<'py>(
         return;
     }
 
-    let start_x = offset_x.max(0) as usize;
-    let start_y = offset_y.max(0) as usize;
-    let end_x = ((offset_x + src_w as i32) as usize).min(dst_w);
-    let end_y = ((offset_y + src_h as i32) as usize).min(dst_h);
+    // Calculate processing bounds
+    let (mut start_x, mut start_y, mut end_x, mut end_y) = if let Some((bx1, by1, bx2, by2)) = bounds {
+        // Use provided bounds, clamped to valid range
+        (
+            (bx1.max(0) as usize).max(offset_x.max(0) as usize),
+            (by1.max(0) as usize).max(offset_y.max(0) as usize),
+            ((bx2 as usize).min(dst_w)).min((offset_x + src_w as i32) as usize),
+            ((by2 as usize).min(dst_h)).min((offset_y + src_h as i32) as usize),
+        )
+    } else {
+        (
+            offset_x.max(0) as usize,
+            offset_y.max(0) as usize,
+            ((offset_x + src_w as i32) as usize).min(dst_w),
+            ((offset_y + src_h as i32) as usize).min(dst_h),
+        )
+    };
+
+    // Ensure valid range
+    if start_x >= end_x || start_y >= end_y {
+        return;
+    }
 
     let src_start_x = (-offset_x).max(0) as usize;
     let src_start_y = (-offset_y).max(0) as usize;

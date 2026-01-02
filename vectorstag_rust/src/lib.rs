@@ -7,6 +7,7 @@
 //! - SVG path parsing and curve sampling
 //! - Image operations (compositing, resizing, color space conversion)
 //! - SVG filter primitives (blur, morphology, lighting, etc.)
+//! - CSS selector parsing and matching
 
 use pyo3::prelude::*;
 
@@ -16,6 +17,9 @@ mod gradient;
 mod path;
 mod image;
 mod filters;
+mod css;
+mod canvas;
+mod owned_canvas;
 
 /// A Python module implemented in Rust for fast SVG rendering operations.
 #[pymodule]
@@ -27,5 +31,8 @@ fn vectorstag_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     path::register(m)?;
     image::register(m)?;
     filters::register(m)?;
+    css::register(m)?;
+    canvas::register(m)?;
+    owned_canvas::register(m)?;
     Ok(())
 }

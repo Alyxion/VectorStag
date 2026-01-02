@@ -6,6 +6,12 @@ from dataclasses import dataclass, field
 from typing import Optional, Union
 import math
 
+try:
+    import vectorstag_rust
+    HAS_RUST_CSS = True
+except ImportError:
+    HAS_RUST_CSS = False
+
 # Import from submodules
 from .core.transforms import Transform
 from .parser.elements import (
@@ -382,9 +388,12 @@ class SVGParser:
         self.css_types = {}  # Type selector CSS rules
         self.css_attr_selectors = {}  # Attribute selector CSS rules [attr] or [attr=value]
         self.css_rules = []  # Complex CSS rules: (selector, properties, specificity, order)
+        self.css_rules_props = []  # Just the properties dict for each rule (for Rust matcher)
         self.css_rule_order = 0  # For stable ordering of rules with equal specificity
         self.elements_by_id = {}  # For feImage element references
         self.path_data_by_id = {}  # For textPath references
+        # Rust CSS matcher for fast selector matching
+        self._css_matcher = vectorstag_rust.CssMatcher() if HAS_RUST_CSS else None
 
         # Parse CSS from <style> blocks
         self._parse_css_styles(root)
@@ -505,11 +514,15 @@ class SVGParser:
             # Calculate specificity: (ids, classes+attrs, elements)
             specificity = self._calculate_specificity(selector)
 
-            # Pre-parse selector into parts for fast matching (no regex at match time)
-            selector_parts = tuple(_parse_simple_selector(part) for part in selector.split())
+            # Add to Rust CSS matcher (if available)
+            if self._css_matcher is not None:
+                self._css_matcher.add_rule(selector, self.css_rule_order)
+                self.css_rules_props.append(properties)
+            else:
+                # Fallback: Pre-parse selector into parts for Python matching
+                selector_parts = tuple(_parse_simple_selector(part) for part in selector.split())
+                self.css_rules.append((selector_parts, properties, specificity, self.css_rule_order))
 
-            # Store rule with pre-parsed selector, specificity and order
-            self.css_rules.append((selector_parts, properties, specificity, self.css_rule_order))
             self.css_rule_order += 1
 
             # Also store simple selectors for fast lookup
@@ -1667,15 +1680,39 @@ class SVGParser:
                 style_dict[attr] = val
 
         # Apply complex CSS rules sorted by specificity (lowest first, so higher overrides)
-        matching_rules = []
-        for selector_parts, properties, specificity, order in self.css_rules:
-            if self._selector_matches(selector_parts, elem, ancestors):
-                matching_rules.append((specificity, order, properties))
+        if self._css_matcher is not None and self._css_matcher.rule_count() > 0:
+            # Use Rust CSS matcher for fast matching
+            elem_tag = self._strip_ns(elem.tag)
+            elem_id = elem.get('id', '')
+            elem_classes = elem.get('class', '').split() if elem.get('class') else []
+            # Build attrs dict for attribute selectors
+            elem_attrs = {k: v for k, v in elem.attrib.items() if not k.startswith('{')}
+            # Build ancestors list: (tag, id, classes) for each ancestor
+            ancestor_data = []
+            for anc in ancestors:
+                anc_tag = self._strip_ns(anc.tag)
+                anc_id = anc.get('id', '')
+                anc_classes = anc.get('class', '').split() if anc.get('class') else []
+                ancestor_data.append((anc_tag, anc_id, anc_classes))
 
-        # Sort by specificity then order (both ascending, so later/more specific wins)
-        matching_rules.sort(key=lambda x: (x[0], x[1]))
-        for _, _, props in matching_rules:
-            style_dict.update(props)
+            # Get matching rule indices (already sorted by specificity)
+            matching_indices = self._css_matcher.match_element(
+                elem_tag, elem_id, elem_classes, elem_attrs, ancestor_data
+            )
+            # Apply matching rules' properties
+            for idx in matching_indices:
+                style_dict.update(self.css_rules_props[idx])
+        else:
+            # Fallback to Python matching
+            matching_rules = []
+            for selector_parts, properties, specificity, order in self.css_rules:
+                if self._selector_matches(selector_parts, elem, ancestors):
+                    matching_rules.append((specificity, order, properties))
+
+            # Sort by specificity then order (both ascending, so later/more specific wins)
+            matching_rules.sort(key=lambda x: (x[0], x[1]))
+            for _, _, props in matching_rules:
+                style_dict.update(props)
 
         # Legacy: Apply simple CSS selectors (for backward compatibility)
         # These should already be included in css_rules, but keep for now
