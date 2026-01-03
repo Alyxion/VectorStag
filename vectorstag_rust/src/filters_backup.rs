@@ -117,26 +117,6 @@ fn set_sat(r: f32, g: f32, b: f32, s: f32) -> (f32, f32, f32) {
 // Filter Primitives (Core Implementation)
 // ============================================================================
 
-pub fn fe_flood_impl_f32(
-    width: usize,
-    height: usize,
-    r: f32,
-    g: f32,
-    b: f32,
-    a: f32,
-) -> Array3<f32> {
-    let mut dst = Array3::<f32>::zeros((height, width, 4));
-    for y in 0..height {
-        for x in 0..width {
-            dst[[y, x, 0]] = r;
-            dst[[y, x, 1]] = g;
-            dst[[y, x, 2]] = b;
-            dst[[y, x, 3]] = a;
-        }
-    }
-    dst
-}
-
 pub fn fe_flood_impl(width: usize, height: usize, r: u8, g: u8, b: u8, a: u8) -> Array3<u8> {
     let mut pixels = Array3::<u8>::zeros((height, width, 4));
     for y in 0..height {
@@ -161,54 +141,18 @@ pub fn fe_flood<'py>(
     fe_flood_impl(width, height, r, g, b, a).into_pyarray(py)
 }
 
-#[pyfunction]
-pub fn fe_flood_f32<'py>(
-    py: Python<'py>,
-    width: usize,
-    height: usize,
-    r: f32, g: f32, b: f32, a: f32,
-) -> Bound<'py, numpy::PyArray3<f32>> {
-    fe_flood_impl_f32(width, height, r, g, b, a).into_pyarray(py)
-}
-
-pub fn fe_offset_impl_f32(src: &ndarray::ArrayView3<f32>, dx: i32, dy: i32) -> Array3<f32> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    for y in 0..h {
-        let src_y = y as i32 - dy;
-        if src_y < 0 || src_y >= h as i32 {
-            continue;
-        }
-        for x in 0..w {
-            let src_x = x as i32 - dx;
-            if src_x < 0 || src_x >= w as i32 {
-                continue;
-            }
-            for c in 0..4 {
-                dst[[y, x, c]] = src[[src_y as usize, src_x as usize, c]];
-            }
-        }
-    }
-    dst
-}
-
-pub fn fe_offset_impl(src: &ndarray::ArrayView3<u8>, dx: i32, dy: i32) -> Array3<u8> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
+pub fn fe_offset_impl(src_arr: &ndarray::ArrayView3<u8>, dx: i32, dy: i32) -> Array3<u8> {
+    let (h, w, _) = (src_arr.shape()[0], src_arr.shape()[1], src_arr.shape()[2]);
     let mut dst = Array3::<u8>::zeros((h, w, 4));
 
     for y in 0..h {
         let src_y = y as i32 - dy;
-        if src_y < 0 || src_y >= h as i32 {
-            continue;
-        }
+        if src_y < 0 || src_y >= h as i32 { continue; }
         for x in 0..w {
             let src_x = x as i32 - dx;
-            if src_x < 0 || src_x >= w as i32 {
-                continue;
-            }
+            if src_x < 0 || src_x >= w as i32 { continue; }
             for c in 0..4 {
-                dst[[y, x, c]] = src[[src_y as usize, src_x as usize, c]];
+                dst[[y, x, c]] = src_arr[[src_y as usize, src_x as usize, c]];
             }
         }
     }
@@ -225,102 +169,6 @@ pub fn fe_offset<'py>(
 ) -> Bound<'py, numpy::PyArray3<u8>> {
     let src_arr = src.as_array();
     fe_offset_impl(&src_arr, dx, dy).into_pyarray(py)
-}
-
-pub fn fe_blend_impl_f32(arr1: &ndarray::ArrayView3<f32>, arr2: &ndarray::ArrayView3<f32>, mode: u8) -> Array3<f32> {
-    let (h, w, _) = (arr1.shape()[0], arr1.shape()[1], arr1.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    for y in 0..h {
-        for x in 0..w {
-            let pca1_r = arr1[[y, x, 0]];
-            let pca1_g = arr1[[y, x, 1]];
-            let pca1_b = arr1[[y, x, 2]];
-            let a1 = arr1[[y, x, 3]];
-
-            let pca2_r = arr2[[y, x, 0]];
-            let pca2_g = arr2[[y, x, 1]];
-            let pca2_b = arr2[[y, x, 2]];
-            let a2 = arr2[[y, x, 3]];
-
-            let (r1, g1, b1) = if a1 > 0.0 {
-                (pca1_r / a1, pca1_g / a1, pca1_b / a1)
-            } else {
-                (0.0, 0.0, 0.0)
-            };
-
-            let (r2, g2, b2) = if a2 > 0.0 {
-                (pca2_r / a2, pca2_g / a2, pca2_b / a2)
-            } else {
-                (0.0, 0.0, 0.0)
-            };
-
-            let (br, bg, bb) = match mode {
-                12 => {
-                    let (h1, _, _) = rgb_to_hsl(r1, g1, b1);
-                    let (_, s2, l2) = rgb_to_hsl(r2, g2, b2);
-                    hsl_to_rgb(h1, s2, l2)
-                }
-                13 => {
-                    let (_, s1, _) = rgb_to_hsl(r1, g1, b1);
-                    let (h2, _, l2) = rgb_to_hsl(r2, g2, b2);
-                    hsl_to_rgb(h2, s1, l2)
-                }
-                14 => {
-                    let (h1, s1, _) = rgb_to_hsl(r1, g1, b1);
-                    let l2 = luminosity(r2, g2, b2);
-                    let (r, g, b) = hsl_to_rgb(h1, s1, 0.5);
-                    set_lum(r, g, b, l2)
-                }
-                15 => {
-                    let l1 = luminosity(r1, g1, b1);
-                    set_lum(r2, g2, b2, l1)
-                }
-                _ => {
-                    let blend = |c1: f32, c2: f32| -> f32 {
-                        match mode {
-                            0 => c1,
-                            1 => c1 * c2,
-                            2 => 1.0 - (1.0 - c1) * (1.0 - c2),
-                            3 => c1.min(c2),
-                            4 => c1.max(c2),
-                            5 => if c2 < 0.5 { 2.0 * c1 * c2 } else { 1.0 - 2.0 * (1.0 - c1) * (1.0 - c2) },
-                            6 => if c2 == 1.0 { c2 } else { (c1 / (1.0 - c2)).min(1.0) },
-                            7 => if c2 == 0.0 { 0.0 } else { 1.0 - ((1.0 - c1) / c2).min(1.0) },
-                            8 => if c1 < 0.5 { 2.0 * c1 * c2 } else { 1.0 - 2.0 * (1.0 - c1) * (1.0 - c2) },
-                            9 => {
-                                if c1 < 0.5 {
-                                    c2 - (1.0 - 2.0 * c1) * c2 * (1.0 - c2)
-                                } else {
-                                    let d = if c2 < 0.25 {
-                                        ((16.0 * c2 - 12.0) * c2 + 4.0) * c2
-                                    } else {
-                                        c2.sqrt()
-                                    };
-                                    c2 + (2.0 * c1 - 1.0) * (d - c2)
-                                }
-                            }
-                            10 => (c1 - c2).abs(),
-                            11 => c1 + c2 - 2.0 * c1 * c2,
-                            _ => c1,
-                        }
-                    };
-                    (blend(r1, r2), blend(g1, g2), blend(b1, b2))
-                }
-            };
-
-            let out_a = a1 + a2 * (1.0 - a1);
-            let term1 = 1.0 - a2;
-            let term2 = 1.0 - a1;
-            let term3 = a1 * a2;
-
-            dst[[y, x, 0]] = (pca1_r * term1 + pca2_r * term2 + br * term3).clamp(0.0, 1.0);
-            dst[[y, x, 1]] = (pca1_g * term1 + pca2_g * term2 + bg * term3).clamp(0.0, 1.0);
-            dst[[y, x, 2]] = (pca1_b * term1 + pca2_b * term2 + bb * term3).clamp(0.0, 1.0);
-            dst[[y, x, 3]] = out_a.clamp(0.0, 1.0);
-        }
-    }
-    dst
 }
 
 pub fn fe_blend_impl(arr1: &ndarray::ArrayView3<u8>, arr2: &ndarray::ArrayView3<u8>, mode: u8) -> Array3<u8> {
@@ -446,42 +294,6 @@ pub fn fe_blend<'py>(
     fe_blend_impl(&arr1, &arr2, mode).into_pyarray(py)
 }
 
-pub fn fe_composite_impl_f32(arr1: &ndarray::ArrayView3<f32>, arr2: &ndarray::ArrayView3<f32>, operator: u8, k1: f32, k2: f32, k3: f32, k4: f32) -> Array3<f32> {
-    let (h, w, _) = (arr1.shape()[0], arr1.shape()[1], arr1.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    for y in 0..h {
-        for x in 0..w {
-            let a1 = arr1[[y, x, 3]];
-            let a2 = arr2[[y, x, 3]];
-
-            let (fa, fb) = match operator {
-                0 => (1.0, 1.0 - a1),
-                1 => (a2, 0.0),
-                2 => (1.0 - a2, 0.0),
-                3 => (a2, 1.0 - a1),
-                4 => (1.0 - a2, 1.0 - a1),
-                5 => (0.0, 0.0),
-                _ => (1.0, 1.0 - a1),
-            };
-
-            for c in 0..4 {
-                let c1 = arr1[[y, x, c]];
-                let c2 = arr2[[y, x, c]];
-
-                let out = if operator == 5 {
-                    k1 * c1 * c2 + k2 * c1 + k3 * c2 + k4
-                } else {
-                    c1 * fa + c2 * fb
-                };
-
-                dst[[y, x, c]] = out.clamp(0.0, 1.0);
-            }
-        }
-    }
-    dst
-}
-
 pub fn fe_composite_impl(arr1: &ndarray::ArrayView3<u8>, arr2: &ndarray::ArrayView3<u8>, operator: u8, k1: f32, k2: f32, k3: f32, k4: f32) -> Array3<u8> {
     let (h, w, _) = (arr1.shape()[0], arr1.shape()[1], arr1.shape()[2]);
     let mut dst = Array3::<u8>::zeros((h, w, 4));
@@ -532,42 +344,6 @@ pub fn fe_composite<'py>(
     fe_composite_impl(&arr1, &arr2, operator, k1, k2, k3, k4).into_pyarray(py)
 }
 
-pub fn fe_merge_impl_f32(layers: &[ndarray::ArrayView3<f32>]) -> Array3<f32> {
-    if layers.is_empty() {
-        return Array3::<f32>::zeros((1, 1, 4));
-    }
-
-    let first = &layers[0];
-    let (h, w, _) = (first.shape()[0], first.shape()[1], first.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    for y in 0..h {
-        for x in 0..w {
-            for c in 0..4 {
-                dst[[y, x, c]] = first[[y, x, c]];
-            }
-        }
-    }
-
-    for layer in layers.iter().skip(1) {
-        let src = layer;
-        for y in 0..h {
-            for x in 0..w {
-                let src_a = src[[y, x, 3]];
-                let inv_sa = 1.0 - src_a;
-                
-                for c in 0..4 {
-                    let dst_c = dst[[y, x, c]];
-                    let src_c = src[[y, x, c]];
-                    let out = src_c + dst_c * inv_sa;
-                    dst[[y, x, c]] = out.clamp(0.0, 1.0);
-                }
-            }
-        }
-    }
-    dst
-}
-
 pub fn fe_merge_impl(layers: &[ndarray::ArrayView3<u8>]) -> Array3<u8> {
     if layers.is_empty() {
         return Array3::<u8>::zeros((1, 1, 4));
@@ -577,7 +353,7 @@ pub fn fe_merge_impl(layers: &[ndarray::ArrayView3<u8>]) -> Array3<u8> {
     let (h, w, _) = (first.shape()[0], first.shape()[1], first.shape()[2]);
     let mut dst = Array3::<u8>::zeros((h, w, 4));
 
-    // Initialize with first layer
+    // Initialize with first layer (assuming premultiplied)
     for y in 0..h {
         for x in 0..w {
             for c in 0..4 {
@@ -586,20 +362,24 @@ pub fn fe_merge_impl(layers: &[ndarray::ArrayView3<u8>]) -> Array3<u8> {
         }
     }
 
-    // Blend subsequent layers using Over operator (Premultiplied)
+    // Blend subsequent layers using Over operator
     // out = src + dst * (1 - src_a)
     for layer in layers.iter().skip(1) {
         let src = layer;
         for y in 0..h {
             for x in 0..w {
                 let src_a = src[[y, x, 3]] as f32 / 255.0;
-                let inv_sa = 1.0 - src_a;
+                let dst_a = dst[[y, x, 3]] as f32 / 255.0;
                 
-                for c in 0..4 {
-                    let dst_c = dst[[y, x, c]] as f32 / 255.0;
+                let out_a = src_a + dst_a * (1.0 - src_a);
+                dst[[y, x, 3]] = (out_a * 255.0).clamp(0.0, 255.0) as u8;
+
+                for c in 0..3 {
                     let src_c = src[[y, x, c]] as f32 / 255.0;
-                    let out = src_c + dst_c * inv_sa;
-                    dst[[y, x, c]] = (out * 255.0).clamp(0.0, 255.0) as u8;
+                    let dst_c = dst[[y, x, c]] as f32 / 255.0;
+                    
+                    let out_c = src_c + dst_c * (1.0 - src_a);
+                    dst[[y, x, c]] = (out_c * 255.0).clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -615,81 +395,6 @@ pub fn fe_merge<'py>(
 ) -> Bound<'py, numpy::PyArray3<u8>> {
     let layer_views: Vec<_> = layers.iter().map(|l| l.as_array()).collect();
     fe_merge_impl(&layer_views).into_pyarray(py)
-}
-
-pub fn fe_color_matrix_impl_f32(src: &ndarray::ArrayView3<f32>, matrix_type: u8, values: &[f32]) -> Array3<f32> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    let mut m = [[0.0f32; 5]; 4];
-
-    // Helper to set identity matrix
-    let set_identity = |mat: &mut [[f32; 5]; 4]| {
-        mat[0] = [1.0, 0.0, 0.0, 0.0, 0.0];
-        mat[1] = [0.0, 1.0, 0.0, 0.0, 0.0];
-        mat[2] = [0.0, 0.0, 1.0, 0.0, 0.0];
-        mat[3] = [0.0, 0.0, 0.0, 1.0, 0.0];
-    };
-
-    match matrix_type {
-        0 => { // matrix
-            if values.len() != 20 {
-                set_identity(&mut m);
-            } else {
-                for i in 0..4 {
-                    for j in 0..5 {
-                        m[i][j] = values[i * 5 + j];
-                    }
-                }
-            }
-        }
-        1 => { // saturate
-            let s = if values.len() == 1 { values[0] } else { 1.0 }; 
-            m[0] = [0.213 + 0.787 * s, 0.715 - 0.715 * s, 0.072 - 0.072 * s, 0.0, 0.0];
-            m[1] = [0.213 - 0.213 * s, 0.715 + 0.285 * s, 0.072 - 0.072 * s, 0.0, 0.0];
-            m[2] = [0.213 - 0.213 * s, 0.715 - 0.715 * s, 0.072 + 0.928 * s, 0.0, 0.0];
-            m[3] = [0.0, 0.0, 0.0, 1.0, 0.0];
-        }
-        2 => { // hueRotate
-            let angle_deg = if values.len() == 1 { values[0] } else { 0.0 };
-            let angle = angle_deg.to_radians();
-            let cos_a = angle.cos();
-            let sin_a = angle.sin();
-            m[0] = [0.213 + cos_a * 0.787 - sin_a * 0.213, 0.715 - cos_a * 0.715 - sin_a * 0.715, 0.072 - cos_a * 0.072 + sin_a * 0.928, 0.0, 0.0];
-            m[1] = [0.213 - cos_a * 0.213 + sin_a * 0.143, 0.715 + cos_a * 0.285 + sin_a * 0.140, 0.072 - cos_a * 0.072 - sin_a * 0.283, 0.0, 0.0];
-            m[2] = [0.213 - cos_a * 0.213 - sin_a * 0.787, 0.715 - cos_a * 0.715 + sin_a * 0.715, 0.072 + cos_a * 0.928 + sin_a * 0.072, 0.0, 0.0];
-            m[3] = [0.0, 0.0, 0.0, 1.0, 0.0];
-        }
-        3 => { // luminanceToAlpha
-            m[0] = [0.0, 0.0, 0.0, 0.0, 0.0];
-            m[1] = [0.0, 0.0, 0.0, 0.0, 0.0];
-            m[2] = [0.0, 0.0, 0.0, 0.0, 0.0];
-            m[3] = [0.2126, 0.7152, 0.0722, 0.0, 0.0];
-        }
-        _ => {
-            set_identity(&mut m);
-        }
-    }
-
-    for y in 0..h {
-        for x in 0..w {
-            let r = src[[y, x, 0]];
-            let g = src[[y, x, 1]];
-            let b = src[[y, x, 2]];
-            let a = src[[y, x, 3]];
-
-            let out_r = (m[0][0] * r + m[0][1] * g + m[0][2] * b + m[0][3] * a + m[0][4]).clamp(0.0, 1.0);
-            let out_g = (m[1][0] * r + m[1][1] * g + m[1][2] * b + m[1][3] * a + m[1][4]).clamp(0.0, 1.0);
-            let out_b = (m[2][0] * r + m[2][1] * g + m[2][2] * b + m[2][3] * a + m[2][4]).clamp(0.0, 1.0);
-            let out_a = (m[3][0] * r + m[3][1] * g + m[3][2] * b + m[3][3] * a + m[3][4]).clamp(0.0, 1.0);
-
-            dst[[y, x, 0]] = out_r;
-            dst[[y, x, 1]] = out_g;
-            dst[[y, x, 2]] = out_b;
-            dst[[y, x, 3]] = out_a;
-        }
-    }
-    dst
 }
 
 pub fn fe_color_matrix_impl(src: &ndarray::ArrayView3<u8>, matrix_type: u8, values: &[f32]) -> Array3<u8> {
@@ -777,55 +482,6 @@ pub fn fe_color_matrix<'py>(
 ) -> Bound<'py, numpy::PyArray3<u8>> {
     let arr = src.as_array();
     fe_color_matrix_impl(&arr, matrix_type, &values).into_pyarray(py)
-}
-
-pub fn fe_component_transfer_impl_f32(
-    src: &ndarray::ArrayView3<f32>,
-    func_r: &(u8, Vec<f32>, f32, f32, f32, f32, f32),
-    func_g: &(u8, Vec<f32>, f32, f32, f32, f32, f32),
-    func_b: &(u8, Vec<f32>, f32, f32, f32, f32, f32),
-    func_a: &(u8, Vec<f32>, f32, f32, f32, f32, f32),
-) -> Array3<f32> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    fn apply_transfer(val: f32, func: &(u8, Vec<f32>, f32, f32, f32, f32, f32)) -> f32 {
-        let (func_type, table, slope, intercept, amplitude, exponent, offset) = func;
-        match func_type {
-            0 => val,
-            1 => {
-                if table.len() < 2 { return val; }
-                let n = table.len() - 1;
-                let k = (val * n as f32).floor() as usize;
-                let k = k.min(n - 1);
-                let frac = val * n as f32 - k as f32;
-                table[k] * (1.0 - frac) + table[k + 1] * frac
-            }
-            2 => {
-                if table.is_empty() { return val; }
-                let n = table.len();
-                let k = (val * n as f32).floor() as usize;
-                let k = k.min(n - 1);
-                table[k]
-            }
-            3 => slope * val + intercept,
-            4 => amplitude * val.powf(*exponent) + offset,
-            _ => val,
-        }
-    }
-
-    let funcs = [func_r, func_g, func_b, func_a];
-
-    for y in 0..h {
-        for x in 0..w {
-            for c in 0..4 {
-                let val = src[[y, x, c]];
-                let out = apply_transfer(val, funcs[c]);
-                dst[[y, x, c]] = out.clamp(0.0, 1.0);
-            }
-        }
-    }
-    dst
 }
 
 pub fn fe_component_transfer_impl(
@@ -945,109 +601,6 @@ fn vhg_sliding_minmax(data: &[u8], radius: usize, is_min: bool) -> Vec<u8> {
     result
 }
 
-/// Van Herk-Gil-Werman algorithm for 1D sliding window min/max (f32)
-#[inline]
-fn vhg_sliding_minmax_f32(data: &[f32], radius: usize, is_min: bool) -> Vec<f32> {
-    let n = data.len();
-    if n == 0 {
-        return vec![];
-    }
-
-    let window = 2 * radius + 1;
-
-    if window >= n {
-        let result_val = if is_min {
-            *data.iter().min_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(&0.0)
-        } else {
-            *data.iter().max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap_or(&0.0)
-        };
-        return vec![result_val; n];
-    }
-
-    let mut result = vec![0.0f32; n];
-    let num_blocks = (n + window - 1) / window;
-    let mut prefix = vec![0.0f32; n];
-    let mut suffix = vec![0.0f32; n];
-
-    for block in 0..num_blocks {
-        let block_start = block * window;
-        let block_end = ((block + 1) * window).min(n);
-
-        let mut val = if is_min { f32::INFINITY } else { f32::NEG_INFINITY };
-        for i in (block_start..block_end).rev() {
-            if is_min { val = val.min(data[i]); } else { val = val.max(data[i]); }
-            suffix[i] = val;
-        }
-
-        val = if is_min { f32::INFINITY } else { f32::NEG_INFINITY };
-        for i in block_start..block_end {
-            if is_min { val = val.min(data[i]); } else { val = val.max(data[i]); }
-            prefix[i] = val;
-        }
-    }
-
-    for i in 0..n {
-        let left = if i >= radius { i - radius } else { 0 };
-        let right = if i + radius < n { i + radius } else { n - 1 };
-        if is_min {
-            result[i] = suffix[left].min(prefix[right]);
-        } else {
-            result[i] = suffix[left].max(prefix[right]);
-        }
-    }
-
-    result
-}
-
-pub fn fe_morphology_impl_f32(src: &ndarray::ArrayView3<f32>, operator: u8, radius_x: f32, radius_y: f32) -> Array3<f32> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-
-    let rx = radius_x.round() as usize;
-    let ry = radius_y.round() as usize;
-    let is_erode = operator == 0;
-
-    if rx == 0 && ry == 0 {
-        return src.to_owned();
-    }
-
-    let mut temp = Array3::<f32>::zeros((h, w, 4));
-
-    if rx > 0 {
-        for y in 0..h {
-            for c in 0..4 {
-                let row: Vec<f32> = (0..w).map(|x| src[[y, x, c]]).collect();
-                let result = vhg_sliding_minmax_f32(&row, rx, is_erode);
-                for x in 0..w { temp[[y, x, c]] = result[x]; }
-            }
-        }
-    } else {
-        for y in 0..h {
-            for x in 0..w {
-                for c in 0..4 { temp[[y, x, c]] = src[[y, x, c]]; }
-            }
-        }
-    }
-
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    if ry > 0 {
-        for x in 0..w {
-            for c in 0..4 {
-                let col: Vec<f32> = (0..h).map(|y| temp[[y, x, c]]).collect();
-                let result = vhg_sliding_minmax_f32(&col, ry, is_erode);
-                for y in 0..h { dst[[y, x, c]] = result[y]; }
-            }
-        }
-    } else {
-        for y in 0..h {
-            for x in 0..w {
-                for c in 0..4 { dst[[y, x, c]] = temp[[y, x, c]]; }
-            }
-        }
-    }
-    dst
-}
-
 pub fn fe_morphology_impl(src: &ndarray::ArrayView3<u8>, operator: u8, radius_x: f32, radius_y: f32) -> Array3<u8> {
     let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
 
@@ -1114,105 +667,6 @@ pub fn fe_morphology<'py>(
 ) -> Bound<'py, numpy::PyArray3<u8>> {
     let arr = src.as_array();
     fe_morphology_impl(&arr, operator, radius_x, radius_y).into_pyarray(py)
-}
-
-pub fn fe_convolve_matrix_impl_f32(
-    src: &ndarray::ArrayView3<f32>,
-    order_x: usize,
-    order_y: usize,
-    kernel: &[f32],
-    divisor: f32,
-    bias: f32,
-    target_x: usize,
-    target_y: usize,
-    edge_mode: u8,
-    preserve_alpha: bool,
-) -> Array3<f32> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    let div = if divisor.abs() < 1e-10 { 1.0 } else { divisor };
-    let scaled_kernel: Vec<f32> = kernel.iter().map(|k| k / div).collect();
-    
-    let h_i = h as i32;
-    let w_i = w as i32;
-    let target_y_i = target_y as i32;
-    let target_x_i = target_x as i32;
-
-    let channels = if preserve_alpha { 3 } else { 4 };
-
-    if scaled_kernel.is_empty() || order_x == 0 || order_y == 0 {
-        return src.to_owned();
-    }
-
-    if edge_mode == 0 {
-        for y in 0..h {
-            let y_i = y as i32;
-            for x in 0..w {
-                let x_i = x as i32;
-                let mut sum = [0.0f32; 4];
-
-                for ky in 0..order_y {
-                    let sy = (y_i + ky as i32 - target_y_i).clamp(0, h_i - 1) as usize;
-                    for kx in 0..order_x {
-                        let kernel_idx = ky * order_x + kx;
-                        if kernel_idx >= scaled_kernel.len() { continue; }
-                        let sx = (x_i + kx as i32 - target_x_i).clamp(0, w_i - 1) as usize;
-                        let kernel_val = scaled_kernel[kernel_idx];
-                        for c in 0..channels {
-                            sum[c] += src[[sy, sx, c]] * kernel_val;
-                        }
-                    }
-                }
-
-                for c in 0..channels {
-                    dst[[y, x, c]] = (sum[c] + bias).clamp(0.0, 1.0);
-                }
-                if preserve_alpha {
-                    dst[[y, x, 3]] = src[[y, x, 3]];
-                }
-            }
-        }
-    } else {
-        for y in 0..h {
-            let y_i = y as i32;
-            for x in 0..w {
-                let x_i = x as i32;
-                let mut sum = [0.0f32; 4];
-
-                for ky in 0..order_y {
-                    for kx in 0..order_x {
-                        let kernel_idx = ky * order_x + kx;
-                        if kernel_idx >= scaled_kernel.len() { continue; }
-
-                        let sy = y_i + ky as i32 - target_y_i;
-                        let sx = x_i + kx as i32 - target_x_i;
-
-                        let (sy, sx) = match edge_mode {
-                            1 => (sy.rem_euclid(h_i), sx.rem_euclid(w_i)),
-                            _ => {
-                                if sy < 0 || sy >= h_i || sx < 0 || sx >= w_i { continue; }
-                                (sy, sx)
-                            }
-                        };
-
-                        let kernel_val = scaled_kernel[kernel_idx];
-                        for c in 0..channels {
-                            sum[c] += src[[sy as usize, sx as usize, c]] * kernel_val;
-                        }
-                    }
-                }
-
-                for c in 0..channels {
-                    dst[[y, x, c]] = (sum[c] + bias).clamp(0.0, 1.0);
-                }
-                if preserve_alpha {
-                    dst[[y, x, 3]] = src[[y, x, 3]];
-                }
-            }
-        }
-    }
-    dst
 }
 
 pub fn fe_convolve_matrix_impl(
@@ -1384,56 +838,6 @@ fn perlin_noise(x: f64, y: f64, channel: usize, gradients: &[[f64; 2]; 256]) -> 
     nx0 + v * (nx1 - nx0)
 }
 
-pub fn fe_turbulence_impl_f32(
-    width: usize,
-    height: usize,
-    base_freq_x: f64,
-    base_freq_y: f64,
-    num_octaves: usize,
-    seed: i32,
-    noise_type: u8,
-    _stitch_tiles: bool,
-) -> Array3<f32> {
-    let mut pixels = Array3::<f32>::zeros((height, width, 4));
-    let gradients = generate_gradients(seed);
-
-    for y in 0..height {
-        for x in 0..width {
-            for c in 0..4 {
-                let mut noise = 0.0f64;
-                let mut amplitude = 1.0f64;
-                let mut freq_x = base_freq_x;
-                let mut freq_y = base_freq_y;
-
-                for _ in 0..num_octaves {
-                    let nx = x as f64 * freq_x;
-                    let ny = y as f64 * freq_y;
-                    let n = perlin_noise(nx, ny, c, &gradients);
-
-                    if noise_type == 0 {
-                        noise += n.abs() * amplitude;
-                    } else {
-                        noise += n * amplitude;
-                    }
-
-                    amplitude *= 0.5;
-                    freq_x *= 2.0;
-                    freq_y *= 2.0;
-                }
-
-                let val = if noise_type == 0 {
-                    noise
-                } else {
-                    (noise + 1.0) * 0.5
-                };
-
-                pixels[[y, x, c]] = val.clamp(0.0, 1.0) as f32;
-            }
-        }
-    }
-    pixels
-}
-
 pub fn fe_turbulence_impl(
     width: usize,
     height: usize,
@@ -1498,57 +902,6 @@ pub fn fe_turbulence<'py>(
     stitch_tiles: bool,
 ) -> Bound<'py, numpy::PyArray3<u8>> {
     fe_turbulence_impl(width, height, base_freq_x, base_freq_y, num_octaves, seed, noise_type, stitch_tiles).into_pyarray(py)
-}
-
-pub fn fe_displacement_map_impl_f32(
-    src: &ndarray::ArrayView3<f32>,
-    map: &ndarray::ArrayView3<f32>,
-    scale: f32,
-    x_channel: u8,
-    y_channel: u8,
-) -> Array3<f32> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    for y in 0..h {
-        for x in 0..w {
-            let dx_val = map[[y, x, x_channel as usize]] - 0.5;
-            let dy_val = map[[y, x, y_channel as usize]] - 0.5;
-
-            let src_x = x as f32 + dx_val * scale;
-            let src_y = y as f32 + dy_val * scale;
-
-            let x0 = src_x.floor() as i32;
-            let y0 = src_y.floor() as i32;
-            let x1 = x0 + 1;
-            let y1 = y0 + 1;
-
-            let fx = src_x - x0 as f32;
-            let fy = src_y - y0 as f32;
-
-            for c in 0..4 {
-                let get_pixel = |px: i32, py: i32| -> f32 {
-                    if px < 0 || px >= w as i32 || py < 0 || py >= h as i32 {
-                        0.0
-                    } else {
-                        src[[py as usize, px as usize, c]]
-                    }
-                };
-
-                let v00 = get_pixel(x0, y0);
-                let v10 = get_pixel(x1, y0);
-                let v01 = get_pixel(x0, y1);
-                let v11 = get_pixel(x1, y1);
-
-                let v0 = v00 + fx * (v10 - v00);
-                let v1 = v01 + fx * (v11 - v01);
-                let v = v0 + fy * (v1 - v0);
-
-                dst[[y, x, c]] = v.clamp(0.0, 1.0);
-            }
-        }
-    }
-    dst
 }
 
 pub fn fe_displacement_map_impl(
@@ -1617,26 +970,6 @@ pub fn fe_displacement_map<'py>(
     fe_displacement_map_impl(&src_arr, &map_arr, scale, x_channel, y_channel).into_pyarray(py)
 }
 
-pub fn fe_tile_impl_f32(src: &ndarray::ArrayView3<f32>, out_width: usize, out_height: usize) -> Array3<f32> {
-    let (src_h, src_w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((out_height, out_width, 4));
-
-    if src_h == 0 || src_w == 0 {
-        return dst;
-    }
-
-    for y in 0..out_height {
-        let src_y = y % src_h;
-        for x in 0..out_width {
-            let src_x = x % src_w;
-            for c in 0..4 {
-                dst[[y, x, c]] = src[[src_y, src_x, c]];
-            }
-        }
-    }
-    dst
-}
-
 pub fn fe_tile_impl(src: &ndarray::ArrayView3<u8>, out_width: usize, out_height: usize) -> Array3<u8> {
     let (src_h, src_w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
     let mut dst = Array3::<u8>::zeros((out_height, out_width, 4));
@@ -1667,102 +1000,6 @@ pub fn fe_tile<'py>(
 ) -> Bound<'py, numpy::PyArray3<u8>> {
     let src_arr = src.as_array();
     fe_tile_impl(&src_arr, out_width, out_height).into_pyarray(py)
-}
-
-pub fn fe_diffuse_lighting_impl_f32(
-    src: &ndarray::ArrayView3<f32>,
-    surface_scale: f32,
-    diffuse_constant: f32,
-    light_color: (f32, f32, f32), // normalized
-    light_type: u8,
-    azimuth: f32, elevation: f32,
-    light_x: f32, light_y: f32, light_z: f32,
-    points_at_x: f32, points_at_y: f32, points_at_z: f32,
-    specular_exponent: f32, limiting_cone_angle: f32,
-) -> Array3<f32> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    // For lighting, we need alpha map from src alpha
-    // We treat 'src' as the source image, and use its alpha channel as height map
-    
-    let get_height = |x: i32, y: i32| -> f32 {
-        if x < 0 || x >= w as i32 || y < 0 || y >= h as i32 {
-            0.0
-        } else {
-            src[[y as usize, x as usize, 3]] * surface_scale
-        }
-    };
-
-    let (lx, ly, lz) = if light_type == 0 {
-        // Distant light
-        let az_rad = azimuth.to_radians();
-        let el_rad = elevation.to_radians();
-        (az_rad.cos() * el_rad.cos(), az_rad.sin() * el_rad.cos(), el_rad.sin())
-    } else {
-        (0.0, 0.0, 0.0)
-    };
-    let (dist_lx, dist_ly, dist_lz) = (lx, ly, lz);
-
-    for y in 0..h {
-        let iy = y as i32;
-        for x in 0..w {
-            let ix = x as i32;
-            
-            // Calculate normal vector
-            let z_nw = get_height(ix - 1, iy - 1);
-            let z_n  = get_height(ix,     iy - 1);
-            let z_ne = get_height(ix + 1, iy - 1);
-            let z_w  = get_height(ix - 1, iy);
-            let z_e  = get_height(ix + 1, iy);
-            let z_sw = get_height(ix - 1, iy + 1);
-            let z_s  = get_height(ix,     iy + 1);
-            let z_se = get_height(ix + 1, iy + 1);
-
-            let nx = -((z_ne + 2.0 * z_e + z_se) - (z_nw + 2.0 * z_w + z_sw)) / 4.0;
-            let ny = -((z_sw + 2.0 * z_s + z_se) - (z_nw + 2.0 * z_n + z_ne)) / 4.0;
-            let nz = 1.0;
-            
-            let len = (nx * nx + ny * ny + nz * nz).sqrt();
-            let (nx, ny, nz) = (nx / len, ny / len, nz / len);
-
-            // Light vector
-            let (lx, ly, lz) = if light_type == 1 || light_type == 2 {
-                let z = get_height(ix, iy);
-                let dx = light_x - x as f32;
-                let dy = light_y - y as f32;
-                let dz = light_z - z;
-                let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
-                (dx / len, dy / len, dz / len)
-            } else {
-                (dist_lx, dist_ly, dist_lz)
-            };
-
-            let n_dot_l = (nx * lx + ny * ly + nz * lz).max(0.0);
-            
-            let intensity = if light_type == 2 {
-                let sx = points_at_x - light_x;
-                let sy = points_at_y - light_y;
-                let sz = points_at_z - light_z;
-                let s_len = (sx * sx + sy * sy + sz * sz).sqrt().max(1e-6);
-                let (sx, sy, sz) = (sx / s_len, sy / s_len, sz / s_len);
-                let l_dot_s = -(lx * sx + ly * sy + lz * sz);
-                let cone_cos = limiting_cone_angle.to_radians().cos();
-                if l_dot_s < cone_cos { 0.0 } else { l_dot_s.powf(specular_exponent) }
-            } else {
-                1.0
-            };
-
-            let diffuse = diffuse_constant * n_dot_l * intensity;
-            
-            // Result is alpha 1.0, color modulated by diffuse factor
-            dst[[y, x, 0]] = (light_color.0 * diffuse).clamp(0.0, 1.0);
-            dst[[y, x, 1]] = (light_color.1 * diffuse).clamp(0.0, 1.0);
-            dst[[y, x, 2]] = (light_color.2 * diffuse).clamp(0.0, 1.0);
-            dst[[y, x, 3]] = 1.0;
-        }
-    }
-    dst
 }
 
 pub fn fe_diffuse_lighting_impl(
@@ -1862,106 +1099,6 @@ pub fn fe_diffuse_lighting<'py>(
         azimuth, elevation, light_x, light_y, light_z,
         points_at_x, points_at_y, points_at_z, specular_exponent, limiting_cone_angle
     ).into_pyarray(py)
-}
-
-pub fn fe_specular_lighting_impl_f32(
-    src: &ndarray::ArrayView3<f32>,
-    surface_scale: f32,
-    specular_constant: f32,
-    specular_exponent: f32,
-    light_color: (f32, f32, f32), // normalized
-    light_type: u8,
-    azimuth: f32, elevation: f32,
-    light_x: f32, light_y: f32, light_z: f32,
-    points_at_x: f32, points_at_y: f32, points_at_z: f32,
-    spot_exponent: f32, limiting_cone_angle: f32,
-) -> Array3<f32> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    let get_height = |x: i32, y: i32| -> f32 {
-        if x < 0 || x >= w as i32 || y < 0 || y >= h as i32 {
-            0.0
-        } else {
-            src[[y as usize, x as usize, 3]] * surface_scale
-        }
-    };
-
-    let (dist_lx, dist_ly, dist_lz) = if light_type == 0 {
-        let az_rad = azimuth.to_radians();
-        let el_rad = elevation.to_radians();
-        (az_rad.cos() * el_rad.cos(), az_rad.sin() * el_rad.cos(), el_rad.sin())
-    } else {
-        (0.0, 0.0, 0.0)
-    };
-
-    // Eye vector (0, 0, 1) usually
-    let (ex, ey, ez) = (0.0, 0.0, 1.0);
-
-    for y in 0..h {
-        let iy = y as i32;
-        for x in 0..w {
-            let ix = x as i32;
-            
-            // Calculate normal vector
-            let z_nw = get_height(ix - 1, iy - 1);
-            let z_n  = get_height(ix,     iy - 1);
-            let z_ne = get_height(ix + 1, iy - 1);
-            let z_w  = get_height(ix - 1, iy);
-            let z_e  = get_height(ix + 1, iy);
-            let z_sw = get_height(ix - 1, iy + 1);
-            let z_s  = get_height(ix,     iy + 1);
-            let z_se = get_height(ix + 1, iy + 1);
-
-            let nx = -((z_ne + 2.0 * z_e + z_se) - (z_nw + 2.0 * z_w + z_sw)) / 4.0;
-            let ny = -((z_sw + 2.0 * z_s + z_se) - (z_nw + 2.0 * z_n + z_ne)) / 4.0;
-            let nz = 1.0;
-            
-            let len = (nx * nx + ny * ny + nz * nz).sqrt();
-            let (nx, ny, nz) = (nx / len, ny / len, nz / len);
-
-            let (lx, ly, lz) = if light_type == 1 || light_type == 2 {
-                let z = get_height(ix, iy);
-                let dx = light_x - x as f32;
-                let dy = light_y - y as f32;
-                let dz = light_z - z;
-                let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
-                (dx / len, dy / len, dz / len)
-            } else {
-                (dist_lx, dist_ly, dist_lz)
-            };
-
-            let hx = lx + ex;
-            let hy = ly + ey;
-            let hz = lz + ez;
-            let h_len = (hx * hx + hy * hy + hz * hz).sqrt();
-            let (hx, hy, hz) = if h_len > 1e-6 { (hx / h_len, hy / h_len, hz / h_len) } else { (0.0, 0.0, 1.0) };
-
-            let n_dot_h = (nx * hx + ny * hy + nz * hz).max(0.0);
-
-            let intensity = if light_type == 2 {
-                let sx = points_at_x - light_x;
-                let sy = points_at_y - light_y;
-                let sz = points_at_z - light_z;
-                let s_len = (sx * sx + sy * sy + sz * sz).sqrt().max(1e-6);
-                let (sx, sy, sz) = (sx / s_len, sy / s_len, sz / s_len);
-                let l_dot_s = -(lx * sx + ly * sy + lz * sz);
-                let cone_cos = limiting_cone_angle.to_radians().cos();
-                if l_dot_s < cone_cos { 0.0 } else { l_dot_s.powf(spot_exponent) }
-            } else {
-                1.0
-            };
-
-            let specular = n_dot_h.powf(specular_exponent) * specular_constant * intensity;
-
-            dst[[y, x, 0]] = (light_color.0 * specular).clamp(0.0, 1.0);
-            dst[[y, x, 1]] = (light_color.1 * specular).clamp(0.0, 1.0);
-            dst[[y, x, 2]] = (light_color.2 * specular).clamp(0.0, 1.0);
-            let max_rgb = dst[[y, x, 0]].max(dst[[y, x, 1]]).max(dst[[y, x, 2]]);
-            dst[[y, x, 3]] = max_rgb;
-        }
-    }
-    dst
 }
 
 pub fn fe_specular_lighting_impl(
@@ -2130,58 +1267,6 @@ fn box_blur_integral(src: &[f32], dst: &mut [f32], w: usize, h: usize, rx: usize
     }
 }
 
-pub fn fe_gaussian_blur_impl_f32(src: &ndarray::ArrayView3<f32>, std_dev_x: f32, std_dev_y: f32) -> Array3<f32> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-
-    if std_dev_x < 0.5 && std_dev_y < 0.5 {
-        return src.to_owned();
-    }
-
-    let std_dev_x = std_dev_x.min(100.0);
-    let std_dev_y = std_dev_y.min(100.0);
-
-    let box_radius_x = ((12.0 * std_dev_x * std_dev_x / 3.0).sqrt() + 0.5).floor() as usize;
-    let box_radius_y = ((12.0 * std_dev_y * std_dev_y / 3.0).sqrt() + 0.5).floor() as usize;
-
-    let total_pixels = h * w * 4;
-
-    let mut buf_a = vec![0.0f32; total_pixels];
-    let mut buf_b = vec![0.0f32; total_pixels];
-
-    // Copy src to buffer
-    for y in 0..h {
-        for x in 0..w {
-            let idx = (y * w + x) * 4;
-            buf_a[idx] = src[[y, x, 0]];
-            buf_a[idx + 1] = src[[y, x, 1]];
-            buf_a[idx + 2] = src[[y, x, 2]];
-            buf_a[idx + 3] = src[[y, x, 3]];
-        }
-    }
-
-    let mut current = &mut buf_a;
-    let mut next = &mut buf_b;
-
-    if box_radius_x > 0 || box_radius_y > 0 {
-        for _ in 0..3 {
-            box_blur_integral(current, next, w, h, box_radius_x, box_radius_y);
-            std::mem::swap(&mut current, &mut next);
-        }
-    }
-
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-    for y in 0..h {
-        for x in 0..w {
-            let idx = (y * w + x) * 4;
-            dst[[y, x, 0]] = current[idx].clamp(0.0, 1.0);
-            dst[[y, x, 1]] = current[idx + 1].clamp(0.0, 1.0);
-            dst[[y, x, 2]] = current[idx + 2].clamp(0.0, 1.0);
-            dst[[y, x, 3]] = current[idx + 3].clamp(0.0, 1.0);
-        }
-    }
-    dst
-}
-
 pub fn fe_gaussian_blur_impl(src: &ndarray::ArrayView3<u8>, std_dev_x: f32, std_dev_y: f32) -> Array3<u8> {
     let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
 
@@ -2256,108 +1341,6 @@ pub fn fe_gaussian_blur<'py>(
 ) -> Bound<'py, numpy::PyArray3<u8>> {
     let arr = src.as_array();
     fe_gaussian_blur_impl(&arr, std_dev_x, std_dev_y).into_pyarray(py)
-}
-
-pub fn fe_drop_shadow_impl_f32(
-    src: &ndarray::ArrayView3<f32>,
-    dx: f32,
-    dy: f32,
-    std_dev_x: f32,
-    std_dev_y: f32,
-    flood_r: f32, flood_g: f32, flood_b: f32, flood_a: f32,
-) -> Array3<f32> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-
-    let dx_i = dx.round() as i32;
-    let dy_i = dy.round() as i32;
-
-    let std_dev_x = std_dev_x.min(100.0);
-    let std_dev_y = std_dev_y.min(100.0);
-
-    let mut alpha = vec![0.0f32; h * w];
-    for y in 0..h {
-        let src_y = y as i32 - dy_i;
-        if src_y < 0 || src_y >= h as i32 { continue; }
-        for x in 0..w {
-            let src_x = x as i32 - dx_i;
-            if src_x < 0 || src_x >= w as i32 { continue; }
-            let a = src[[src_y as usize, src_x as usize, 3]];
-            alpha[y * w + x] = a * flood_a;
-        }
-    }
-
-    if std_dev_x >= 0.5 || std_dev_y >= 0.5 {
-        let box_radius_x = ((12.0 * std_dev_x * std_dev_x / 3.0).sqrt() + 0.5).floor() as usize;
-        let box_radius_y = ((12.0 * std_dev_y * std_dev_y / 3.0).sqrt() + 0.5).floor() as usize;
-
-        let mut current = &mut alpha;
-        let mut next = &mut vec![0.0f32; h * w];
-
-        for _ in 0..3 {
-            box_blur_single_channel(current, next, w, h, box_radius_x, box_radius_y);
-            std::mem::swap(&mut current, &mut next);
-        }
-    }
-
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-    for y in 0..h {
-        for x in 0..w {
-            let shadow_a = alpha[y * w + x];
-            // Shadow
-            if shadow_a > 0.0 {
-                dst[[y, x, 0]] = flood_r;
-                dst[[y, x, 1]] = flood_g;
-                dst[[y, x, 2]] = flood_b;
-                dst[[y, x, 3]] = shadow_a;
-            }
-            
-            // Composite source over shadow
-            let src_a = src[[y, x, 3]];
-            if src_a > 0.0 {
-                let inv_src_a = 1.0 - src_a;
-                dst[[y, x, 0]] = src[[y, x, 0]] + dst[[y, x, 0]] * inv_src_a;
-                dst[[y, x, 1]] = src[[y, x, 1]] + dst[[y, x, 1]] * inv_src_a;
-                dst[[y, x, 2]] = src[[y, x, 2]] + dst[[y, x, 2]] * inv_src_a;
-                dst[[y, x, 3]] = src_a + dst[[y, x, 3]] * inv_src_a;
-            }
-        }
-    }
-    dst
-}
-
-fn box_blur_single_channel(src: &[f32], dst: &mut [f32], w: usize, h: usize, rx: usize, ry: usize) {
-    if w == 0 || h == 0 { return; }
-    let integral = compute_integral_image_single(src, w, h);
-    let iw = w + 1;
-    let area_x = (2 * rx + 1) as f64;
-    let area_y = (2 * ry + 1) as f64;
-    let inv_area = 1.0 / (area_x * area_y);
-
-    for y in 0..h {
-        let y1 = if y >= ry { y - ry } else { 0 };
-        let y2 = if y + ry < h { y + ry + 1 } else { h };
-        for x in 0..w {
-            let x1 = if x >= rx { x - rx } else { 0 };
-            let x2 = if x + rx < w { x + rx + 1 } else { w };
-            let sum = integral_query(&integral, iw, x1, y1, x2, y2);
-            let count = ((x2 - x1) * (y2 - y1)) as f64;
-            // Adjust for edge cases if necessary, or just use box area approx
-            dst[y * w + x] = (sum / count) as f32; // Normalizing by actual kernel overlap area
-        }
-    }
-}
-
-fn compute_integral_image_single(src: &[f32], w: usize, h: usize) -> Vec<f64> {
-    let mut integral = vec![0.0f64; (w + 1) * (h + 1)];
-    let iw = w + 1;
-    for y in 0..h {
-        let mut row_sum = 0.0f64;
-        for x in 0..w {
-            row_sum += src[y * w + x] as f64;
-            integral[(y + 1) * iw + (x + 1)] = row_sum + integral[y * iw + (x + 1)];
-        }
-    }
-    integral
 }
 
 pub fn fe_drop_shadow_impl(
@@ -2482,22 +1465,6 @@ pub fn fe_drop_shadow<'py>(
 ) -> Bound<'py, numpy::PyArray3<u8>> {
     let arr = src.as_array();
     fe_drop_shadow_impl(&arr, dx, dy, std_dev_x, std_dev_y, flood_r, flood_g, flood_b, flood_a).into_pyarray(py)
-}
-
-pub fn get_source_alpha_impl_f32(src: &ndarray::ArrayView3<f32>) -> Array3<f32> {
-    let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
-    let mut dst = Array3::<f32>::zeros((h, w, 4));
-
-    for y in 0..h {
-        for x in 0..w {
-            let a = src[[y, x, 3]];
-            dst[[y, x, 0]] = 0.0;
-            dst[[y, x, 1]] = 0.0;
-            dst[[y, x, 2]] = 0.0;
-            dst[[y, x, 3]] = a;
-        }
-    }
-    dst
 }
 
 pub fn get_source_alpha_impl(src: &ndarray::ArrayView3<u8>) -> Array3<u8> {

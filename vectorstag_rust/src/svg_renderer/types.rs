@@ -210,6 +210,13 @@ pub struct MaskDef {
     pub height: f64,
 }
 
+/// Color interpolation mode
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ColorInterpolation {
+    SRGB,
+    LinearRGB,
+}
+
 /// Filter primitive types
 #[derive(Clone, Debug)]
 pub enum FilterPrimitive {
@@ -218,32 +225,38 @@ pub enum FilterPrimitive {
         std_dev_y: f64,
         input: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     Offset {
         dx: f64,
         dy: f64,
         input: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     Flood {
         color: Color,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     Merge {
         nodes: Vec<String>,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     ColorMatrix {
         matrix_type: u8,  // 0=matrix, 1=saturate, 2=hueRotate, 3=luminanceToAlpha
         values: Vec<f32>,
         input: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     Blend {
         mode: u8,
         in1: String,
         in2: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     Composite {
         operator: u8,  // 0=over, 1=in, 2=out, 3=atop, 4=xor, 5=arithmetic
@@ -254,6 +267,7 @@ pub enum FilterPrimitive {
         in1: String,
         in2: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     Morphology {
         operator: u8,  // 0=erode, 1=dilate
@@ -261,6 +275,7 @@ pub enum FilterPrimitive {
         radius_y: f64,
         input: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     Turbulence {
         base_freq_x: f64,
@@ -269,10 +284,12 @@ pub enum FilterPrimitive {
         seed: i32,
         noise_type: u8,  // 0=fractalNoise, 1=turbulence
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     Tile {
         input: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     ComponentTransfer {
         func_r: (u8, Vec<f32>, f32, f32, f32, f32, f32),
@@ -281,6 +298,7 @@ pub enum FilterPrimitive {
         func_a: (u8, Vec<f32>, f32, f32, f32, f32, f32),
         input: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     ConvolveMatrix {
         order_x: usize,
@@ -294,6 +312,7 @@ pub enum FilterPrimitive {
         preserve_alpha: bool,
         input: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     DiffuseLighting {
         surface_scale: f32,
@@ -312,6 +331,7 @@ pub enum FilterPrimitive {
         limiting_cone_angle: f32,
         input: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     SpecularLighting {
         surface_scale: f32,
@@ -331,6 +351,7 @@ pub enum FilterPrimitive {
         limiting_cone_angle: f32,
         input: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     DisplacementMap {
         scale: f32,
@@ -339,6 +360,7 @@ pub enum FilterPrimitive {
         in1: String,
         in2: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     DropShadow {
         dx: f64,
@@ -348,11 +370,26 @@ pub enum FilterPrimitive {
         flood_color: Color,
         input: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
     Image {
         href: String,
         result: String,
+        color_interpolation: ColorInterpolation,
     },
+}
+
+/// Length value with unit type
+#[derive(Clone, Copy, Debug)]
+pub struct LengthVal {
+    pub value: f64,
+    pub is_percent: bool,
+}
+
+impl Default for LengthVal {
+    fn default() -> Self {
+        Self { value: 0.0, is_percent: false }
+    }
 }
 
 /// Filter definition
@@ -360,10 +397,10 @@ pub enum FilterPrimitive {
 pub struct FilterDef {
     pub id: String,
     pub primitives: Vec<FilterPrimitive>,
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
+    pub x: LengthVal,
+    pub y: LengthVal,
+    pub width: LengthVal,
+    pub height: LengthVal,
     pub filter_units: bool,  // true = objectBoundingBox (default), false = userSpaceOnUse
     pub primitive_units: bool,  // true = userSpaceOnUse, false = objectBoundingBox (default)
 }

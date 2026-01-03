@@ -624,6 +624,7 @@ dependencies = [
  "image",
  "ndarray",
  "numpy",
+ "once_cell",
  "pyo3",
  "rayon",
  "regex",

@@ -4,6 +4,8 @@ use roxmltree::Node;
 use super::types::*;
 pub use super::types::Transform;
 
+pub const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
+
 /// Convert HSL to RGB
 /// h: hue in degrees (0-360)
 /// s: saturation (0-1)
@@ -490,11 +492,59 @@ pub fn parse_transform_origin(s: &str) -> TransformOrigin {
     TransformOrigin { x, y, x_percent: x_pct, y_percent: y_pct }
 }
 
+use crate::path::parse_path_internal;
+use crate::path::PathCmd;
+
 /// Get element bounding box from its attributes
 pub fn get_element_bbox(node: &Node) -> Option<(f64, f64, f64, f64)> {
     let tag = node.tag_name().name();
 
     match tag {
+        "path" => {
+            if let Some(d) = node.attribute("d") {
+                let cmds = parse_path_internal(d);
+                let mut min_x = f64::INFINITY;
+                let mut min_y = f64::INFINITY;
+                let mut max_x = f64::NEG_INFINITY;
+                let mut max_y = f64::NEG_INFINITY;
+                let mut has_points = false;
+
+                // Simple bbox estimation from points (not perfect for bezier but close enough for filters usually)
+                // To be exact we should sample or calculate bezier bounds
+                let mut update_bounds = |x: f64, y: f64| {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                    has_points = true;
+                };
+
+                for cmd in cmds {
+                    match cmd {
+                        PathCmd::M(x, y) | PathCmd::L(x, y) => update_bounds(x, y),
+                        PathCmd::C(x1, y1, x2, y2, x, y) => {
+                            update_bounds(x1, y1);
+                            update_bounds(x2, y2);
+                            update_bounds(x, y);
+                        }
+                        PathCmd::Q(x1, y1, x, y) => {
+                            update_bounds(x1, y1);
+                            update_bounds(x, y);
+                        }
+                        PathCmd::A(_, _, _, _, _, x, y) => update_bounds(x, y),
+                        _ => {}
+                    }
+                }
+
+                if has_points {
+                    Some((min_x, min_y, max_x - min_x, max_y - min_y))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
         "rect" => {
             let x = node.attribute("x").map(|s| parse_length(s, 0.0)).unwrap_or(0.0);
             let y = node.attribute("y").map(|s| parse_length(s, 0.0)).unwrap_or(0.0);

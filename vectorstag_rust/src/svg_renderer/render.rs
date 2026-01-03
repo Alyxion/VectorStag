@@ -448,8 +448,11 @@ fn render_with_filter(
     // We render the element normally (the filter attribute is already extracted)
     render_node_without_filter(ctx, node, parent_transform, parent_style, depth, root);
 
+    // Get element bbox for filter units
+    let bbox = get_element_bbox(node);
+
     // Apply filter to the temporary buffer with scale factor
-    let filtered = apply_filter(filter_def, &ctx.buffer, width, height, scale);
+    let filtered = apply_filter(filter_def, &ctx.buffer, &original_buffer, width, height, parent_transform, bbox);
 
     // Restore original buffer
     ctx.buffer = original_buffer;
