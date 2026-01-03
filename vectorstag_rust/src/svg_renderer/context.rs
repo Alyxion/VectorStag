@@ -27,6 +27,7 @@ impl RenderContext {
             clip_paths: HashMap::new(),
             masks: HashMap::new(),
             markers: HashMap::new(),
+            filters: HashMap::new(),
             antialias,
             shapes_rendered: 0,
             active_clip: None,

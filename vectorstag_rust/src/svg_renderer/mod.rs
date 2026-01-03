@@ -21,10 +21,12 @@ mod shapes;
 mod elements;
 mod render;
 mod preserve_aspect_ratio;
+mod filter;
 
 use types::*;
 use parsing::{parse_style, parse_viewbox, parse_length};
 use defs::{collect_all_gradients, collect_all_markers, collect_clip_paths_and_masks};
+use filter::collect_all_filters;
 use render::render_node;
 use preserve_aspect_ratio::{parse_preserve_aspect_ratio, compute_viewbox_transform};
 
@@ -134,6 +136,11 @@ impl VectorStagRenderer {
         // Also collect all markers from the entire document
         for child in root.children() {
             collect_all_markers(&mut ctx, &child);
+        }
+
+        // Collect all filters from the entire document
+        for child in root.children() {
+            collect_all_filters(&mut ctx, &child);
         }
 
         // Second pass: collect clipPaths and masks

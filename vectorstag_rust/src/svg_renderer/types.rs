@@ -210,6 +210,164 @@ pub struct MaskDef {
     pub height: f64,
 }
 
+/// Filter primitive types
+#[derive(Clone, Debug)]
+pub enum FilterPrimitive {
+    GaussianBlur {
+        std_dev_x: f64,
+        std_dev_y: f64,
+        input: String,
+        result: String,
+    },
+    Offset {
+        dx: f64,
+        dy: f64,
+        input: String,
+        result: String,
+    },
+    Flood {
+        color: Color,
+        result: String,
+    },
+    Merge {
+        nodes: Vec<String>,
+        result: String,
+    },
+    ColorMatrix {
+        matrix_type: u8,  // 0=matrix, 1=saturate, 2=hueRotate, 3=luminanceToAlpha
+        values: Vec<f32>,
+        input: String,
+        result: String,
+    },
+    Blend {
+        mode: u8,
+        in1: String,
+        in2: String,
+        result: String,
+    },
+    Composite {
+        operator: u8,  // 0=over, 1=in, 2=out, 3=atop, 4=xor, 5=arithmetic
+        k1: f32,
+        k2: f32,
+        k3: f32,
+        k4: f32,
+        in1: String,
+        in2: String,
+        result: String,
+    },
+    Morphology {
+        operator: u8,  // 0=erode, 1=dilate
+        radius_x: f64,
+        radius_y: f64,
+        input: String,
+        result: String,
+    },
+    Turbulence {
+        base_freq_x: f64,
+        base_freq_y: f64,
+        num_octaves: usize,
+        seed: i32,
+        noise_type: u8,  // 0=fractalNoise, 1=turbulence
+        result: String,
+    },
+    Tile {
+        input: String,
+        result: String,
+    },
+    ComponentTransfer {
+        func_r: (u8, Vec<f32>, f32, f32, f32, f32, f32),
+        func_g: (u8, Vec<f32>, f32, f32, f32, f32, f32),
+        func_b: (u8, Vec<f32>, f32, f32, f32, f32, f32),
+        func_a: (u8, Vec<f32>, f32, f32, f32, f32, f32),
+        input: String,
+        result: String,
+    },
+    ConvolveMatrix {
+        order_x: usize,
+        order_y: usize,
+        kernel: Vec<f32>,
+        divisor: f32,
+        bias: f32,
+        target_x: usize,
+        target_y: usize,
+        edge_mode: u8,
+        preserve_alpha: bool,
+        input: String,
+        result: String,
+    },
+    DiffuseLighting {
+        surface_scale: f32,
+        diffuse_constant: f32,
+        light_color: (u8, u8, u8),
+        light_type: u8,
+        azimuth: f32,
+        elevation: f32,
+        light_x: f32,
+        light_y: f32,
+        light_z: f32,
+        points_at_x: f32,
+        points_at_y: f32,
+        points_at_z: f32,
+        specular_exponent: f32,
+        limiting_cone_angle: f32,
+        input: String,
+        result: String,
+    },
+    SpecularLighting {
+        surface_scale: f32,
+        specular_constant: f32,
+        specular_exponent: f32,
+        light_color: (u8, u8, u8),
+        light_type: u8,
+        azimuth: f32,
+        elevation: f32,
+        light_x: f32,
+        light_y: f32,
+        light_z: f32,
+        points_at_x: f32,
+        points_at_y: f32,
+        points_at_z: f32,
+        spot_exponent: f32,
+        limiting_cone_angle: f32,
+        input: String,
+        result: String,
+    },
+    DisplacementMap {
+        scale: f32,
+        x_channel: u8,
+        y_channel: u8,
+        in1: String,
+        in2: String,
+        result: String,
+    },
+    DropShadow {
+        dx: f64,
+        dy: f64,
+        std_dev_x: f64,
+        std_dev_y: f64,
+        flood_color: Color,
+        input: String,
+        result: String,
+    },
+    Image {
+        href: String,
+        result: String,
+    },
+}
+
+/// Filter definition
+#[derive(Clone, Debug)]
+pub struct FilterDef {
+    pub id: String,
+    pub primitives: Vec<FilterPrimitive>,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub filter_units: bool,  // true = objectBoundingBox (default), false = userSpaceOnUse
+    pub primitive_units: bool,  // true = userSpaceOnUse, false = objectBoundingBox (default)
+}
+
 /// Marker orientation
 #[derive(Clone, Debug)]
 pub enum MarkerOrient {
@@ -241,6 +399,7 @@ pub struct RenderContext {
     pub clip_paths: HashMap<String, ClipPathDef>,
     pub masks: HashMap<String, MaskDef>,
     pub markers: HashMap<String, MarkerDef>,
+    pub filters: HashMap<String, FilterDef>,
     pub antialias: u32,
     pub shapes_rendered: usize,
     pub active_clip: Option<Vec<Vec<(f64, f64)>>>,

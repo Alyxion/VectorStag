@@ -78,7 +78,7 @@ DEFAULT_TIMEOUT = 1  # seconds per test (strict 1s limit)
 BATCH_SIZE = 100  # restart workers after this many tests
 
 # Global flag for using Rust renderer
-USE_RUST_RENDERER = False
+USE_RUST_RENDERER = True
 
 # SVGs known to cause infinite loops or extreme slowdowns
 SKIP_SVGS = {
