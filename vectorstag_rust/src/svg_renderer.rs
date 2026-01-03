@@ -116,12 +116,17 @@ struct Style {
     stroke_linejoin: LineJoin,
     stroke_miterlimit: f64,
     display: bool, // true = visible, false = none
+    visibility: bool, // true = visible, false = hidden/collapse
     // Font properties
     font_family: String,
     font_size: f64,
     font_weight: u16,
     font_style: String, // "normal", "italic", "oblique"
     text_anchor: String, // "start", "middle", "end"
+    // Marker references
+    marker_start: Option<String>,
+    marker_mid: Option<String>,
+    marker_end: Option<String>,
 }
 
 impl Style {
@@ -138,11 +143,15 @@ impl Style {
             stroke_linejoin: LineJoin::Miter,
             stroke_miterlimit: 4.0,
             display: true,
+            visibility: true,
             font_family: "sans-serif".to_string(),
             font_size: 12.0,
             font_weight: 400,
             font_style: "normal".to_string(),
             text_anchor: "start".to_string(),
+            marker_start: None,
+            marker_mid: None,
+            marker_end: None,
         }
     }
 }
@@ -217,6 +226,32 @@ struct MaskDef {
     height: f64,
 }
 
+/// Marker orientation
+#[derive(Clone, Debug)]
+enum MarkerOrient {
+    Auto,
+    AutoStartReverse,
+    Angle(f64), // in radians
+}
+
+/// Marker definition
+#[derive(Clone, Debug)]
+struct MarkerDef {
+    id: String,
+    ref_x: f64,
+    ref_y: f64,
+    marker_width: f64,
+    marker_height: f64,
+    orient: MarkerOrient,
+    // viewBox if specified
+    viewbox: Option<(f64, f64, f64, f64)>,
+    // markerUnits: true = strokeWidth, false = userSpaceOnUse
+    stroke_width_units: bool,
+    // The marker element node content (we'll store the XML string to re-render)
+    // Actually, we'll store pre-parsed path data for children
+    children_xml: String,
+}
+
 /// Render context
 struct RenderContext {
     buffer: Vec<u8>,
@@ -225,6 +260,7 @@ struct RenderContext {
     gradients: HashMap<String, GradientDef>,
     clip_paths: HashMap<String, ClipPathDef>,
     masks: HashMap<String, MaskDef>,
+    markers: HashMap<String, MarkerDef>,
     antialias: u32,
     shapes_rendered: usize,
     // Active clip path for current element (polygons in render coordinates)
@@ -256,6 +292,7 @@ impl RenderContext {
             gradients: HashMap::new(),
             clip_paths: HashMap::new(),
             masks: HashMap::new(),
+            markers: HashMap::new(),
             antialias,
             shapes_rendered: 0,
             active_clip: None,
@@ -736,10 +773,19 @@ fn parse_color(s: &str) -> Option<Color> {
         let hex = &s[1..];
         return match hex.len() {
             3 => {
+                // #RGB - expand each digit
                 let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
                 let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
                 let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
                 Some(Color::from_rgba(r, g, b, 255))
+            }
+            4 => {
+                // #RGBA (CSS4) - expand each digit
+                let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
+                let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
+                let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
+                let a = u8::from_str_radix(&hex[3..4], 16).ok()? * 17;
+                Some(Color::from_rgba(r, g, b, a))
             }
             6 => {
                 let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
@@ -827,6 +873,19 @@ fn parse_paint(s: &str) -> Paint {
     }
 
     Paint::None
+}
+
+/// Parse marker URL reference (e.g., "url(#marker1)")
+fn parse_marker_url(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s == "none" {
+        return None;
+    }
+    if s.starts_with("url(#") {
+        let id = s.trim_start_matches("url(#").trim_end_matches(')');
+        return Some(id.to_string());
+    }
+    None
 }
 
 /// Parse transform attribute
@@ -947,6 +1006,7 @@ fn parse_style(node: &Node, parent_style: &Style) -> Style {
             "stroke-opacity" => style.stroke_opacity = val.parse().unwrap_or(1.0),
             "opacity" => style.opacity = val.parse().unwrap_or(1.0),
             "display" => style.display = val != "none",
+            "visibility" => style.visibility = val == "visible",
             "fill-rule" => {
                 style.fill_rule = match val {
                     "evenodd" => FillRule::EvenOdd,
@@ -982,6 +1042,17 @@ fn parse_style(node: &Node, parent_style: &Style) -> Style {
             },
             "font-style" => style.font_style = val.to_string(),
             "text-anchor" => style.text_anchor = val.to_string(),
+            // Marker properties
+            "marker-start" => style.marker_start = parse_marker_url(val),
+            "marker-mid" => style.marker_mid = parse_marker_url(val),
+            "marker-end" => style.marker_end = parse_marker_url(val),
+            "marker" => {
+                // Shorthand sets all three
+                let m = parse_marker_url(val);
+                style.marker_start = m.clone();
+                style.marker_mid = m.clone();
+                style.marker_end = m;
+            }
             _ => {}
         }
     };
@@ -1162,10 +1233,10 @@ fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transfor
         "metadata" | "title" | "desc" | "style" | "script" => return,
         // Effect definitions (not rendered directly, applied elsewhere)
         "filter" | "clipPath" | "mask" | "pattern" | "symbol" | "marker" => return,
-        // Text elements (not implemented yet)
-        "text" | "tspan" | "textPath" | "font" | "font-face" | "glyph" | "missing-glyph" => return,
+        // Font definition elements (text is handled below)
+        "font" | "font-face" | "glyph" | "missing-glyph" => return,
         // Other elements to skip
-        "switch" | "foreignObject" | "image" => return,
+        "foreignObject" => return,
         _ => {}
     }
 
@@ -1180,6 +1251,11 @@ fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transfor
 
     // Skip elements with display: none
     if !style.display {
+        return;
+    }
+
+    // Skip elements with visibility: hidden (they still take up space, but aren't drawn)
+    if !style.visibility {
         return;
     }
 
@@ -1238,15 +1314,67 @@ fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transfor
 
     // Render based on element type
     match tag {
-        "g" | "svg" => {
+        "g" => {
             // Group - render children
             for child in node.children() {
                 render_node(ctx, &child, &transform, &style, depth + 1, root);
             }
         }
+        "svg" => {
+            // Nested SVG element - handle x, y positioning
+            // Note: Full viewport/clipping support would require render-to-buffer approach
+            let x = node.attribute("x")
+                .and_then(|s| s.trim_end_matches("px").parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let y = node.attribute("y")
+                .and_then(|s| s.trim_end_matches("px").parse::<f64>().ok())
+                .unwrap_or(0.0);
+
+            // Apply x/y offset
+            let nested_transform = if x != 0.0 || y != 0.0 {
+                transform.multiply(&Transform::translate(x, y))
+            } else {
+                transform.clone()
+            };
+
+            for child in node.children() {
+                render_node(ctx, &child, &nested_transform, &style, depth + 1, root);
+            }
+        }
+        "switch" => {
+            // Render the first child that passes its conditional tests
+            for child in node.children() {
+                if !child.is_element() {
+                    continue;
+                }
+
+                // Check conditional attributes
+                // requiredExtensions - we don't support any extensions, so skip if present
+                if child.attribute("requiredExtensions").is_some() {
+                    continue;
+                }
+
+                // requiredFeatures - skip for now (would need full feature detection)
+                if child.attribute("requiredFeatures").is_some() {
+                    continue;
+                }
+
+                // systemLanguage - for simplicity, accept "en" languages, skip others
+                if let Some(lang) = child.attribute("systemLanguage") {
+                    // Accept en, en-US, en-GB, etc. Skip others for simplicity.
+                    if !lang.starts_with("en") {
+                        continue;
+                    }
+                }
+
+                // This child passes all tests - render it and stop
+                render_node(ctx, &child, &transform, &style, depth + 1, root);
+                break;
+            }
+        }
         "path" => {
             if let Some(d) = node.attribute("d") {
-                render_path(ctx, d, &transform, &style);
+                render_path_with_markers(ctx, d, &transform, &style, root);
             }
         }
         "rect" => {
@@ -1259,13 +1387,23 @@ fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transfor
             render_ellipse(ctx, node, &transform, &style);
         }
         "line" => {
-            render_line(ctx, node, &transform, &style);
+            render_line(ctx, node, &transform, &style, root);
         }
         "polyline" => {
-            render_polyline(ctx, node, &transform, &style);
+            render_polyline(ctx, node, &transform, &style, root);
         }
         "polygon" => {
-            render_polygon_elem(ctx, node, &transform, &style);
+            render_polygon_elem(ctx, node, &transform, &style, root);
+        }
+        "text" => {
+            render_text_element(ctx, node, &transform, &style);
+        }
+        "tspan" | "textPath" => {
+            // tspan and textPath are handled within render_text_element
+            // If we encounter them at top level, ignore them
+        }
+        "image" => {
+            render_image_element(ctx, node, &transform, &style);
         }
         "use" => {
             // Resolve href attribute (try both href and xlink:href)
@@ -1453,6 +1591,53 @@ fn collect_defs(ctx: &mut RenderContext, node: &Node) {
 
                 ctx.gradients.insert(id.to_string(), grad);
             }
+        } else if tag == "marker" {
+            if let Some(id) = child.attribute("id") {
+                let ref_x = child.attribute("refX")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                let ref_y = child.attribute("refY")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                let marker_width = child.attribute("markerWidth")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3.0);
+                let marker_height = child.attribute("markerHeight")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3.0);
+
+                let orient = match child.attribute("orient") {
+                    Some("auto") => MarkerOrient::Auto,
+                    Some("auto-start-reverse") => MarkerOrient::AutoStartReverse,
+                    Some(s) => {
+                        // Parse angle (may be in degrees or with "deg" suffix)
+                        let angle_str = s.trim_end_matches("deg");
+                        angle_str.parse::<f64>()
+                            .map(|deg| MarkerOrient::Angle(deg.to_radians()))
+                            .unwrap_or(MarkerOrient::Angle(0.0))
+                    }
+                    None => MarkerOrient::Angle(0.0),
+                };
+
+                let viewbox = child.attribute("viewBox").and_then(parse_viewbox);
+                let stroke_width_units = child.attribute("markerUnits") != Some("userSpaceOnUse");
+
+                // Store a representation of the marker content
+                // We'll reconstruct from the node during rendering
+                let marker = MarkerDef {
+                    id: id.to_string(),
+                    ref_x,
+                    ref_y,
+                    marker_width,
+                    marker_height,
+                    orient,
+                    viewbox,
+                    stroke_width_units,
+                    children_xml: String::new(), // Not used - we render from node
+                };
+
+                ctx.markers.insert(id.to_string(), marker);
+            }
         }
     }
 }
@@ -1538,6 +1723,67 @@ fn collect_all_gradients(ctx: &mut RenderContext, node: &Node) {
     // Recurse into children
     for child in node.children() {
         collect_all_gradients(ctx, &child);
+    }
+}
+
+/// Recursively collect all markers from the entire document tree
+fn collect_all_markers(ctx: &mut RenderContext, node: &Node) {
+    if !node.is_element() {
+        return;
+    }
+
+    let tag = node.tag_name().name();
+
+    if tag == "marker" {
+        if let Some(id) = node.attribute("id") {
+            let ref_x = node.attribute("refX")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let ref_y = node.attribute("refY")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let marker_width = node.attribute("markerWidth")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3.0);
+            let marker_height = node.attribute("markerHeight")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3.0);
+
+            let orient = match node.attribute("orient") {
+                Some("auto") => MarkerOrient::Auto,
+                Some("auto-start-reverse") => MarkerOrient::AutoStartReverse,
+                Some(s) => {
+                    let angle_str = s.trim_end_matches("deg");
+                    angle_str.parse::<f64>()
+                        .map(|deg| MarkerOrient::Angle(deg.to_radians()))
+                        .unwrap_or(MarkerOrient::Angle(0.0))
+                }
+                None => MarkerOrient::Angle(0.0),
+            };
+
+            let viewbox = node.attribute("viewBox").and_then(parse_viewbox);
+            let stroke_width_units = node.attribute("markerUnits") != Some("userSpaceOnUse");
+
+            let marker = MarkerDef {
+                id: id.to_string(),
+                ref_x,
+                ref_y,
+                marker_width,
+                marker_height,
+                orient,
+                viewbox,
+                stroke_width_units,
+                children_xml: String::new(),
+            };
+
+            ctx.markers.insert(id.to_string(), marker);
+        }
+        return; // Don't recurse into marker children
+    }
+
+    // Recurse into children
+    for child in node.children() {
+        collect_all_markers(ctx, &child);
     }
 }
 
@@ -1706,7 +1952,143 @@ fn point_in_clip_path(x: f64, y: f64, clip_path: &ClipPathDef) -> bool {
     false
 }
 
-fn render_path(ctx: &mut RenderContext, d: &str, transform: &Transform, style: &Style) {
+/// Render markers on a path's vertices
+fn render_markers(
+    ctx: &mut RenderContext,
+    points: &[(f64, f64)],
+    style: &Style,
+    transform: &Transform,
+    root: &Node,
+) {
+    if points.len() < 2 {
+        return;
+    }
+
+    let stroke_width = style.stroke_width * transform.a.abs();
+
+    // Calculate angles for each point
+    let mut angles: Vec<f64> = Vec::with_capacity(points.len());
+
+    for i in 0..points.len() {
+        let angle = if i == 0 {
+            // Start point: angle from first to second point
+            let (x1, y1) = points[0];
+            let (x2, y2) = points[1];
+            (y2 - y1).atan2(x2 - x1)
+        } else if i == points.len() - 1 {
+            // End point: angle from second-to-last to last point
+            let (x1, y1) = points[points.len() - 2];
+            let (x2, y2) = points[points.len() - 1];
+            (y2 - y1).atan2(x2 - x1)
+        } else {
+            // Mid point: average of incoming and outgoing angles
+            let (x0, y0) = points[i - 1];
+            let (x1, y1) = points[i];
+            let (x2, y2) = points[i + 1];
+            let a1 = (y1 - y0).atan2(x1 - x0);
+            let a2 = (y2 - y1).atan2(x2 - x1);
+            // Average the angles (this is simplified - proper bisector is more complex)
+            (a1 + a2) / 2.0
+        };
+        angles.push(angle);
+    }
+
+    // Render start marker
+    if let Some(ref marker_id) = style.marker_start {
+        if let Some(marker_def) = ctx.markers.get(marker_id).cloned() {
+            let (x, y) = points[0];
+            let angle = match &marker_def.orient {
+                MarkerOrient::Auto => angles[0],
+                MarkerOrient::AutoStartReverse => angles[0] + std::f64::consts::PI,
+                MarkerOrient::Angle(a) => *a,
+            };
+            render_single_marker(ctx, &marker_def, x, y, angle, stroke_width, root, marker_id);
+        }
+    }
+
+    // Render mid markers
+    if let Some(ref marker_id) = style.marker_mid {
+        if points.len() > 2 {
+            if let Some(marker_def) = ctx.markers.get(marker_id).cloned() {
+                for i in 1..(points.len() - 1) {
+                    let (x, y) = points[i];
+                    let angle = match &marker_def.orient {
+                        MarkerOrient::Auto | MarkerOrient::AutoStartReverse => angles[i],
+                        MarkerOrient::Angle(a) => *a,
+                    };
+                    render_single_marker(ctx, &marker_def, x, y, angle, stroke_width, root, marker_id);
+                }
+            }
+        }
+    }
+
+    // Render end marker
+    if let Some(ref marker_id) = style.marker_end {
+        if let Some(marker_def) = ctx.markers.get(marker_id).cloned() {
+            let (x, y) = points[points.len() - 1];
+            let angle = match &marker_def.orient {
+                MarkerOrient::Auto | MarkerOrient::AutoStartReverse => angles[points.len() - 1],
+                MarkerOrient::Angle(a) => *a,
+            };
+            render_single_marker(ctx, &marker_def, x, y, angle, stroke_width, root, marker_id);
+        }
+    }
+}
+
+/// Render a single marker at a specific position
+fn render_single_marker(
+    ctx: &mut RenderContext,
+    marker_def: &MarkerDef,
+    x: f64,
+    y: f64,
+    angle: f64,
+    stroke_width: f64,
+    root: &Node,
+    marker_id: &str,
+) {
+    // Find the marker element in the document
+    if let Some(marker_elem) = find_element_by_id(root, marker_id) {
+        // Calculate scale based on markerUnits
+        let scale = if marker_def.stroke_width_units {
+            stroke_width
+        } else {
+            1.0
+        };
+
+        // Calculate marker transform:
+        // 1. Translate to marker position
+        // 2. Rotate to path direction
+        // 3. Scale by stroke width (if strokeWidth units)
+        // 4. Apply viewBox transform if present
+        // 5. Translate by -refX, -refY
+
+        let marker_transform = if let Some((vb_x, vb_y, vb_w, vb_h)) = marker_def.viewbox {
+            // With viewBox: scale from viewBox to markerWidth/Height
+            let sx = marker_def.marker_width / vb_w;
+            let sy = marker_def.marker_height / vb_h;
+            let s = sx.min(sy) * scale;
+
+            Transform::translate(x, y)
+                .multiply(&Transform::rotate(angle))
+                .multiply(&Transform::scale(s, s))
+                .multiply(&Transform::translate(-marker_def.ref_x, -marker_def.ref_y))
+        } else {
+            // Without viewBox: use markerWidth/Height directly as the coordinate space
+            Transform::translate(x, y)
+                .multiply(&Transform::rotate(angle))
+                .multiply(&Transform::scale(scale, scale))
+                .multiply(&Transform::translate(-marker_def.ref_x, -marker_def.ref_y))
+        };
+
+        // Render marker children with the calculated transform
+        let base_style = Style::new();
+        for child in marker_elem.children() {
+            render_node(ctx, &child, &marker_transform, &base_style, 0, root);
+        }
+    }
+}
+
+fn render_path_with_markers(ctx: &mut RenderContext, d: &str, transform: &Transform, style: &Style, root: &Node) {
     // Check shape limit
     if !ctx.can_render_more() {
         return;
@@ -1759,14 +2141,64 @@ fn render_path(ctx: &mut RenderContext, d: &str, transform: &Transform, style: &
             }
         }
     }
+
+    // Render markers on each polygon
+    let has_markers = style.marker_start.is_some() || style.marker_mid.is_some() || style.marker_end.is_some();
+    if has_markers {
+        for poly in &polygons {
+            if poly.len() >= 2 && poly.len() <= MAX_POLYGON_POINTS {
+                render_markers(ctx, poly, style, transform, root);
+            }
+        }
+    }
+}
+
+/// Check if all points in a path are effectively at the same location (zero-length path)
+fn is_zero_length_path(points: &[(f64, f64)]) -> bool {
+    if points.is_empty() {
+        return true;
+    }
+    let (x0, y0) = points[0];
+    const EPSILON: f64 = 0.001;
+    points.iter().all(|(x, y)| (x - x0).abs() < EPSILON && (y - y0).abs() < EPSILON)
 }
 
 fn render_stroke(ctx: &mut RenderContext, points: &[(f64, f64)], color: Color, width: f64, linecap: LineCap, linejoin: LineJoin, closed: bool) {
-    if points.len() < 2 || color.a == 0 {
+    if color.a == 0 {
         return;
     }
 
     let half_width = width / 2.0;
+
+    // Handle zero-length paths (single point or all points identical)
+    if points.len() == 1 || (points.len() >= 2 && is_zero_length_path(points)) {
+        // For zero-length paths, draw based on linecap
+        let (cx, cy) = points[0];
+        match linecap {
+            LineCap::Round => {
+                // Draw a circle
+                draw_circle(ctx, cx, cy, half_width, color);
+            }
+            LineCap::Square => {
+                // Draw a square centered at the point
+                let square = vec![
+                    (cx - half_width, cy - half_width),
+                    (cx + half_width, cy - half_width),
+                    (cx + half_width, cy + half_width),
+                    (cx - half_width, cy + half_width),
+                ];
+                ctx.fill_polygon(&square, color, FillRule::NonZero);
+            }
+            LineCap::Butt => {
+                // Butt caps on zero-length paths render nothing
+            }
+        }
+        return;
+    }
+
+    if points.len() < 2 {
+        return;
+    }
 
     // Draw stroke as thick line segments
     let n = if closed { points.len() } else { points.len() - 1 };
@@ -2071,7 +2503,7 @@ fn render_ellipse(ctx: &mut RenderContext, node: &Node, transform: &Transform, s
     }
 }
 
-fn render_line(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style) {
+fn render_line(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style, root: &Node) {
     if !ctx.can_render_more() { return; }
     ctx.increment_shapes();
     let x1: f64 = node.attribute("x1").and_then(|s| s.parse().ok()).unwrap_or(0.0);
@@ -2079,21 +2511,29 @@ fn render_line(ctx: &mut RenderContext, node: &Node, transform: &Transform, styl
     let x2: f64 = node.attribute("x2").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let y2: f64 = node.attribute("y2").and_then(|s| s.parse().ok()).unwrap_or(0.0);
 
+    let p1 = transform.apply(x1, y1);
+    let p2 = transform.apply(x2, y2);
+    let points = vec![p1, p2];
+
     if let Some(ref stroke) = style.stroke {
         if style.stroke_width > 0.0 {
             if let Paint::Color(color) = stroke {
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
-                let p1 = transform.apply(x1, y1);
-                let p2 = transform.apply(x2, y2);
-                render_stroke(ctx, &[p1, p2], c, style.stroke_width * transform.a.abs(),
+                render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs(),
                     style.stroke_linecap, style.stroke_linejoin, false);
             }
         }
     }
+
+    // Render markers
+    let has_markers = style.marker_start.is_some() || style.marker_mid.is_some() || style.marker_end.is_some();
+    if has_markers {
+        render_markers(ctx, &points, style, transform, root);
+    }
 }
 
-fn render_polyline(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style) {
+fn render_polyline(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style, root: &Node) {
     if !ctx.can_render_more() { return; }
     ctx.increment_shapes();
     let points = parse_points(node.attribute("points").unwrap_or(""), transform);
@@ -2113,9 +2553,15 @@ fn render_polyline(ctx: &mut RenderContext, node: &Node, transform: &Transform, 
             }
         }
     }
+
+    // Render markers
+    let has_markers = style.marker_start.is_some() || style.marker_mid.is_some() || style.marker_end.is_some();
+    if has_markers && points.len() >= 2 {
+        render_markers(ctx, &points, style, transform, root);
+    }
 }
 
-fn render_polygon_elem(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style) {
+fn render_polygon_elem(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style, root: &Node) {
     if !ctx.can_render_more() { return; }
     ctx.increment_shapes();
     let points = parse_points(node.attribute("points").unwrap_or(""), transform);
@@ -2150,6 +2596,219 @@ fn render_polygon_elem(ctx: &mut RenderContext, node: &Node, transform: &Transfo
                     style.stroke_linecap, style.stroke_linejoin, true);
             }
         }
+    }
+
+    // Render markers (polygons are closed, so vertices form a loop)
+    let has_markers = style.marker_start.is_some() || style.marker_mid.is_some() || style.marker_end.is_some();
+    if has_markers && points.len() >= 2 {
+        render_markers(ctx, &points, style, transform, root);
+    }
+}
+
+/// Render a text element
+fn render_text_element(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style) {
+    if !ctx.can_render_more() { return; }
+    ctx.increment_shapes();
+
+    // Get text position
+    let x: f64 = node.attribute("x").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let y: f64 = node.attribute("y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+
+    // Collect text content (direct text and tspan children)
+    let text_content = collect_text_content(node);
+    if text_content.is_empty() {
+        return;
+    }
+
+    // Get font properties from style
+    let font_family = &style.font_family;
+    let font_size = style.font_size;
+    let font_weight = style.font_weight;
+    let italic = style.font_style == "italic" || style.font_style == "oblique";
+    let text_anchor = &style.text_anchor;
+
+    // Layout text to get glyph paths
+    let glyph_paths = crate::text::layout_text(
+        &text_content,
+        x,
+        y,
+        font_family,
+        font_size,
+        font_weight,
+        italic,
+        text_anchor,
+        &ctx.font_manager,
+    );
+
+    // Render each glyph
+    for glyph_commands in glyph_paths {
+        // Convert to polygons and render
+        let polygons = commands_to_polygons(&glyph_commands, transform);
+
+        for poly in &polygons {
+            if poly.len() < 3 {
+                continue;
+            }
+
+            // Fill the glyph
+            if let Some(ref fill) = style.fill {
+                match fill {
+                    Paint::Color(color) => {
+                        let mut c = *color;
+                        c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
+                        ctx.fill_polygon(poly, c, style.fill_rule);
+                    }
+                    Paint::Gradient(id) => {
+                        if let Some(gradient) = ctx.gradients.get(id).cloned() {
+                            let opacity = style.fill_opacity * style.opacity;
+                            ctx.fill_polygon_gradient(poly, &gradient, transform, style.fill_rule, opacity);
+                        }
+                    }
+                    Paint::None => {}
+                }
+            }
+        }
+    }
+}
+
+/// Collect text content from a text element (including tspan children)
+fn collect_text_content(node: &Node) -> String {
+    let mut content = String::new();
+
+    for child in node.children() {
+        if child.is_text() {
+            if let Some(text) = child.text() {
+                content.push_str(text);
+            }
+        } else if child.is_element() && child.tag_name().name() == "tspan" {
+            // Recursively collect tspan content
+            content.push_str(&collect_text_content(&child));
+        }
+    }
+
+    content
+}
+
+/// Render an image element (embedded or external)
+fn render_image_element(ctx: &mut RenderContext, node: &Node, transform: &Transform, _style: &Style) {
+    if !ctx.can_render_more() { return; }
+    ctx.increment_shapes();
+
+    // Get image dimensions and position
+    let x: f64 = node.attribute("x").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let y: f64 = node.attribute("y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let width: f64 = node.attribute("width").and_then(|s| parse_length(s, 0.0).into()).unwrap_or(0.0);
+    let height: f64 = node.attribute("height").and_then(|s| parse_length(s, 0.0).into()).unwrap_or(0.0);
+
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+
+    // Get href (try both forms)
+    let href = node.attribute("href")
+        .or_else(|| node.attribute(("http://www.w3.org/1999/xlink", "href")));
+
+    let href = match href {
+        Some(h) => h,
+        None => return,
+    };
+
+    // Only handle data: URLs for now
+    if !href.starts_with("data:") {
+        return;
+    }
+
+    // Parse data URL
+    let img_data = match decode_data_url(href) {
+        Some(data) => data,
+        None => return,
+    };
+
+    // Decode image
+    let img = match image::load_from_memory(&img_data) {
+        Ok(img) => img.to_rgba8(),
+        Err(_) => return,
+    };
+
+    // Calculate destination rectangle in screen coordinates
+    let (dst_x1, dst_y1) = transform.apply(x, y);
+    let (dst_x2, dst_y2) = transform.apply(x + width, y + height);
+
+    let dst_x = dst_x1.min(dst_x2) as i32;
+    let dst_y = dst_y1.min(dst_y2) as i32;
+    let dst_w = (dst_x2 - dst_x1).abs() as u32;
+    let dst_h = (dst_y2 - dst_y1).abs() as u32;
+
+    if dst_w == 0 || dst_h == 0 {
+        return;
+    }
+
+    // Resize image to destination size
+    let resized = image::imageops::resize(&img, dst_w, dst_h, image::imageops::FilterType::Lanczos3);
+
+    // Composite onto canvas
+    let canvas_w = ctx.width as i32;
+    let canvas_h = ctx.height as i32;
+
+    for (img_y, row) in resized.enumerate_rows() {
+        let canvas_y = dst_y + img_y as i32;
+        if canvas_y < 0 || canvas_y >= canvas_h {
+            continue;
+        }
+
+        for (img_x, _, pixel) in row {
+            let canvas_x = dst_x + img_x as i32;
+            if canvas_x < 0 || canvas_x >= canvas_w {
+                continue;
+            }
+
+            let [r, g, b, a] = pixel.0;
+            if a == 0 {
+                continue;
+            }
+
+            let idx = (canvas_y as usize * ctx.width + canvas_x as usize) * 4;
+            if idx + 3 >= ctx.buffer.len() {
+                continue;
+            }
+
+            // Alpha compositing
+            let sa = a as f32 / 255.0;
+            let da = ctx.buffer[idx + 3] as f32 / 255.0;
+            let out_a = sa + da * (1.0 - sa);
+
+            if out_a > 0.0 {
+                let blend = |s: u8, d: u8| -> u8 {
+                    ((s as f32 * sa + d as f32 * da * (1.0 - sa)) / out_a) as u8
+                };
+                ctx.buffer[idx] = blend(r, ctx.buffer[idx]);
+                ctx.buffer[idx + 1] = blend(g, ctx.buffer[idx + 1]);
+                ctx.buffer[idx + 2] = blend(b, ctx.buffer[idx + 2]);
+                ctx.buffer[idx + 3] = (out_a * 255.0) as u8;
+            }
+        }
+    }
+}
+
+/// Decode a data: URL to raw bytes
+fn decode_data_url(url: &str) -> Option<Vec<u8>> {
+    // Format: data:[<mediatype>][;base64],<data>
+    let url = url.strip_prefix("data:")?;
+
+    // Find the comma that separates metadata from data
+    let comma_pos = url.find(',')?;
+    let (metadata, data) = url.split_at(comma_pos);
+    let data = &data[1..]; // Skip the comma
+
+    // Check if base64 encoded
+    if metadata.contains(";base64") {
+        // Decode base64, ignoring whitespace
+        let clean_data: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(&clean_data).ok()
+    } else {
+        // URL-encoded data (not commonly used for images)
+        None
     }
 }
 
@@ -2285,6 +2944,11 @@ impl VectorStagRenderer {
             collect_all_gradients(&mut ctx, &child);
         }
 
+        // Also collect all markers from the entire document
+        for child in root.children() {
+            collect_all_markers(&mut ctx, &child);
+        }
+
         // Second pass: collect clipPaths and masks
         for child in root.children() {
             collect_clip_paths_and_masks(&mut ctx, &child, &base_transform);
@@ -2294,8 +2958,12 @@ impl VectorStagRenderer {
         // Parse style from root SVG element (many SVGs like Lucide define stroke/fill on root)
         let base_style = Style::new();
         let root_style = parse_style(&root, &base_style);
-        for child in root.children() {
-            render_node(&mut ctx, &child, &base_transform, &root_style, 0, &root);
+
+        // Check if root SVG has display="none"
+        if root_style.display {
+            for child in root.children() {
+                render_node(&mut ctx, &child, &base_transform, &root_style, 0, &root);
+            }
         }
 
         // Downsample
