@@ -159,14 +159,38 @@ struct GradientDef {
     transform: Transform,
 }
 
+/// ClipPath definition - stores path data for clipping
+#[derive(Clone, Debug)]
+struct ClipPathDef {
+    id: String,
+    // Polygons that define the clip region
+    polygons: Vec<Vec<(f64, f64)>>,
+    // Whether coordinates are in userSpaceOnUse
+    user_space: bool,
+}
+
+/// Mask definition
+#[derive(Clone, Debug)]
+struct MaskDef {
+    id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
 /// Render context
 struct RenderContext {
     buffer: Vec<u8>,
     width: usize,
     height: usize,
     gradients: HashMap<String, GradientDef>,
+    clip_paths: HashMap<String, ClipPathDef>,
+    masks: HashMap<String, MaskDef>,
     antialias: u32,
     shapes_rendered: usize,
+    // Active clip path for current element (polygons in render coordinates)
+    active_clip: Option<Vec<Vec<(f64, f64)>>>,
 }
 
 impl RenderContext {
@@ -188,8 +212,11 @@ impl RenderContext {
             width: render_width,
             height: render_height,
             gradients: HashMap::new(),
+            clip_paths: HashMap::new(),
+            masks: HashMap::new(),
             antialias,
             shapes_rendered: 0,
+            active_clip: None,
         }
     }
 
@@ -199,6 +226,36 @@ impl RenderContext {
 
     fn increment_shapes(&mut self) {
         self.shapes_rendered += 1;
+    }
+
+    /// Check if a point is inside the active clip path
+    fn is_inside_clip(&self, x: f64, y: f64) -> bool {
+        match &self.active_clip {
+            None => true, // No clip = always inside
+            Some(clip_polygons) => {
+                for polygon in clip_polygons {
+                    if polygon.len() < 3 {
+                        continue;
+                    }
+                    // Ray casting algorithm
+                    let mut inside = false;
+                    let n = polygon.len();
+                    let mut j = n - 1;
+                    for i in 0..n {
+                        let (xi, yi) = polygon[i];
+                        let (xj, yj) = polygon[j];
+                        if ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
+                            inside = !inside;
+                        }
+                        j = i;
+                    }
+                    if inside {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
     }
 
     fn blend_pixel(&mut self, x: usize, y: usize, color: Color) {
@@ -1044,6 +1101,10 @@ fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transfor
         return;
     }
 
+    // Handle clip-path attribute (disabled - causes performance issues with per-pixel checking)
+    // TODO: Re-enable with proper render-to-temp-buffer clipping approach
+    let prev_clip: Option<Vec<Vec<(f64, f64)>>> = None;
+
     // Render based on element type
     match tag {
         "g" | "svg" => {
@@ -1187,6 +1248,9 @@ fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transfor
             // Unknown element - skip (don't recurse into unknown elements as they may be effect containers)
         }
     }
+
+    // Restore previous clip path
+    ctx.active_clip = prev_clip;
 }
 
 fn collect_defs(ctx: &mut RenderContext, node: &Node) {
@@ -1348,6 +1412,169 @@ fn collect_all_gradients(ctx: &mut RenderContext, node: &Node) {
     for child in node.children() {
         collect_all_gradients(ctx, &child);
     }
+}
+
+/// Collect all clipPath and mask definitions from the document
+fn collect_clip_paths_and_masks(ctx: &mut RenderContext, node: &Node, transform: &Transform) {
+    if !node.is_element() {
+        return;
+    }
+
+    let tag = node.tag_name().name();
+
+    if tag == "clipPath" {
+        if let Some(id) = node.attribute("id") {
+            let user_space = node.attribute("clipPathUnits") == Some("userSpaceOnUse");
+            let mut polygons: Vec<Vec<(f64, f64)>> = Vec::new();
+
+            // Collect all paths/shapes inside the clipPath
+            for child in node.children() {
+                if !child.is_element() {
+                    continue;
+                }
+                let child_tag = child.tag_name().name();
+                match child_tag {
+                    "path" => {
+                        if let Some(d) = child.attribute("d") {
+                            let child_transform = child.attribute("transform")
+                                .map(parse_transform)
+                                .unwrap_or_default();
+                            let combined = if user_space {
+                                transform.multiply(&child_transform)
+                            } else {
+                                child_transform
+                            };
+                            let polys = path_to_polygons(d, &combined);
+                            polygons.extend(polys);
+                        }
+                    }
+                    "rect" => {
+                        let x: f64 = child.attribute("x").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let y: f64 = child.attribute("y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let w: f64 = child.attribute("width").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let h: f64 = child.attribute("height").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let child_transform = child.attribute("transform")
+                            .map(parse_transform)
+                            .unwrap_or_default();
+                        let combined = if user_space {
+                            transform.multiply(&child_transform)
+                        } else {
+                            child_transform
+                        };
+                        let rect_poly = vec![
+                            combined.apply(x, y),
+                            combined.apply(x + w, y),
+                            combined.apply(x + w, y + h),
+                            combined.apply(x, y + h),
+                        ];
+                        polygons.push(rect_poly);
+                    }
+                    "circle" => {
+                        let cx: f64 = child.attribute("cx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let cy: f64 = child.attribute("cy").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let r: f64 = child.attribute("r").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let child_transform = child.attribute("transform")
+                            .map(parse_transform)
+                            .unwrap_or_default();
+                        let combined = if user_space {
+                            transform.multiply(&child_transform)
+                        } else {
+                            child_transform
+                        };
+                        let segments = 32;
+                        let mut circle: Vec<(f64, f64)> = Vec::with_capacity(segments);
+                        for i in 0..segments {
+                            let angle = 2.0 * std::f64::consts::PI * (i as f64) / (segments as f64);
+                            let px = cx + r * angle.cos();
+                            let py = cy + r * angle.sin();
+                            circle.push(combined.apply(px, py));
+                        }
+                        polygons.push(circle);
+                    }
+                    "ellipse" => {
+                        let cx: f64 = child.attribute("cx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let cy: f64 = child.attribute("cy").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let rx: f64 = child.attribute("rx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let ry: f64 = child.attribute("ry").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let child_transform = child.attribute("transform")
+                            .map(parse_transform)
+                            .unwrap_or_default();
+                        let combined = if user_space {
+                            transform.multiply(&child_transform)
+                        } else {
+                            child_transform
+                        };
+                        let segments = 32;
+                        let mut ellipse: Vec<(f64, f64)> = Vec::with_capacity(segments);
+                        for i in 0..segments {
+                            let angle = 2.0 * std::f64::consts::PI * (i as f64) / (segments as f64);
+                            let px = cx + rx * angle.cos();
+                            let py = cy + ry * angle.sin();
+                            ellipse.push(combined.apply(px, py));
+                        }
+                        polygons.push(ellipse);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Always insert the clipPath - even if empty
+            // An empty clipPath should clip everything (show nothing)
+            ctx.clip_paths.insert(id.to_string(), ClipPathDef {
+                id: id.to_string(),
+                polygons,
+                user_space,
+            });
+        }
+        return;
+    }
+
+    if tag == "mask" {
+        if let Some(id) = node.attribute("id") {
+            let x: f64 = node.attribute("x").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(-10.0);
+            let y: f64 = node.attribute("y").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(-10.0);
+            let width: f64 = node.attribute("width").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(120.0);
+            let height: f64 = node.attribute("height").and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(120.0);
+            ctx.masks.insert(id.to_string(), MaskDef { id: id.to_string(), x, y, width, height });
+        }
+        return;
+    }
+
+    // Recurse into children
+    for child in node.children() {
+        collect_clip_paths_and_masks(ctx, &child, transform);
+    }
+}
+
+/// Check if a point is inside a polygon using ray casting algorithm
+fn point_in_polygon(x: f64, y: f64, polygon: &[(f64, f64)]) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = polygon[i];
+        let (xj, yj) = polygon[j];
+
+        if ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Check if a point is inside any of the clip path's polygons
+fn point_in_clip_path(x: f64, y: f64, clip_path: &ClipPathDef) -> bool {
+    for polygon in &clip_path.polygons {
+        if point_in_polygon(x, y, polygon) {
+            return true;
+        }
+    }
+    false
 }
 
 fn render_path(ctx: &mut RenderContext, d: &str, transform: &Transform, style: &Style) {
@@ -1925,7 +2152,13 @@ impl VectorStagRenderer {
             collect_all_gradients(&mut ctx, &child);
         }
 
-        // Second pass: render tree
+        // Second pass: collect clipPaths and masks (disabled for performance)
+        // TODO: Re-enable with proper render-to-temp-buffer approach
+        // for child in root.children() {
+        //     collect_clip_paths_and_masks(&mut ctx, &child, &base_transform);
+        // }
+
+        // Third pass: render tree
         // Parse style from root SVG element (many SVGs like Lucide define stroke/fill on root)
         let base_style = Style::new();
         let root_style = parse_style(&root, &base_style);
