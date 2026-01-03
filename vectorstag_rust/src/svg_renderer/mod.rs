@@ -112,6 +112,10 @@ impl VectorStagRenderer {
         let render_width = out_width as f64 * antialias as f64;
         let render_height = out_height as f64 * antialias as f64;
 
+        // Set initial viewport dimensions to viewBox for percent calculations
+        ctx.viewport_width = vb_w;
+        ctx.viewport_height = vb_h;
+
         let par = root.attribute("preserveAspectRatio")
             .map(parse_preserve_aspect_ratio)
             .unwrap_or_default();

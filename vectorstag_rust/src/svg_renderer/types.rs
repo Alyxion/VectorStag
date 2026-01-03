@@ -246,6 +246,10 @@ pub struct RenderContext {
     pub active_clip: Option<Vec<Vec<(f64, f64)>>>,
     pub active_clip_bbox: Option<(f64, f64, f64, f64)>,
     pub font_manager: Arc<FontManager>,
+    /// Current viewport width (for percent calculations)
+    pub viewport_width: f64,
+    /// Current viewport height (for percent calculations)
+    pub viewport_height: f64,
 }
 
 /// Maximum shapes to render (prevents infinite loops)

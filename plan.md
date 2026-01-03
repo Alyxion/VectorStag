@@ -2,27 +2,54 @@
 
 **Date:** 2026-01-03
 **Overall Accuracy:** 99.2%
-**Throughput:** ~107 files/sec
+**Throughput:** ~220 files/sec
 
 ---
 
 ## Current Benchmark Results
 
-| Category | Accuracy | Status |
-|----------|----------|--------|
-| Emojis | 99.9% | ✓ Complete |
-| FontAwesome | 100.0% | ✓ Complete |
-| Material | 99.7% | ✓ Complete |
-| Flags | 99.6% | ✓ Complete |
-| W3C | 99.3% | ✓ Complete |
-| Lucide | 98.6% | Minor stroke AA differences |
-| resvg/text | 98.1% | Needs text rendering |
-| resvg/painting | 97.7% | Good |
-| resvg/shapes | 96.7% | Good |
-| resvg/structure | 95.8% | Needs preserveAspectRatio |
-| resvg/paint-servers | 95.7% | Needs gradientTransform |
-| resvg/filters | 95.2% | Needs filter primitives |
-| resvg/masking | 94.3% | Needs clipPath/mask |
+| Category | Accuracy | Files <95% | Status |
+|----------|----------|------------|--------|
+| Emojis | 99.9% | 0 | Complete |
+| FontAwesome | 100.0% | 0 | Complete |
+| Material | 99.7% | 0 | Complete |
+| Flags | 99.7% | 1 | Complete |
+| W3C | 99.3% | 1 | Complete |
+| Lucide | 98.6% | 0 | Minor stroke AA differences |
+| resvg/text | 98.1% | 21 | Needs text rendering |
+| resvg/painting | 97.7% | 40 | mix-blend-mode, isolation needed |
+| resvg/shapes | 96.7% | 17 | Good |
+| resvg/structure | 95.8% | 47 | Image loading, use elements |
+| resvg/paint-servers | 95.7% | 36 | Pattern support, gradient xlink:href |
+| resvg/filters | 95.2% | 99 | Needs filter primitives |
+| resvg/masking | 94.3% | 23 | Needs mask implementation |
+
+---
+
+## Recent Improvements (2026-01-03)
+
+### 1. HSL/HSLA Color Support
+- Added `hsl()` and `hsla()` color parsing
+- Correct HSL to RGB conversion
+- Supports percentage saturation/lightness values
+
+### 2. Transform-Origin Support (SVG 2)
+- Full `transform-origin` attribute parsing
+- Supports keywords: center, left, right, top, bottom
+- Supports percentage and absolute length values
+- Applied to shapes: rect, circle, ellipse, line, image
+- Note: Groups and clipPath transform-origin need computed bbox
+
+### 3. Module Restructuring
+- Split svg_renderer.rs (3000+ lines) into smaller modules:
+  - types.rs: Core types (Color, Transform, Style, etc.)
+  - context.rs: RenderContext implementation
+  - parsing.rs: Attribute parsing functions
+  - defs.rs: Gradient/marker/clipPath collection
+  - shapes.rs: Shape rendering (rect, circle, etc.)
+  - elements.rs: Path, text, image rendering
+  - render.rs: Main render_node logic
+  - preserve_aspect_ratio.rs: PAR parsing and transforms
 
 ---
 
@@ -30,7 +57,7 @@
 
 1. **Full Rust SVG Rendering Pipeline**
    - SVG parsing with roxmltree
-   - Path rendering with antialiasing
+   - Path rendering with 4x antialiasing
    - Shape primitives (rect, circle, ellipse, line, polyline, polygon)
    - Rounded rectangles (rx/ry)
 
@@ -38,6 +65,7 @@
    - Linear gradients (objectBoundingBox and userSpaceOnUse)
    - Radial gradients
    - Gradient stop interpolation
+   - gradientTransform support
    - Gradient collection from entire document tree
 
 3. **Stroke Rendering**
@@ -49,93 +77,87 @@
 4. **Style Inheritance**
    - CSS style parsing
    - Style inheritance from parent elements
-   - Root SVG style application
    - currentColor support
 
+5. **Color Parsing**
+   - Hex colors (#RGB, #RRGGBB, #RGBA, #RRGGBBAA)
+   - RGB/RGBA functions
+   - HSL/HSLA functions
+   - Named colors
+
 6. **Advanced Features**
-   - `preserveAspectRatio` support (parsing and viewbox transformation)
-   - `gradientTransform` support for both userSpaceOnUse and objectBoundingBox
-
----
-
-## Work In Progress
-
-### ClipPath (Basic Support Enabled)
-
-**Status:** Enabled with BBox Optimization
-
-**Implementation:**
-- `ClipPathDef` stores polygons from path data
-- `render_node` identifies and applies active clip path
-- `is_inside_clip` uses **Bounding Box Check** first, then Ray Casting
-- **Optimization:** Bounding box pre-check significantly reduces the cost of per-pixel testing.
-
-**Remaining Work:**
-- Full `objectBoundingBox` support (requires element bbox calculation before render)
-- Render-to-mask buffer approach for complex clips (performance optimization)
+   - `preserveAspectRatio` support (all align/meetOrSlice modes)
+   - `transform-origin` support (SVG 2)
+   - Viewport percent calculations
+   - CSS length units (mm, cm, in, pt, pc, px)
 
 ---
 
 ## Remaining Work for 99.9%
 
-### Priority 1: ClipPath (Efficient Implementation)
-- Implement render-to-temp-buffer approach
-- Handle objectBoundingBox vs userSpaceOnUse
-- Support nested clipPaths
+### High Priority
 
-### Priority 2: Mask Support
-- Similar to clipPath but uses luminance for alpha
-- Render mask content to buffer
-- Convert to grayscale for mask values
-
-### Priority 3: Basic Filters
-Key filter primitives needed:
+#### 1. Filter Primitives (99 tests failing)
 - `feGaussianBlur` - Most common
 - `feColorMatrix` - Color adjustments
 - `feOffset` - Shadow effects
 - `feFlood` - Solid color regions
 - `feMerge` - Compositing filter results
 
-### Priority 4: Text Rendering
-Options:
-1. Use system fonts via fontdb crate
-2. Convert text to paths (simpler but less accurate)
-3. Integrate with existing text rasterizer
+#### 2. Mask Support (23 tests failing)
+- Implement mask rendering to buffer
+- Convert to luminance for alpha mask
+- Handle maskContentUnits
 
-### Priority 5: preserveAspectRatio
-- **Status:** Completed
-- Implemented parsing for all align/meetOrSlice modes
-- Integrated `compute_viewbox_transform` into rendering pipeline
+#### 3. Image Improvements (47 structure tests)
+- External image loading (file:// URLs)
+- Intrinsic image size detection (for no-width, no-height)
+- Embedded SVG/SVGZ rendering
+- preserveAspectRatio on images
 
-### Priority 6: gradientTransform
-- **Status:** Completed
-- Fixed transform application for both `userSpaceOnUse` and `objectBoundingBox`
-- Verified correct coordinate mapping for bounding box relative transforms
+### Medium Priority
+
+#### 4. Paint Server Improvements (36 tests)
+- Pattern support
+- Gradient xlink:href inheritance
+- spreadMethod (pad, reflect, repeat)
+
+#### 5. Painting Features (40 tests)
+- mix-blend-mode
+- isolation
+- paint-order
+
+#### 6. Use Element Improvements
+- Complex style inheritance
+- Nested use elements
+- Size inheritance from referenced elements
 
 ---
 
 ## Code Structure
 
 ```
-vectorstag_rust/src/
-├── lib.rs              # Module registration
-├── svg_renderer.rs     # Main renderer (2200+ lines)
-├── canvas.rs           # Analytical AA fill algorithms
-├── gradient.rs         # Gradient generation
-├── stroke.rs           # Stroke rendering
-├── path.rs             # Path parsing
-├── filters.rs          # Filter primitives
-├── image.rs            # Image operations
-├── css.rs              # CSS selector parsing
-└── owned_canvas.rs     # Canvas ownership helpers
+vectorstag_rust/src/svg_renderer/
+├── mod.rs              # Main entry point, VectorStagRenderer
+├── types.rs            # Core types (Color, Transform, Style, etc.)
+├── context.rs          # RenderContext implementation
+├── parsing.rs          # Attribute parsing (colors, transforms, styles)
+├── defs.rs             # Gradient/marker/clipPath collection
+├── shapes.rs           # Shape rendering (rect, circle, ellipse, line)
+├── elements.rs         # Path, text, image rendering
+├── render.rs           # Main render_node logic
+├── path_utils.rs       # Path parsing utilities
+├── markers.rs          # Marker rendering
+├── stroke.rs           # Stroke path generation
+└── preserve_aspect_ratio.rs  # PAR parsing and transforms
 ```
 
 ---
 
 ## Performance Notes
 
-- Target: <20s for full benchmark (currently ~75s)
-- Per-file average: ~42ms (acceptable for complex SVGs)
+- Full benchmark: ~35s at 220 files/sec
+- Per-file average: ~40ms
 - Icon collections render at 100-300 files/sec
 - resvg tests are slower due to complexity
 
@@ -145,14 +167,17 @@ vectorstag_rust/src/
 
 ```bash
 # Full benchmark
-poetry run python scripts/benchmark.py -j 8
+poetry run python scripts/benchmark.py -j 16
 
 # Collections only
-poetry run python scripts/benchmark.py --collections -j 8
+poetry run python scripts/benchmark.py --collections -j 16
 
 # Specific resvg category
-poetry run python scripts/benchmark.py --resvg --resvg-category masking -j 8
+poetry run python scripts/benchmark.py --resvg --resvg-category structure -j 8
 
 # Single file render
-poetry run python render.py input.svg output.png
+poetry run python render.py input.svg output.png -b white
+
+# Compare with reference
+poetry run python svg_compare.py compare input.svg
 ```

@@ -18,6 +18,9 @@ pub fn render_path_with_markers(
     if !ctx.can_render_more() {
         return;
     }
+    if !style.visibility {
+        return;
+    }
 
     let polygons = path_to_polygons(d, transform);
 
@@ -78,6 +81,7 @@ pub fn render_path_with_markers(
 /// Render a text element
 pub fn render_text_element(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style) {
     if !ctx.can_render_more() { return; }
+    if !style.visibility { return; }
     ctx.increment_shapes();
 
     let x: f64 = node.attribute("x").and_then(|s| s.parse().ok()).unwrap_or(0.0);
@@ -152,8 +156,9 @@ pub fn collect_text_content(node: &Node) -> String {
 }
 
 /// Render an image element (embedded or external)
-pub fn render_image_element(ctx: &mut RenderContext, node: &Node, transform: &Transform, _style: &Style) {
+pub fn render_image_element(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style) {
     if !ctx.can_render_more() { return; }
+    if !style.visibility { return; }
     ctx.increment_shapes();
 
     let x: f64 = node.attribute("x").and_then(|s| s.parse().ok()).unwrap_or(0.0);

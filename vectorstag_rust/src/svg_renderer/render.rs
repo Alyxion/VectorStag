@@ -2,7 +2,7 @@
 
 use roxmltree::Node;
 use super::types::*;
-use super::parsing::{parse_transform, parse_style};
+use super::parsing::{parse_transform, parse_style, parse_viewbox, parse_length, parse_length_percent, parse_transform_origin, get_element_bbox, apply_transform_origin};
 use super::defs::collect_defs;
 use super::shapes::*;
 use super::elements::*;
@@ -45,24 +45,31 @@ pub fn render_node(
         _ => {}
     }
 
-    // Parse transform
-    let local_transform = node.attribute("transform")
+    // Parse transform with transform-origin support
+    let mut local_transform = node.attribute("transform")
         .map(parse_transform)
         .unwrap_or_default();
+
+    // Apply transform-origin if present
+    if let Some(origin_str) = node.attribute("transform-origin") {
+        let origin = parse_transform_origin(origin_str);
+        let bbox = get_element_bbox(node);
+        local_transform = apply_transform_origin(&local_transform, &origin, bbox);
+    }
+
     let transform = parent_transform.multiply(&local_transform);
 
     // Parse style
     let style = parse_style(node, parent_style);
 
-    // Skip elements with display: none
+    // Skip elements with display: none (removes element and all children)
     if !style.display {
         return;
     }
 
-    // Skip elements with visibility: hidden
-    if !style.visibility {
-        return;
-    }
+    // Note: visibility:hidden is handled per-element, not here
+    // Container elements (g, svg, etc.) still process children even if hidden
+    // Only leaf elements (path, rect, etc.) check visibility before rendering
 
     // Handle clip-path attribute
     let mut prev_clip: Option<Vec<Vec<(f64, f64)>>> = None;
@@ -109,21 +116,105 @@ pub fn render_node(
             }
         }
         "svg" => {
+            // Handle nested SVG with proper viewport and viewBox support
+            // Use parent viewport for percent values
+            let parent_vp_w = ctx.viewport_width;
+            let parent_vp_h = ctx.viewport_height;
+
             let x = node.attribute("x")
-                .and_then(|s| s.trim_end_matches("px").parse::<f64>().ok())
+                .map(|s| parse_length_percent(s, parent_vp_w, 0.0))
                 .unwrap_or(0.0);
             let y = node.attribute("y")
-                .and_then(|s| s.trim_end_matches("px").parse::<f64>().ok())
+                .map(|s| parse_length_percent(s, parent_vp_h, 0.0))
                 .unwrap_or(0.0);
 
-            let nested_transform = if x != 0.0 || y != 0.0 {
-                transform.multiply(&Transform::translate(x, y))
+            // Get viewport size (width/height of nested SVG)
+            let width = node.attribute("width")
+                .map(|s| parse_length_percent(s, parent_vp_w, 0.0))
+                .unwrap_or(0.0);
+            let height = node.attribute("height")
+                .map(|s| parse_length_percent(s, parent_vp_h, 0.0))
+                .unwrap_or(0.0);
+
+            // Parse viewBox if present
+            let viewbox = node.attribute("viewBox").and_then(parse_viewbox);
+
+            // Start with x/y translation
+            let mut nested_transform = transform.multiply(&Transform::translate(x, y));
+
+            // Determine the new viewport dimensions for percent calculations
+            // Use viewBox dimensions if present, otherwise use width/height
+            let (new_viewport_w, new_viewport_h) = if let Some((_, _, vb_w, vb_h)) = viewbox {
+                (vb_w, vb_h)
+            } else if width > 0.0 && height > 0.0 {
+                (width, height)
             } else {
-                transform
+                // Use parent viewport if nothing specified
+                (ctx.viewport_width, ctx.viewport_height)
             };
+
+            // If viewBox is present and we have a valid viewport size, apply viewBox transform
+            if let Some((vb_x, vb_y, vb_w, vb_h)) = viewbox {
+                if width > 0.0 && height > 0.0 && vb_w > 0.0 && vb_h > 0.0 {
+                    // Parse preserveAspectRatio
+                    let par = node.attribute("preserveAspectRatio")
+                        .map(parse_preserve_aspect_ratio)
+                        .unwrap_or_default();
+
+                    let viewbox_transform = compute_viewbox_transform(
+                        vb_x, vb_y, vb_w, vb_h,
+                        width, height,
+                        par
+                    );
+
+                    nested_transform = nested_transform.multiply(&viewbox_transform);
+                }
+            }
+
+            // Set up viewport clipping if width/height are specified
+            // Check overflow attribute (default is "hidden" for nested SVG)
+            let overflow = node.attribute("overflow").unwrap_or("hidden");
+            let should_clip = (overflow == "hidden" || overflow == "scroll") && width > 0.0 && height > 0.0;
+
+            // Save previous state
+            let prev_clip = ctx.active_clip.clone();
+            let prev_clip_bbox = ctx.active_clip_bbox;
+            let prev_viewport_w = ctx.viewport_width;
+            let prev_viewport_h = ctx.viewport_height;
+
+            // Update viewport dimensions for children
+            ctx.viewport_width = new_viewport_w;
+            ctx.viewport_height = new_viewport_h;
+
+            if should_clip {
+                // Create clip rectangle in screen coordinates
+                let (x1, y1) = transform.apply(x, y);
+                let (x2, y2) = transform.apply(x + width, y);
+                let (x3, y3) = transform.apply(x + width, y + height);
+                let (x4, y4) = transform.apply(x, y + height);
+
+                let clip_polygon = vec![(x1, y1), (x2, y2), (x3, y3), (x4, y4)];
+
+                // Calculate bbox
+                let min_x = x1.min(x2).min(x3).min(x4);
+                let max_x = x1.max(x2).max(x3).max(x4);
+                let min_y = y1.min(y2).min(y3).min(y4);
+                let max_y = y1.max(y2).max(y3).max(y4);
+
+                ctx.active_clip = Some(vec![clip_polygon]);
+                ctx.active_clip_bbox = Some((min_x, min_y, max_x, max_y));
+            }
 
             for child in node.children() {
                 render_node(ctx, &child, &nested_transform, &style, depth + 1, root);
+            }
+
+            // Restore previous state
+            ctx.viewport_width = prev_viewport_w;
+            ctx.viewport_height = prev_viewport_h;
+            if should_clip {
+                ctx.active_clip = prev_clip;
+                ctx.active_clip_bbox = prev_clip_bbox;
             }
         }
         "switch" => {

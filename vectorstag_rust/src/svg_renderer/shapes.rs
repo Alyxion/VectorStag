@@ -2,27 +2,45 @@
 
 use roxmltree::Node;
 use super::types::*;
-use super::parsing::parse_points;
+use super::parsing::{parse_points, parse_length_percent, parse_radius_percent};
 use super::stroke::render_stroke;
 use super::markers::render_markers;
 
 /// Render a rectangle element
 pub fn render_rect(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style) {
     if !ctx.can_render_more() { return; }
+    if !style.visibility { return; }
     ctx.increment_shapes();
 
-    let x: f64 = node.attribute("x").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let y: f64 = node.attribute("y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let w: f64 = node.attribute("width").and_then(|s| s.trim_end_matches("px").parse().ok()).unwrap_or(0.0);
-    let h: f64 = node.attribute("height").and_then(|s| s.trim_end_matches("px").parse().ok()).unwrap_or(0.0);
+    // Get viewport dimensions for percent calculations
+    let vp_w = ctx.viewport_width;
+    let vp_h = ctx.viewport_height;
+
+    // Parse with percent support
+    let x: f64 = node.attribute("x")
+        .map(|s| parse_length_percent(s, vp_w, 0.0))
+        .unwrap_or(0.0);
+    let y: f64 = node.attribute("y")
+        .map(|s| parse_length_percent(s, vp_h, 0.0))
+        .unwrap_or(0.0);
+    let w: f64 = node.attribute("width")
+        .map(|s| parse_length_percent(s, vp_w, 0.0))
+        .unwrap_or(0.0);
+    let h: f64 = node.attribute("height")
+        .map(|s| parse_length_percent(s, vp_h, 0.0))
+        .unwrap_or(0.0);
 
     if w <= 0.0 || h <= 0.0 {
         return;
     }
 
     // Parse rx/ry for rounded corners
-    let mut rx: f64 = node.attribute("rx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let mut ry: f64 = node.attribute("ry").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let mut rx: f64 = node.attribute("rx")
+        .map(|s| parse_length_percent(s, vp_w, 0.0))
+        .unwrap_or(0.0);
+    let mut ry: f64 = node.attribute("ry")
+        .map(|s| parse_length_percent(s, vp_h, 0.0))
+        .unwrap_or(0.0);
 
     // Per SVG spec: if only rx or ry is specified, the other defaults to it
     if rx > 0.0 && ry == 0.0 { ry = rx; }
@@ -108,11 +126,25 @@ pub fn render_rect(ctx: &mut RenderContext, node: &Node, transform: &Transform, 
 /// Render a circle element
 pub fn render_circle(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style) {
     if !ctx.can_render_more() { return; }
+    if !style.visibility { return; }
     ctx.increment_shapes();
 
-    let cx: f64 = node.attribute("cx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let cy: f64 = node.attribute("cy").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let r: f64 = node.attribute("r").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    // Get viewport dimensions for percent calculations
+    let vp_w = ctx.viewport_width;
+    let vp_h = ctx.viewport_height;
+
+    // Parse cx, cy with percent support (relative to viewport width/height)
+    let cx: f64 = node.attribute("cx")
+        .map(|s| parse_length_percent(s, vp_w, 0.0))
+        .unwrap_or(0.0);
+    let cy: f64 = node.attribute("cy")
+        .map(|s| parse_length_percent(s, vp_h, 0.0))
+        .unwrap_or(0.0);
+    // Parse r with percent support (relative to sqrt((w^2 + h^2)/2))
+    // SVG: negative r means error - don't render
+    let r: f64 = node.attribute("r")
+        .map(|s| parse_radius_percent(s, vp_w, vp_h, 0.0))
+        .unwrap_or(0.0);
 
     if r <= 0.0 {
         return;
@@ -159,14 +191,48 @@ pub fn render_circle(ctx: &mut RenderContext, node: &Node, transform: &Transform
 /// Render an ellipse element
 pub fn render_ellipse(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style) {
     if !ctx.can_render_more() { return; }
+    if !style.visibility { return; }
     ctx.increment_shapes();
 
-    let cx: f64 = node.attribute("cx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let cy: f64 = node.attribute("cy").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let rx: f64 = node.attribute("rx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let ry: f64 = node.attribute("ry").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    // Get viewport dimensions for percent calculations
+    let vp_w = ctx.viewport_width;
+    let vp_h = ctx.viewport_height;
 
-    if rx <= 0.0 || ry <= 0.0 {
+    // Parse with percent support
+    let cx: f64 = node.attribute("cx")
+        .map(|s| parse_length_percent(s, vp_w, 0.0))
+        .unwrap_or(0.0);
+    let cy: f64 = node.attribute("cy")
+        .map(|s| parse_length_percent(s, vp_h, 0.0))
+        .unwrap_or(0.0);
+
+    // SVG 2: Handle missing and negative radii
+    let rx_attr = node.attribute("rx");
+    let ry_attr = node.attribute("ry");
+    let rx_raw: f64 = rx_attr
+        .map(|s| parse_length_percent(s, vp_w, 0.0))
+        .unwrap_or(0.0);
+    let ry_raw: f64 = ry_attr
+        .map(|s| parse_length_percent(s, vp_h, 0.0))
+        .unwrap_or(0.0);
+
+    // If both are negative, don't render
+    if rx_raw < 0.0 && ry_raw < 0.0 {
+        return;
+    }
+
+    // Use absolute values for remaining calculations
+    let mut rx = rx_raw.abs();
+    let mut ry = ry_raw.abs();
+
+    // If one radius is missing, use the other
+    if rx_attr.is_none() && ry_attr.is_some() {
+        rx = ry;
+    } else if ry_attr.is_none() && rx_attr.is_some() {
+        ry = rx;
+    }
+
+    if rx == 0.0 || ry == 0.0 {
         return;
     }
 
@@ -211,6 +277,7 @@ pub fn render_ellipse(ctx: &mut RenderContext, node: &Node, transform: &Transfor
 /// Render a line element
 pub fn render_line(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style, root: &Node) {
     if !ctx.can_render_more() { return; }
+    if !style.visibility { return; }
     ctx.increment_shapes();
 
     let x1: f64 = node.attribute("x1").and_then(|s| s.parse().ok()).unwrap_or(0.0);
@@ -243,6 +310,7 @@ pub fn render_line(ctx: &mut RenderContext, node: &Node, transform: &Transform, 
 /// Render a polyline element
 pub fn render_polyline(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style, root: &Node) {
     if !ctx.can_render_more() { return; }
+    if !style.visibility { return; }
     ctx.increment_shapes();
 
     let points = parse_points(node.attribute("points").unwrap_or(""), transform);
@@ -272,6 +340,7 @@ pub fn render_polyline(ctx: &mut RenderContext, node: &Node, transform: &Transfo
 /// Render a polygon element
 pub fn render_polygon_elem(ctx: &mut RenderContext, node: &Node, transform: &Transform, style: &Style, root: &Node) {
     if !ctx.can_render_more() { return; }
+    if !style.visibility { return; }
     ctx.increment_shapes();
 
     let points = parse_points(node.attribute("points").unwrap_or(""), transform);

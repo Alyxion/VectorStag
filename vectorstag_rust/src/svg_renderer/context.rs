@@ -32,6 +32,8 @@ impl RenderContext {
             active_clip: None,
             active_clip_bbox: None,
             font_manager,
+            viewport_width: render_width as f64,
+            viewport_height: render_height as f64,
         }
     }
 
