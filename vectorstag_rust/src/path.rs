@@ -80,7 +80,7 @@ pub fn parse_path<'py>(py: Python<'py>, d: &str) -> Bound<'py, PyList> {
             PathCmd::L(x, y) => ("L", x, y, 0.0, 0.0, 0.0, 0.0),
             PathCmd::C(x1, y1, x2, y2, x, y) => ("C", x1, y1, x2, y2, x, y),
             PathCmd::Q(x1, y1, x, y) => ("Q", x1, y1, x, y, 0.0, 0.0),
-            PathCmd::A(rx, ry, rotation, large_arc, sweep, x, y) => {
+            PathCmd::A(rx, ry, rotation, large_arc, sweep, x, _y) => {
                 // Return arc as "A" with parameters encoded
                 ("A", rx, ry, rotation, if large_arc { 1.0 } else { 0.0 }, if sweep { 1.0 } else { 0.0 }, x)
             }

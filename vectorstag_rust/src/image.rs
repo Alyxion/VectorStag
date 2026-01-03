@@ -3,10 +3,11 @@
 use pyo3::prelude::*;
 use numpy::IntoPyArray;
 use ndarray::Array3;
-use rayon::prelude::*;
+
 
 /// Alpha blend a single pixel (inline for SIMD-friendly code)
 #[inline(always)]
+#[allow(dead_code)]
 pub fn blend_pixel(dst: &mut [u8], src: &[u8]) {
     let src_a = src[3] as u32;
     if src_a == 0 { return; }
@@ -328,7 +329,7 @@ pub fn apply_mask_and_composite<'py>(
     }
 
     // Calculate processing bounds
-    let (mut start_x, mut start_y, mut end_x, mut end_y) = if let Some((bx1, by1, bx2, by2)) = bounds {
+    let (start_x, start_y, end_x, end_y) = if let Some((bx1, by1, bx2, by2)) = bounds {
         // Use provided bounds, clamped to valid range
         (
             (bx1.max(0) as usize).max(offset_x.max(0) as usize),

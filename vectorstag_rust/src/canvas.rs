@@ -535,7 +535,7 @@ pub fn canvas_fill_polygon_linear_gradient_aa(
 pub fn canvas_fill_polygon_radial_gradient_aa(
     mut dst: PyReadwriteArray3<u8>,
     points: Vec<(f32, f32)>,
-    cx: f32, cy: f32, radius: f32,  // Outer circle
+    _cx: f32, _cy: f32, radius: f32,  // Outer circle
     fx: f32, fy: f32, fr: f32,       // Focal point and inner radius
     stops: Vec<(f32, u8, u8, u8, u8)>,  // (position, r, g, b, a)
     spread_method: u8,
@@ -724,8 +724,6 @@ pub fn canvas_fill_circle_aa(
     let py_start = ((cy - radius - 1.0).floor() as i32).max(0) as usize;
     let py_end = ((cy + radius + 1.0).ceil() as i32).min(img_height as i32) as usize;
 
-    let r2 = radius * radius;
-
     for py in py_start..py_end {
         let py_center = py as f32 + 0.5;
         let dy = py_center - cy;
@@ -747,7 +745,7 @@ pub fn canvas_fill_circle_aa(
                 0.0  // Fully outside
             } else {
                 // In the transition zone - linear falloff
-                (radius + 0.5 - dist)
+                radius + 0.5 - dist
             };
 
             if cov > 0.0 {

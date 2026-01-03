@@ -18,6 +18,7 @@ mod gradient;
 pub mod path;
 mod image;
 mod filters;
+mod text;
 mod css;
 mod canvas;
 mod owned_canvas;

@@ -52,35 +52,27 @@
    - Root SVG style application
    - currentColor support
 
-5. **Use Element Support**
-   - href/xlink:href resolution
-   - Symbol with viewBox handling
-   - Proper transform inheritance
+6. **Advanced Features**
+   - `preserveAspectRatio` support (parsing and viewbox transformation)
+   - `gradientTransform` support for both userSpaceOnUse and objectBoundingBox
 
 ---
 
 ## Work In Progress
 
-### ClipPath (Infrastructure Added, Disabled)
+### ClipPath (Basic Support Enabled)
 
-**Files Modified:**
-- `vectorstag_rust/src/svg_renderer.rs`
+**Status:** Enabled with BBox Optimization
 
-**What was added:**
-- `ClipPathDef` struct to store clip path polygons
-- `collect_clip_paths_and_masks()` function
-- `point_in_polygon()` ray casting algorithm
-- `is_inside_clip()` method on RenderContext
+**Implementation:**
+- `ClipPathDef` stores polygons from path data
+- `render_node` identifies and applies active clip path
+- `is_inside_clip` uses **Bounding Box Check** first, then Ray Casting
+- **Optimization:** Bounding box pre-check significantly reduces the cost of per-pixel testing.
 
-**Why disabled:**
-Per-pixel clip path checking caused ~10x performance regression (107 files/sec → 8 files/sec). Need render-to-temporary-buffer approach instead.
-
-**Proper implementation approach:**
-1. When element has clip-path, create temporary RGBA buffer
-2. Render element to temporary buffer
-3. Create clip mask from clipPath polygons
-4. Apply mask during composite to main buffer
-5. This avoids per-pixel polygon tests
+**Remaining Work:**
+- Full `objectBoundingBox` support (requires element bbox calculation before render)
+- Render-to-mask buffer approach for complex clips (performance optimization)
 
 ---
 
@@ -111,18 +103,14 @@ Options:
 3. Integrate with existing text rasterizer
 
 ### Priority 5: preserveAspectRatio
-Currently hardcoded to xMidYMid meet. Need to parse:
-- `none` - stretch to fit
-- `xMinYMin`, `xMidYMin`, `xMaxYMin`
-- `xMinYMid`, `xMidYMid`, `xMaxYMid`
-- `xMinYMax`, `xMidYMax`, `xMaxYMax`
-- `meet` vs `slice`
+- **Status:** Completed
+- Implemented parsing for all align/meetOrSlice modes
+- Integrated `compute_viewbox_transform` into rendering pipeline
 
 ### Priority 6: gradientTransform
-Current implementation doesn't apply gradientTransform correctly for objectBoundingBox. Need to:
-1. Apply gradientTransform in 0-1 coordinate space
-2. Then map to bounding box
-3. Handle rotation, skew, scale properly
+- **Status:** Completed
+- Fixed transform application for both `userSpaceOnUse` and `objectBoundingBox`
+- Verified correct coordinate mapping for bounding box relative transforms
 
 ---
 

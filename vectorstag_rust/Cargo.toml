@@ -17,6 +17,11 @@ rayon = "1.10"
 roxmltree = "0.20"
 regex = "1"
 
+# Text rendering
+fontdb = "0.16"
+ttf-parser = "0.20"
+rustybuzz = "0.12"
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -49,3 +49,61 @@ poetry run python scripts/benchmark.py --list-resvg-categories
 - Use 4-8 workers if memory pressure occurs on complex SVGs: `-j 4` or `-j 8`
 - Use `ProcessPoolExecutor` with `as_completed()` for timeout support
 - Worker timeout is 30 seconds (WORKER_TIMEOUT in svg_compare.py)
+
+---
+
+  How to Build
+
+  cd /projects/VectorStag
+
+  # Install dependencies
+  poetry install
+
+  # Build the Rust extension
+  poetry run maturin develop --release -m vectorstag_rust/Cargo.toml
+
+  ---
+  How to Test
+
+  Full Benchmark (All Collections + resvg tests)
+
+  poetry run python scripts/benchmark.py -j 8
+
+  Icon Collections Only (Faster)
+
+  poetry run python scripts/benchmark.py --collections -j 8
+
+  Specific resvg Category
+
+  poetry run python scripts/benchmark.py --resvg --resvg-category masking -j 8
+  poetry run python scripts/benchmark.py --resvg --resvg-category filters -j 8
+  poetry run python scripts/benchmark.py --resvg --resvg-category structure -j 8
+
+  List Available Categories
+
+  poetry run python scripts/benchmark.py --list-resvg-categories
+
+  Render Single File
+
+  poetry run python render.py input.svg output.png -b white
+  poetry run python render.py input.svg output.png -w 500 -H 500
+
+  Compare with Reference
+
+  The benchmark compares against resvg (pre-rendered PNGs in resvg-test-suite/tests/) and CairoSVG.
+
+  ---
+  Key Files
+
+  - Main renderer: vectorstag_rust/src/svg_renderer.rs (~2200 lines)
+  - Benchmark script: scripts/benchmark.py
+  - Python wrapper: vectorstag/rust_renderer.py
+  - Status doc: plan.md
+
+  Todos
+  ☐ Implement efficient clipPath with render-to-temp approach
+  ☐ Implement mask support
+  ☐ Implement basic filters (feGaussianBlur, feColorMatrix)
+  ☐ Implement text rendering
+  ☐ Implement preserveAspectRatio parsing
+  ☐ Fix gradientTransform for objectBoundingBox

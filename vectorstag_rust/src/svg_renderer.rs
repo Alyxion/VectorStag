@@ -8,6 +8,12 @@ use numpy::{PyArray3, IntoPyArray};
 use ndarray::Array3;
 use roxmltree::{Document, Node};
 use std::collections::HashMap;
+use std::sync::Arc;
+use crate::text::FontManager;
+use crate::path::PathCmd;
+
+mod preserve_aspect_ratio;
+use preserve_aspect_ratio::*;
 
 /// RGBA color
 #[derive(Clone, Copy, Debug, Default)]
@@ -23,10 +29,12 @@ impl Color {
         Self { r, g, b, a }
     }
 
+    #[allow(dead_code)]
     fn transparent() -> Self {
         Self { r: 0, g: 0, b: 0, a: 0 }
     }
 
+    #[allow(dead_code)]
     fn white() -> Self {
         Self { r: 255, g: 255, b: 255, a: 255 }
     }
@@ -34,8 +42,8 @@ impl Color {
 
 /// 2D Transform matrix (a, b, c, d, e, f)
 #[derive(Clone, Copy, Debug)]
-struct Transform {
-    a: f64, b: f64, c: f64, d: f64, e: f64, f: f64,
+pub struct Transform {
+    pub a: f64, pub b: f64, pub c: f64, pub d: f64, pub e: f64, pub f: f64,
 }
 
 impl Default for Transform {
@@ -45,14 +53,14 @@ impl Default for Transform {
 }
 
 impl Transform {
-    fn apply(&self, x: f64, y: f64) -> (f64, f64) {
+    pub fn apply(&self, x: f64, y: f64) -> (f64, f64) {
         (
             self.a * x + self.c * y + self.e,
             self.b * x + self.d * y + self.f,
         )
     }
 
-    fn multiply(&self, other: &Transform) -> Transform {
+    pub fn multiply(&self, other: &Transform) -> Transform {
         Transform {
             a: self.a * other.a + self.c * other.b,
             b: self.b * other.a + self.d * other.b,
@@ -63,18 +71,34 @@ impl Transform {
         }
     }
 
-    fn scale(sx: f64, sy: f64) -> Transform {
+    pub fn scale(sx: f64, sy: f64) -> Transform {
         Transform { a: sx, b: 0.0, c: 0.0, d: sy, e: 0.0, f: 0.0 }
     }
 
-    fn translate(tx: f64, ty: f64) -> Transform {
+    pub fn translate(tx: f64, ty: f64) -> Transform {
         Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: tx, f: ty }
     }
 
-    fn rotate(angle: f64) -> Transform {
+    pub fn rotate(angle: f64) -> Transform {
         let cos = angle.cos();
         let sin = angle.sin();
         Transform { a: cos, b: sin, c: -sin, d: cos, e: 0.0, f: 0.0 }
+    }
+
+    #[allow(dead_code)]
+    pub fn invert(&self) -> Option<Transform> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-10 {
+            return None;
+        }
+        Some(Transform {
+            a: self.d / det,
+            b: -self.b / det,
+            c: -self.c / det,
+            d: self.a / det,
+            e: (self.c * self.f - self.d * self.e) / det,
+            f: (self.b * self.e - self.a * self.f) / det,
+        })
     }
 }
 
@@ -92,6 +116,12 @@ struct Style {
     stroke_linejoin: LineJoin,
     stroke_miterlimit: f64,
     display: bool, // true = visible, false = none
+    // Font properties
+    font_family: String,
+    font_size: f64,
+    font_weight: u16,
+    font_style: String, // "normal", "italic", "oblique"
+    text_anchor: String, // "start", "middle", "end"
 }
 
 impl Style {
@@ -108,6 +138,11 @@ impl Style {
             stroke_linejoin: LineJoin::Miter,
             stroke_miterlimit: 4.0,
             display: true,
+            font_family: "sans-serif".to_string(),
+            font_size: 12.0,
+            font_weight: 400,
+            font_style: "normal".to_string(),
+            text_anchor: "start".to_string(),
         }
     }
 }
@@ -144,6 +179,7 @@ enum LineJoin {
 
 /// Gradient definition
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct GradientDef {
     id: String,
     is_radial: bool,
@@ -161,6 +197,7 @@ struct GradientDef {
 
 /// ClipPath definition - stores path data for clipping
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct ClipPathDef {
     id: String,
     // Polygons that define the clip region
@@ -171,6 +208,7 @@ struct ClipPathDef {
 
 /// Mask definition
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct MaskDef {
     id: String,
     x: f64,
@@ -191,10 +229,14 @@ struct RenderContext {
     shapes_rendered: usize,
     // Active clip path for current element (polygons in render coordinates)
     active_clip: Option<Vec<Vec<(f64, f64)>>>,
+    // Bounding box of the active clip path (min_x, min_y, max_x, max_y)
+    active_clip_bbox: Option<(f64, f64, f64, f64)>,
+    // Font manager for text rendering
+    font_manager: Arc<FontManager>,
 }
 
 impl RenderContext {
-    fn new(width: usize, height: usize, background: Color, antialias: u32) -> Self {
+    fn new(width: usize, height: usize, background: Color, antialias: u32, font_manager: Arc<FontManager>) -> Self {
         let render_width = width * antialias as usize;
         let render_height = height * antialias as usize;
         let mut buffer = vec![0u8; render_width * render_height * 4];
@@ -217,6 +259,8 @@ impl RenderContext {
             antialias,
             shapes_rendered: 0,
             active_clip: None,
+            active_clip_bbox: None,
+            font_manager,
         }
     }
 
@@ -233,6 +277,13 @@ impl RenderContext {
         match &self.active_clip {
             None => true, // No clip = always inside
             Some(clip_polygons) => {
+                // Check bounding box first
+                if let Some((min_x, min_y, max_x, max_y)) = self.active_clip_bbox {
+                    if x < min_x || x > max_x || y < min_y || y > max_y {
+                        return false;
+                    }
+                }
+
                 for polygon in clip_polygons {
                     if polygon.len() < 3 {
                         continue;
@@ -260,6 +311,11 @@ impl RenderContext {
 
     fn blend_pixel(&mut self, x: usize, y: usize, color: Color) {
         if x >= self.width || y >= self.height {
+            return;
+        }
+
+        // Check clip
+        if !self.is_inside_clip(x as f64 + 0.5, y as f64 + 0.5) {
             return;
         }
 
@@ -490,12 +546,15 @@ impl RenderContext {
         // Compute gradient parameters based on bounding box (for objectBoundingBox units)
         let (gx1, gy1, gx2, gy2, gcx, gcy, gr) = if gradient.user_space {
             // userSpaceOnUse - apply transform to gradient coords
-            let (gx1, gy1) = transform.apply(gradient.x1, gradient.y1);
-            let (gx2, gy2) = transform.apply(gradient.x2, gradient.y2);
-            let (gcx, gcy) = transform.apply(gradient.cx, gradient.cy);
+            // effective transform = element_transform * gradient_transform
+            let combined_transform = transform.multiply(&gradient.transform);
+            
+            let (gx1, gy1) = combined_transform.apply(gradient.x1, gradient.y1);
+            let (gx2, gy2) = combined_transform.apply(gradient.x2, gradient.y2);
+            let (gcx, gcy) = combined_transform.apply(gradient.cx, gradient.cy);
             // Scale radius by average scale factor
-            let scale = ((transform.a * transform.a + transform.b * transform.b).sqrt() +
-                        (transform.c * transform.c + transform.d * transform.d).sqrt()) / 2.0;
+            let scale = ((combined_transform.a * combined_transform.a + combined_transform.b * combined_transform.b).sqrt() +
+                        (combined_transform.c * combined_transform.c + combined_transform.d * combined_transform.d).sqrt()) / 2.0;
             let gr = gradient.r * scale;
             (gx1, gy1, gx2, gy2, gcx, gcy, gr)
         } else {
@@ -503,13 +562,25 @@ impl RenderContext {
             let bbox_w = max_x - min_x;
             let bbox_h = max_y - min_y;
             let normalize = |v: f64| if v > 1.0 { v / 100.0 } else { v };
-            let gx1 = min_x + normalize(gradient.x1) * bbox_w;
-            let gy1 = min_y + normalize(gradient.y1) * bbox_h;
-            let gx2 = min_x + normalize(gradient.x2) * bbox_w;
-            let gy2 = min_y + normalize(gradient.y2) * bbox_h;
-            let gcx = min_x + normalize(gradient.cx) * bbox_w;
-            let gcy = min_y + normalize(gradient.cy) * bbox_h;
-            let gr = normalize(gradient.r) * bbox_w.max(bbox_h);
+            
+            // Apply gradientTransform to the normalized coordinates
+            let (tx1, ty1) = gradient.transform.apply(normalize(gradient.x1), normalize(gradient.y1));
+            let (tx2, ty2) = gradient.transform.apply(normalize(gradient.x2), normalize(gradient.y2));
+            let (tcx, tcy) = gradient.transform.apply(normalize(gradient.cx), normalize(gradient.cy));
+            
+            // Transform radius (scale only)
+            let scale = ((gradient.transform.a * gradient.transform.a + gradient.transform.b * gradient.transform.b).sqrt() +
+                        (gradient.transform.c * gradient.transform.c + gradient.transform.d * gradient.transform.d).sqrt()) / 2.0;
+            let tr = normalize(gradient.r) * scale;
+
+            // Map to screen space using bounding box
+            let gx1 = min_x + tx1 * bbox_w;
+            let gy1 = min_y + ty1 * bbox_h;
+            let gx2 = min_x + tx2 * bbox_w;
+            let gy2 = min_y + ty2 * bbox_h;
+            let gcx = min_x + tcx * bbox_w;
+            let gcy = min_y + tcy * bbox_h;
+            let gr = tr * bbox_w.max(bbox_h);
             (gx1, gy1, gx2, gy2, gcx, gcy, gr)
         };
 
@@ -866,166 +937,177 @@ fn parse_transform(s: &str) -> Transform {
 fn parse_style(node: &Node, parent_style: &Style) -> Style {
     let mut style = parent_style.clone();
 
+    // Helper to apply a single property
+    let mut apply_prop = |key: &str, val: &str| {
+        match key {
+            "fill" => style.fill = Some(parse_paint(val)),
+            "stroke" => style.stroke = Some(parse_paint(val)),
+            "stroke-width" => style.stroke_width = parse_length(val, 1.0),
+            "fill-opacity" => style.fill_opacity = val.parse().unwrap_or(1.0),
+            "stroke-opacity" => style.stroke_opacity = val.parse().unwrap_or(1.0),
+            "opacity" => style.opacity = val.parse().unwrap_or(1.0),
+            "display" => style.display = val != "none",
+            "fill-rule" => {
+                style.fill_rule = match val {
+                    "evenodd" => FillRule::EvenOdd,
+                    _ => FillRule::NonZero,
+                };
+            }
+            "stroke-linecap" => {
+                style.stroke_linecap = match val {
+                    "round" => LineCap::Round,
+                    "square" => LineCap::Square,
+                    _ => LineCap::Butt,
+                };
+            }
+            "stroke-linejoin" => {
+                style.stroke_linejoin = match val {
+                    "round" => LineJoin::Round,
+                    "bevel" => LineJoin::Bevel,
+                    _ => LineJoin::Miter,
+                };
+            }
+            "stroke-miterlimit" => {
+                if let Ok(m) = val.parse() {
+                    style.stroke_miterlimit = m;
+                }
+            }
+            // Font properties
+            "font-family" => style.font_family = val.trim_matches('\'').trim_matches('"').to_string(),
+            "font-size" => style.font_size = parse_length(val, 12.0),
+            "font-weight" => style.font_weight = match val {
+                "bold" => 700,
+                "normal" => 400,
+                _ => val.parse().unwrap_or(400),
+            },
+            "font-style" => style.font_style = val.to_string(),
+            "text-anchor" => style.text_anchor = val.to_string(),
+            _ => {}
+        }
+    };
+
     // Parse style attribute
     if let Some(style_attr) = node.attribute("style") {
         for part in style_attr.split(';') {
             let part = part.trim();
+            if part.is_empty() { continue; }
             if let Some(colon) = part.find(':') {
                 let prop = part[..colon].trim();
                 let val = part[colon + 1..].trim();
-                apply_style_property(&mut style, prop, val);
+                apply_prop(prop, val);
             }
         }
     }
 
-    // Parse individual attributes (override style)
+    // Parse individual attributes
     for attr in node.attributes() {
-        apply_style_property(&mut style, attr.name(), attr.value());
+        apply_prop(attr.name(), attr.value());
     }
 
     style
 }
 
-fn apply_style_property(style: &mut Style, prop: &str, val: &str) {
-    match prop {
-        "fill" => style.fill = Some(parse_paint(val)),
-        "stroke" => style.stroke = Some(parse_paint(val)),
-        "stroke-width" => {
-            if let Ok(w) = val.trim_end_matches("px").parse() {
-                style.stroke_width = w;
+/// Convert path commands to list of polygons
+fn commands_to_polygons(commands: &[PathCmd], transform: &Transform) -> Vec<Vec<(f64, f64)>> {
+    let mut polygons: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut current_poly: Vec<(f64, f64)> = Vec::new();
+    let mut last_point = (0.0, 0.0);
+    let mut start_point = (0.0, 0.0);
+
+    for cmd in commands {
+        match cmd {
+            PathCmd::M(x, y) => {
+                if !current_poly.is_empty() {
+                    polygons.push(current_poly);
+                    current_poly = Vec::new();
+                }
+                let p = transform.apply(*x, *y);
+                current_poly.push(p);
+                last_point = p;
+                start_point = p;
+            }
+            PathCmd::L(x, y) => {
+                let p = transform.apply(*x, *y);
+                if current_poly.is_empty() {
+                    current_poly.push(last_point);
+                }
+                current_poly.push(p);
+                last_point = p;
+            }
+            PathCmd::C(x1, y1, x2, y2, x, y) => {
+                let p0 = last_point;
+                let p1 = transform.apply(*x1, *y1);
+                let p2 = transform.apply(*x2, *y2);
+                let p3 = transform.apply(*x, *y);
+
+                // Estimate number of segments based on distance
+                let dist = (p1.0 - p0.0).hypot(p1.1 - p0.1) + 
+                           (p2.0 - p1.0).hypot(p2.1 - p1.1) + 
+                           (p3.0 - p2.0).hypot(p3.1 - p2.1);
+                let segments = (dist / 2.0).max(4.0).min(100.0) as usize;
+
+                let points = crate::path::sample_cubic_bezier(
+                    p0.0, p0.1, p1.0, p1.1, p2.0, p2.1, p3.0, p3.1, segments
+                );
+
+                if current_poly.is_empty() {
+                    current_poly.push(p0);
+                }
+                current_poly.extend(points);
+                last_point = p3;
+            }
+            PathCmd::Q(x1, y1, x, y) => {
+                let p0 = last_point;
+                let p1 = transform.apply(*x1, *y1);
+                let p2 = transform.apply(*x, *y);
+
+                let dist = (p1.0 - p0.0).hypot(p1.1 - p0.1) + (p2.0 - p1.0).hypot(p2.1 - p1.1);
+                let segments = (dist / 2.0).max(4.0).min(100.0) as usize;
+
+                let points = crate::path::sample_quadratic_bezier(
+                    p0.0, p0.1, p1.0, p1.1, p2.0, p2.1, segments
+                );
+
+                if current_poly.is_empty() {
+                    current_poly.push(p0);
+                }
+                current_poly.extend(points);
+                last_point = p2;
+            }
+            PathCmd::A(_rx, _ry, _rot, _large_arc, _sweep, x, y) => {
+                // Arcs are usually converted to C by parser, but handle just in case
+                let p = transform.apply(*x, *y);
+                if current_poly.is_empty() {
+                    current_poly.push(last_point);
+                }
+                current_poly.push(p);
+                last_point = p;
+            }
+            PathCmd::Z => {
+                if !current_poly.is_empty() {
+                    // Close polygon
+                    if (last_point.0 - start_point.0).hypot(last_point.1 - start_point.1) > 1e-6 {
+                        current_poly.push(start_point);
+                    }
+                    polygons.push(current_poly);
+                    current_poly = Vec::new();
+                    last_point = start_point;
+                }
             }
         }
-        "fill-opacity" => {
-            if let Ok(o) = val.parse() {
-                style.fill_opacity = o;
-            }
-        }
-        "stroke-opacity" => {
-            if let Ok(o) = val.parse() {
-                style.stroke_opacity = o;
-            }
-        }
-        "opacity" => {
-            if let Ok(o) = val.parse() {
-                style.opacity = o;
-            }
-        }
-        "fill-rule" => {
-            style.fill_rule = match val {
-                "evenodd" => FillRule::EvenOdd,
-                _ => FillRule::NonZero,
-            };
-        }
-        "stroke-linecap" => {
-            style.stroke_linecap = match val {
-                "round" => LineCap::Round,
-                "square" => LineCap::Square,
-                _ => LineCap::Butt,
-            };
-        }
-        "stroke-linejoin" => {
-            style.stroke_linejoin = match val {
-                "round" => LineJoin::Round,
-                "bevel" => LineJoin::Bevel,
-                _ => LineJoin::Miter,
-            };
-        }
-        "stroke-miterlimit" => {
-            if let Ok(m) = val.parse() {
-                style.stroke_miterlimit = m;
-            }
-        }
-        "display" => {
-            style.display = val != "none";
-        }
-        "visibility" => {
-            if val == "hidden" || val == "collapse" {
-                style.display = false;
-            }
-        }
-        _ => {}
     }
+
+    if !current_poly.is_empty() {
+        polygons.push(current_poly);
+    }
+
+    polygons
 }
 
 /// Convert path data to list of polygons
 fn path_to_polygons(d: &str, transform: &Transform) -> Vec<Vec<(f64, f64)>> {
     let commands = crate::path::parse_path_internal(d);
-    let mut polygons: Vec<Vec<(f64, f64)>> = Vec::new();
-    let mut current_poly: Vec<(f64, f64)> = Vec::new();
-    let mut current_x = 0.0;
-    let mut current_y = 0.0;
-
-    for cmd in commands {
-        match cmd {
-            crate::path::PathCmd::M(x, y) => {
-                if current_poly.len() >= 3 {
-                    polygons.push(current_poly);
-                }
-                current_poly = Vec::new();
-                let (tx, ty) = transform.apply(x, y);
-                current_poly.push((tx, ty));
-                current_x = x;
-                current_y = y;
-            }
-            crate::path::PathCmd::L(x, y) => {
-                let (tx, ty) = transform.apply(x, y);
-                current_poly.push((tx, ty));
-                current_x = x;
-                current_y = y;
-            }
-            crate::path::PathCmd::C(x1, y1, x2, y2, x, y) => {
-                // Sample cubic bezier
-                let n_samples = 16;
-                for i in 1..=n_samples {
-                    let t = i as f64 / n_samples as f64;
-                    let mt = 1.0 - t;
-                    let px = mt.powi(3) * current_x
-                        + 3.0 * mt.powi(2) * t * x1
-                        + 3.0 * mt * t.powi(2) * x2
-                        + t.powi(3) * x;
-                    let py = mt.powi(3) * current_y
-                        + 3.0 * mt.powi(2) * t * y1
-                        + 3.0 * mt * t.powi(2) * y2
-                        + t.powi(3) * y;
-                    let (tx, ty) = transform.apply(px, py);
-                    current_poly.push((tx, ty));
-                }
-                current_x = x;
-                current_y = y;
-            }
-            crate::path::PathCmd::Q(x1, y1, x, y) => {
-                // Sample quadratic bezier
-                let n_samples = 8;
-                for i in 1..=n_samples {
-                    let t = i as f64 / n_samples as f64;
-                    let mt = 1.0 - t;
-                    let px = mt.powi(2) * current_x
-                        + 2.0 * mt * t * x1
-                        + t.powi(2) * x;
-                    let py = mt.powi(2) * current_y
-                        + 2.0 * mt * t * y1
-                        + t.powi(2) * y;
-                    let (tx, ty) = transform.apply(px, py);
-                    current_poly.push((tx, ty));
-                }
-                current_x = x;
-                current_y = y;
-            }
-            crate::path::PathCmd::Z => {
-                if current_poly.len() >= 2 {
-                    polygons.push(current_poly);
-                }
-                current_poly = Vec::new();
-            }
-            _ => {}
-        }
-    }
-
-    if current_poly.len() >= 2 {
-        polygons.push(current_poly);
-    }
-
-    polygons
+    commands_to_polygons(&commands, transform)
 }
 
 /// Find an element by ID in the document tree
@@ -1101,9 +1183,58 @@ fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transfor
         return;
     }
 
-    // Handle clip-path attribute (disabled - causes performance issues with per-pixel checking)
-    // TODO: Re-enable with proper render-to-temp-buffer clipping approach
-    let prev_clip: Option<Vec<Vec<(f64, f64)>>> = None;
+    // Handle clip-path attribute
+    let mut prev_clip: Option<Vec<Vec<(f64, f64)>>> = None;
+    let mut prev_clip_bbox: Option<(f64, f64, f64, f64)> = None;
+
+    if let Some(clip_attr) = style.display.then(|| node.attribute("clip-path")).flatten() {
+        if clip_attr.starts_with("url(#") {
+            let id = clip_attr.trim_start_matches("url(#").trim_end_matches(')');
+            if let Some(clip_def) = ctx.clip_paths.get(id).cloned() {
+                // Save previous clip
+                prev_clip = ctx.active_clip.clone();
+                prev_clip_bbox = ctx.active_clip_bbox;
+
+                // Prepare new clip polygons
+                let new_polygons = if clip_def.user_space {
+                     clip_def.polygons.clone()
+                } else {
+                    // TODO: Implement objectBoundingBox support
+                    // Needs bbox of the element we are about to render.
+                    clip_def.polygons.clone()
+                };
+
+                // If there was an active clip, we strictly should INTERSECT.
+                // But doing polygon intersection is expensive/complex.
+                // Alternative: render to mask buffer. 
+                // Since we are doing per-pixel check:
+                // We could change active_clip to be `Vec<ClipPathDef>` (stack of clips)
+                // But `is_inside_clip` takes `&self`.
+                
+                // Let's stick to replacing for now, or just append if we want "inside A OR inside B" (Union).
+                // But clipping is usually intersection.
+                // As a quick fix/feature enable: just use the new clip.
+                
+                // Calculate bbox for the new clip
+                let mut min_x = f64::INFINITY;
+                let mut min_y = f64::INFINITY;
+                let mut max_x = f64::NEG_INFINITY;
+                let mut max_y = f64::NEG_INFINITY;
+                
+                for poly in &new_polygons {
+                    for point in poly {
+                        if point.0 < min_x { min_x = point.0; }
+                        if point.0 > max_x { max_x = point.0; }
+                        if point.1 < min_y { min_y = point.1; }
+                        if point.1 > max_y { max_y = point.1; }
+                    }
+                }
+                
+                ctx.active_clip = Some(new_polygons);
+                ctx.active_clip_bbox = Some((min_x, min_y, max_x, max_y));
+            }
+        }
+    }
 
     // Render based on element type
     match tag {
@@ -1201,23 +1332,18 @@ fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transfor
                                 let target_w = if use_width > 0.0 { use_width } else { viewport_w };
                                 let target_h = if use_height > 0.0 { use_height } else { viewport_h };
 
-                                // Calculate scale to map viewBox to target size
-                                let scale_x = target_w / vb_w;
-                                let scale_y = target_h / vb_h;
-                                let scale = scale_x.min(scale_y);
+                                // Parse preserveAspectRatio
+                                let par = target.attribute("preserveAspectRatio")
+                                    .map(parse_preserve_aspect_ratio)
+                                    .unwrap_or_default();
 
-                                // Offset to center the scaled content (for preserveAspectRatio=xMidYMid)
-                                let scaled_w = vb_w * scale;
-                                let scaled_h = vb_h * scale;
-                                let center_offset_x = (target_w - scaled_w) / 2.0;
-                                let center_offset_y = (target_h - scaled_h) / 2.0;
+                                let viewbox_transform = compute_viewbox_transform(
+                                    vb_x, vb_y, vb_w, vb_h,
+                                    target_w, target_h,
+                                    par
+                                );
 
-                                // The viewBox transform: translate to account for viewBox origin, then scale
-                                // Points at (vb_x, vb_y) should map to (0, 0) after scaling
-                                let symbol_transform = use_transform
-                                    .multiply(&Transform::translate(center_offset_x, center_offset_y))
-                                    .multiply(&Transform::scale(scale, scale))
-                                    .multiply(&Transform::translate(-vb_x, -vb_y));
+                                let symbol_transform = use_transform.multiply(&viewbox_transform);
 
                                 for child in target.children() {
                                     render_node(ctx, &child, &symbol_transform, &style, depth + 1, root);
@@ -1251,6 +1377,7 @@ fn render_node(ctx: &mut RenderContext, node: &Node, parent_transform: &Transfor
 
     // Restore previous clip path
     ctx.active_clip = prev_clip;
+    ctx.active_clip_bbox = prev_clip_bbox;
 }
 
 fn collect_defs(ctx: &mut RenderContext, node: &Node) {
@@ -1547,6 +1674,7 @@ fn collect_clip_paths_and_masks(ctx: &mut RenderContext, node: &Node, transform:
 }
 
 /// Check if a point is inside a polygon using ray casting algorithm
+#[allow(dead_code)]
 fn point_in_polygon(x: f64, y: f64, polygon: &[(f64, f64)]) -> bool {
     let n = polygon.len();
     if n < 3 {
@@ -1568,6 +1696,7 @@ fn point_in_polygon(x: f64, y: f64, polygon: &[(f64, f64)]) -> bool {
 }
 
 /// Check if a point is inside any of the clip path's polygons
+#[allow(dead_code)]
 fn point_in_clip_path(x: f64, y: f64, clip_path: &ClipPathDef) -> bool {
     for polygon in &clip_path.polygons {
         if point_in_polygon(x, y, polygon) {
@@ -2064,13 +2193,17 @@ fn parse_length(s: &str, default: f64) -> f64 {
 #[pyclass]
 pub struct VectorStagRenderer {
     antialias: u32,
+    font_manager: Arc<FontManager>,
 }
 
 #[pymethods]
 impl VectorStagRenderer {
     #[new]
     fn new() -> PyResult<Self> {
-        Ok(Self { antialias: 4 })
+        Ok(Self { 
+            antialias: 4,
+            font_manager: Arc::new(FontManager::new()),
+        })
     }
 
     /// Render SVG content to a numpy array
@@ -2086,7 +2219,7 @@ impl VectorStagRenderer {
         antialias: Option<u8>,
     ) -> PyResult<Bound<'py, PyArray3<u8>>> {
         let scale = scale.unwrap_or(1.0) as f64;
-        let antialias = antialias.unwrap_or(4) as u32;
+        let antialias = antialias.map(|a| a as u32).unwrap_or(self.antialias);
         let bg = background.unwrap_or((255, 255, 255, 255));
         let background = Color::from_rgba(bg.0, bg.1, bg.2, bg.3);
 
@@ -2130,33 +2263,32 @@ impl VectorStagRenderer {
         let out_height = out_height.max(1);
 
         // Create render context
-        let mut ctx = RenderContext::new(out_width, out_height, background, antialias);
+        let mut ctx = RenderContext::new(out_width, out_height, background, antialias, self.font_manager.clone());
 
         // Calculate transform from viewBox to output
         let (vb_x, vb_y, vb_w, vb_h) = viewbox.unwrap_or((0.0, 0.0, svg_width, svg_height));
         let render_width = out_width as f64 * antialias as f64;
         let render_height = out_height as f64 * antialias as f64;
 
-        let scale_x = render_width / vb_w;
-        let scale_y = render_height / vb_h;
-        let scale_factor = scale_x.min(scale_y);
+        let par = root.attribute("preserveAspectRatio")
+            .map(parse_preserve_aspect_ratio)
+            .unwrap_or_default();
 
-        let offset_x = (render_width - vb_w * scale_factor) / 2.0 - vb_x * scale_factor;
-        let offset_y = (render_height - vb_h * scale_factor) / 2.0 - vb_y * scale_factor;
-
-        let base_transform = Transform::translate(offset_x, offset_y)
-            .multiply(&Transform::scale(scale_factor, scale_factor));
+        let base_transform = compute_viewbox_transform(
+            vb_x, vb_y, vb_w, vb_h,
+            render_width, render_height,
+            par
+        );
 
         // First pass: collect all gradients from the entire document
         for child in root.children() {
             collect_all_gradients(&mut ctx, &child);
         }
 
-        // Second pass: collect clipPaths and masks (disabled for performance)
-        // TODO: Re-enable with proper render-to-temp-buffer approach
-        // for child in root.children() {
-        //     collect_clip_paths_and_masks(&mut ctx, &child, &base_transform);
-        // }
+        // Second pass: collect clipPaths and masks
+        for child in root.children() {
+            collect_clip_paths_and_masks(&mut ctx, &child, &base_transform);
+        }
 
         // Third pass: render tree
         // Parse style from root SVG element (many SVGs like Lucide define stroke/fill on root)
