@@ -95,8 +95,28 @@ impl Transform {
 #[derive(Clone, Debug)]
 pub enum Paint {
     Color(Color),
-    Gradient(String),
+    Ref(String),
     None,
+}
+
+#[derive(Clone, Debug)]
+pub struct PatternRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub color: Color,
+}
+
+#[derive(Clone, Debug)]
+pub struct PatternDef {
+    pub id: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub user_space: bool,
+    pub rects: Vec<PatternRect>,
 }
 
 /// Fill rule for polygon filling
@@ -501,6 +521,7 @@ pub struct RenderContext {
     pub width: usize,
     pub height: usize,
     pub gradients: HashMap<String, GradientDef>,
+    pub patterns: HashMap<String, PatternDef>,
     pub clip_paths: HashMap<String, ClipPathDef>,
     pub masks: HashMap<String, MaskDef>,
     pub markers: HashMap<String, MarkerDef>,

@@ -14,10 +14,58 @@ pub fn collect_defs(ctx: &mut RenderContext, node: &Node) {
         let tag = child.tag_name().name();
         if tag == "linearGradient" || tag == "radialGradient" {
             collect_gradient(ctx, &child);
+        } else if tag == "pattern" {
+            collect_pattern(ctx, &child);
         } else if tag == "marker" {
             collect_marker(ctx, &child);
         }
     }
+}
+
+fn collect_pattern(ctx: &mut RenderContext, node: &Node) {
+    let id = match node.attribute("id") {
+        Some(id) => id,
+        None => return,
+    };
+
+    let x: f64 = node.attribute("x").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let y: f64 = node.attribute("y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let width: f64 = node.attribute("width").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let height: f64 = node.attribute("height").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let user_space = node.attribute("patternUnits") == Some("userSpaceOnUse");
+
+    let mut rects = Vec::new();
+    for child in node.children() {
+        if !child.is_element() {
+            continue;
+        }
+        if child.tag_name().name() != "rect" {
+            continue;
+        }
+
+        let rx: f64 = child.attribute("x").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let ry: f64 = child.attribute("y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let rw: f64 = child.attribute("width").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let rh: f64 = child.attribute("height").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+
+        let fill = child.attribute("fill").and_then(parse_color).unwrap_or(Color::from_rgba(0, 0, 0, 0));
+        let opacity: f64 = child.attribute("opacity").and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let fill_opacity: f64 = child.attribute("fill-opacity").and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let mut color = fill;
+        color.a = (color.a as f64 * opacity * fill_opacity) as u8;
+
+        rects.push(PatternRect { x: rx, y: ry, width: rw, height: rh, color });
+    }
+
+    ctx.patterns.insert(id.to_string(), PatternDef {
+        id: id.to_string(),
+        x,
+        y,
+        width,
+        height,
+        user_space,
+        rects,
+    });
 }
 
 /// Collect a gradient definition
@@ -158,6 +206,22 @@ pub fn collect_all_gradients(ctx: &mut RenderContext, node: &Node) {
 
     for child in node.children() {
         collect_all_gradients(ctx, &child);
+    }
+}
+
+pub fn collect_all_patterns(ctx: &mut RenderContext, node: &Node) {
+    if !node.is_element() {
+        return;
+    }
+
+    let tag = node.tag_name().name();
+    if tag == "pattern" {
+        collect_pattern(ctx, node);
+        return;
+    }
+
+    for child in node.children() {
+        collect_all_patterns(ctx, &child);
     }
 }
 

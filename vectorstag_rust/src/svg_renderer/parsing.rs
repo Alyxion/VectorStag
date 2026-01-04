@@ -307,7 +307,7 @@ pub fn parse_paint(s: &str) -> Paint {
         // Check if it's a local reference
         if content.starts_with('#') {
             let id = content.trim_start_matches('#');
-            return Paint::Gradient(id.to_string());
+            return Paint::Ref(id.to_string());
         }
     }
 

@@ -84,6 +84,50 @@ fn get_primitive_subregion_px(
     Some((min_x.floor() as i32, min_y.floor() as i32, max_x.ceil() as i32, max_y.ceil() as i32))
 }
 
+fn crop_to_region(buffer: &Array3<f32>, min_x: i32, min_y: i32, max_x: i32, max_y: i32) -> Array3<f32> {
+    let (h, w, _) = (buffer.shape()[0] as i32, buffer.shape()[1] as i32, buffer.shape()[2]);
+    let out_w = (max_x - min_x).max(0) as usize;
+    let out_h = (max_y - min_y).max(0) as usize;
+    let mut out = Array3::<f32>::zeros((out_h, out_w, 4));
+
+    for oy in 0..out_h {
+        let sy = min_y + oy as i32;
+        if sy < 0 || sy >= h {
+            continue;
+        }
+        for ox in 0..out_w {
+            let sx = min_x + ox as i32;
+            if sx < 0 || sx >= w {
+                continue;
+            }
+            for c in 0..4 {
+                out[[oy, ox, c]] = buffer[[sy as usize, sx as usize, c]];
+            }
+        }
+    }
+    out
+}
+
+fn paste_region(dst: &mut Array3<f32>, src: &Array3<f32>, min_x: i32, min_y: i32) {
+    let (h, w, _) = (dst.shape()[0] as i32, dst.shape()[1] as i32, dst.shape()[2]);
+    let (sh, sw, _) = (src.shape()[0] as i32, src.shape()[1] as i32, src.shape()[2]);
+    for y in 0..sh {
+        let dy = min_y + y;
+        if dy < 0 || dy >= h {
+            continue;
+        }
+        for x in 0..sw {
+            let dx = min_x + x;
+            if dx < 0 || dx >= w {
+                continue;
+            }
+            for c in 0..4 {
+                dst[[dy as usize, dx as usize, c]] = src[[y as usize, x as usize, c]];
+            }
+        }
+    }
+}
+
 /// Collect all filter definitions from the document
 pub fn collect_all_filters(ctx: &mut RenderContext, node: &Node) {
     if !node.is_element() {
@@ -754,23 +798,39 @@ pub fn apply_filter(
                 (filters::fe_component_transfer_impl_f32(&src.view(), func_r, func_g, func_b, func_a), false)
             }
             FilterPrimitive::ConvolveMatrix { order_x, order_y, kernel, divisor, bias, target_x, target_y, edge_mode, preserve_alpha, input, .. } => {
-                // feConvolveMatrix operates on unpremultiplied colors; we premultiply once for storage.
-                let src = convert_input(input, false);
-                (
-                    filters::fe_convolve_matrix_impl_f32(
-                        &src.view(),
-                        *order_x,
-                        *order_y,
-                        kernel,
-                        *divisor,
-                        *bias,
-                        *target_x,
-                        *target_y,
-                        *edge_mode,
-                        *preserve_alpha,
-                    ),
-                    false,
+                // Important: edgeMode and sampling behavior are defined relative to the primitive subregion.
+                // If we convolve across the entire canvas, edgeMode=duplicate/wrap uses the wrong boundaries.
+                let full_src = convert_input(input, false);
+
+                let (pmin_x, pmin_y, pmax_x, pmax_y) = get_primitive_subregion_px(
+                    prim,
+                    filter,
+                    region_min_x,
+                    region_min_y,
+                    region_w,
+                    region_h,
+                    scale_x,
+                    scale_y,
                 )
+                .unwrap_or((region_min_x, region_min_y, region_max_x, region_max_y));
+
+                let cropped = crop_to_region(&full_src, pmin_x, pmin_y, pmax_x, pmax_y);
+                let convolved = filters::fe_convolve_matrix_impl_f32(
+                    &cropped.view(),
+                    *order_x,
+                    *order_y,
+                    kernel,
+                    *divisor,
+                    *bias,
+                    *target_x,
+                    *target_y,
+                    *edge_mode,
+                    *preserve_alpha,
+                );
+
+                let mut out = Array3::<f32>::zeros((height, width, 4));
+                paste_region(&mut out, &convolved, pmin_x, pmin_y);
+                (out, false)
             }
             FilterPrimitive::DiffuseLighting { surface_scale, diffuse_constant, light_color, light_type, azimuth, elevation, light_x, light_y, light_z, points_at_x, points_at_y, points_at_z, specular_exponent, limiting_cone_angle, input, .. } => {
                 // Lighting inputs: Source Alpha (opaque)

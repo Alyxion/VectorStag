@@ -1166,7 +1166,8 @@ pub fn fe_convolve_matrix_impl_f32(
                 }
 
                 for c in 0..channels {
-                    dst[[y, x, c]] = (sum[c] + bias).clamp(0.0, 1.0);
+                    let add_bias = if c == 3 { 0.0 } else { bias };
+                    dst[[y, x, c]] = (sum[c] + add_bias).clamp(0.0, 1.0);
                 }
                 if preserve_alpha {
                     dst[[y, x, 3]] = src[[y, x, 3]];
@@ -1204,7 +1205,8 @@ pub fn fe_convolve_matrix_impl_f32(
                 }
 
                 for c in 0..channels {
-                    dst[[y, x, c]] = (sum[c] + bias).clamp(0.0, 1.0);
+                    let add_bias = if c == 3 { 0.0 } else { bias };
+                    dst[[y, x, c]] = (sum[c] + add_bias).clamp(0.0, 1.0);
                 }
                 if preserve_alpha {
                     dst[[y, x, 3]] = src[[y, x, 3]];

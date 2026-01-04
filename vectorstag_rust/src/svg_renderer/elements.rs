@@ -37,10 +37,12 @@ pub fn render_path_with_markers(
                     c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
                     ctx.fill_polygon(poly, c, style.fill_rule);
                 }
-                Paint::Gradient(id) => {
+                Paint::Ref(id) => {
+                    let opacity = style.fill_opacity * style.opacity;
                     if let Some(gradient) = ctx.gradients.get(id).cloned() {
-                        let opacity = style.fill_opacity * style.opacity;
                         ctx.fill_polygon_gradient(poly, &gradient, transform, style.fill_rule, opacity);
+                    } else if let Some(pattern) = ctx.patterns.get(id).cloned() {
+                        ctx.fill_polygon_pattern(poly, &pattern, style.fill_rule, opacity);
                     }
                 }
                 Paint::None => {}
@@ -125,10 +127,12 @@ pub fn render_text_element(ctx: &mut RenderContext, node: &Node, transform: &Tra
                         c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
                         ctx.fill_polygon(poly, c, style.fill_rule);
                     }
-                    Paint::Gradient(id) => {
+                    Paint::Ref(id) => {
+                        let opacity = style.fill_opacity * style.opacity;
                         if let Some(gradient) = ctx.gradients.get(id).cloned() {
-                            let opacity = style.fill_opacity * style.opacity;
                             ctx.fill_polygon_gradient(poly, &gradient, transform, style.fill_rule, opacity);
+                        } else if let Some(pattern) = ctx.patterns.get(id).cloned() {
+                            ctx.fill_polygon_pattern(poly, &pattern, style.fill_rule, opacity);
                         }
                     }
                     Paint::None => {}

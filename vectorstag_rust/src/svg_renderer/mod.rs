@@ -25,7 +25,7 @@ mod filter;
 
 use types::*;
 use parsing::{parse_style, parse_viewbox, parse_length};
-use defs::{collect_all_gradients, collect_all_markers, collect_clip_paths_and_masks};
+use defs::{collect_all_gradients, collect_all_patterns, collect_all_markers, collect_clip_paths_and_masks};
 use filter::collect_all_filters;
 use render::render_node;
 use preserve_aspect_ratio::{parse_preserve_aspect_ratio, compute_viewbox_transform};
@@ -131,6 +131,11 @@ impl VectorStagRenderer {
         // First pass: collect all gradients from the entire document
         for child in root.children() {
             collect_all_gradients(&mut ctx, &child);
+        }
+
+        // Also collect all patterns from the entire document
+        for child in root.children() {
+            collect_all_patterns(&mut ctx, &child);
         }
 
         // Also collect all markers from the entire document

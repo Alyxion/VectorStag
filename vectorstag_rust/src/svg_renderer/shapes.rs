@@ -101,10 +101,12 @@ pub fn render_rect(ctx: &mut RenderContext, node: &Node, transform: &Transform, 
                 c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
                 ctx.fill_polygon(&corners, c, style.fill_rule);
             }
-            Paint::Gradient(id) => {
+            Paint::Ref(id) => {
+                let opacity = style.fill_opacity * style.opacity;
                 if let Some(gradient) = ctx.gradients.get(id).cloned() {
-                    let opacity = style.fill_opacity * style.opacity;
                     ctx.fill_polygon_gradient(&corners, &gradient, transform, style.fill_rule, opacity);
+                } else if let Some(pattern) = ctx.patterns.get(id).cloned() {
+                    ctx.fill_polygon_pattern(&corners, &pattern, style.fill_rule, opacity);
                 }
             }
             Paint::None => {}
@@ -166,10 +168,12 @@ pub fn render_circle(ctx: &mut RenderContext, node: &Node, transform: &Transform
                 c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
                 ctx.fill_polygon(&points, c, style.fill_rule);
             }
-            Paint::Gradient(id) => {
+            Paint::Ref(id) => {
+                let opacity = style.fill_opacity * style.opacity;
                 if let Some(gradient) = ctx.gradients.get(id).cloned() {
-                    let opacity = style.fill_opacity * style.opacity;
                     ctx.fill_polygon_gradient(&points, &gradient, transform, style.fill_rule, opacity);
+                } else if let Some(pattern) = ctx.patterns.get(id).cloned() {
+                    ctx.fill_polygon_pattern(&points, &pattern, style.fill_rule, opacity);
                 }
             }
             Paint::None => {}
@@ -252,10 +256,12 @@ pub fn render_ellipse(ctx: &mut RenderContext, node: &Node, transform: &Transfor
                 c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
                 ctx.fill_polygon(&points, c, style.fill_rule);
             }
-            Paint::Gradient(id) => {
+            Paint::Ref(id) => {
+                let opacity = style.fill_opacity * style.opacity;
                 if let Some(gradient) = ctx.gradients.get(id).cloned() {
-                    let opacity = style.fill_opacity * style.opacity;
                     ctx.fill_polygon_gradient(&points, &gradient, transform, style.fill_rule, opacity);
+                } else if let Some(pattern) = ctx.patterns.get(id).cloned() {
+                    ctx.fill_polygon_pattern(&points, &pattern, style.fill_rule, opacity);
                 }
             }
             Paint::None => {}
@@ -356,10 +362,12 @@ pub fn render_polygon_elem(ctx: &mut RenderContext, node: &Node, transform: &Tra
                 c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
                 ctx.fill_polygon(&points, c, style.fill_rule);
             }
-            Paint::Gradient(id) => {
+            Paint::Ref(id) => {
+                let opacity = style.fill_opacity * style.opacity;
                 if let Some(gradient) = ctx.gradients.get(id).cloned() {
-                    let opacity = style.fill_opacity * style.opacity;
                     ctx.fill_polygon_gradient(&points, &gradient, transform, style.fill_rule, opacity);
+                } else if let Some(pattern) = ctx.patterns.get(id).cloned() {
+                    ctx.fill_polygon_pattern(&points, &pattern, style.fill_rule, opacity);
                 }
             }
             Paint::None => {}
