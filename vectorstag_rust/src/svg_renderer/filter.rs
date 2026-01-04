@@ -442,17 +442,17 @@ pub fn apply_filter(
     let (region_min_x, region_min_y, region_max_x, region_max_y) = calculate_filter_region(filter, bbox, transform, width, height);
 
     // Convert source to ndarray for filter operations (Premultiplied sRGB)
-    // We store intermediate results in Premultiplied sRGB to maximize precision in u8
+    // We store intermediate results in Premultiplied sRGB (f32) to maximize precision
     let source_arr = Array3::from_shape_fn((height, width, 4), |(y, x, c)| {
         if c == 3 {
-            source[(y * width + x) * 4 + 3]
+            source[(y * width + x) * 4 + 3] as f32 / 255.0
         } else {
             let a = source[(y * width + x) * 4 + 3] as f32 / 255.0;
-            let val = source[(y * width + x) * 4 + c] as f32;
+            let val = source[(y * width + x) * 4 + c] as f32 / 255.0;
             if a > 0.0 {
-                (val * a + 0.5) as u8
+                val * a
             } else {
-                0
+                0.0
             }
         }
     });
@@ -460,23 +460,23 @@ pub fn apply_filter(
     // Convert background to ndarray (Premultiplied sRGB)
     let bg_arr = Array3::from_shape_fn((height, width, 4), |(y, x, c)| {
         if c == 3 {
-            background[(y * width + x) * 4 + 3]
+            background[(y * width + x) * 4 + 3] as f32 / 255.0
         } else {
             let a = background[(y * width + x) * 4 + 3] as f32 / 255.0;
-            let val = background[(y * width + x) * 4 + c] as f32;
+            let val = background[(y * width + x) * 4 + c] as f32 / 255.0;
             if a > 0.0 {
-                (val * a + 0.5) as u8
+                val * a
             } else {
-                0
+                0.0
             }
         }
     });
 
     // Source alpha for SourceAlpha input
-    let source_alpha = filters::get_source_alpha_impl(&source_arr.view());
+    let source_alpha = filters::get_source_alpha_impl_f32(&source_arr.view());
 
     // Results map for named results
-    let mut results: HashMap<String, Array3<u8>> = HashMap::new();
+    let mut results: HashMap<String, Array3<f32>> = HashMap::new();
     results.insert("SourceGraphic".to_string(), source_arr.clone());
     results.insert("SourceAlpha".to_string(), source_alpha);
     results.insert("BackgroundImage".to_string(), bg_arr);
@@ -498,26 +498,40 @@ pub fn apply_filter(
     };
 
     // Helper: Convert Premultiplied sRGB -> Premultiplied LinearRGB
-    let to_linear_premul = |mut arr: Array3<u8>| -> Array3<u8> {
-        unpremultiply(&mut arr);
-        let mut lin = array_srgb_to_linear(&arr.view());
-        premultiply(&mut lin);
-        lin
+    let to_linear_premul = |mut arr: Array3<f32>| -> Array3<f32> {
+        unpremultiply_f32(&mut arr);
+        let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    arr[[y, x, c]] = srgb_to_linear_f32(arr[[y, x, c]]);
+                }
+            }
+        }
+        premultiply_f32(&mut arr);
+        arr
     };
 
     // Helper: Convert Premultiplied LinearRGB -> Premultiplied sRGB
-    let to_srgb_premul = |mut arr: Array3<u8>| -> Array3<u8> {
-        unpremultiply(&mut arr);
-        let mut srgb = array_linear_to_srgb(&arr);
-        premultiply(&mut srgb);
-        srgb
+    let to_srgb_premul = |mut arr: Array3<f32>| -> Array3<f32> {
+        unpremultiply_f32(&mut arr);
+        let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    arr[[y, x, c]] = linear_to_srgb_f32(arr[[y, x, c]]);
+                }
+            }
+        }
+        premultiply_f32(&mut arr);
+        arr
     };
 
     // Apply each primitive in sequence
     for prim in &filter.primitives {
         let interpolation = get_prim_color_interpolation(prim);
         
-        let convert_input = |input_name: &str, ensure_premultiplied: bool| -> Array3<u8> {
+        let convert_input = |input_name: &str, ensure_premultiplied: bool| -> Array3<f32> {
             let view = get_input(input_name, &results, &last_result);
             let mut arr = view.to_owned(); // Always Premultiplied sRGB from storage
             
@@ -526,7 +540,7 @@ pub fn apply_filter(
             }
             
             if !ensure_premultiplied {
-                unpremultiply(&mut arr);
+                unpremultiply_f32(&mut arr);
             }
             arr
         };
@@ -535,74 +549,74 @@ pub fn apply_filter(
         let (mut result, is_premultiplied) = match prim {
             FilterPrimitive::GaussianBlur { std_dev_x, std_dev_y, input, .. } => {
                 let src = convert_input(input, true);
-                let scaled_x = (*std_dev_x as f64 * scale_x) as f32;
-                let scaled_y = (*std_dev_y as f64 * scale_y) as f32;
-                (filters::fe_gaussian_blur_impl(&src.view(), scaled_x, scaled_y), true)
+                let scaled_x = (*std_dev_x as f64 * prim_scale_x) as f32;
+                let scaled_y = (*std_dev_y as f64 * prim_scale_y) as f32;
+                (filters::fe_gaussian_blur_impl_f32(&src.view(), scaled_x, scaled_y), true)
             }
             FilterPrimitive::Offset { dx, dy, input, .. } => {
                 let src = convert_input(input, true);
-                let scaled_dx = (*dx * scale_x) as i32;
-                let scaled_dy = (*dy * scale_y) as i32;
-                (filters::fe_offset_impl(&src.view(), scaled_dx, scaled_dy), true)
+                let scaled_dx = (*dx * prim_scale_x) as i32;
+                let scaled_dy = (*dy * prim_scale_y) as i32;
+                (filters::fe_offset_impl_f32(&src.view(), scaled_dx, scaled_dy), true)
             }
             FilterPrimitive::Flood { color, .. } => {
                 // Flood color is typically sRGB. Convert if needed.
                 let (r, g, b) = if interpolation == ColorInterpolation::LinearRGB {
-                    (srgb_to_linear(color.r), srgb_to_linear(color.g), srgb_to_linear(color.b))
+                    (srgb_to_linear_f32(color.r as f32 / 255.0), srgb_to_linear_f32(color.g as f32 / 255.0), srgb_to_linear_f32(color.b as f32 / 255.0))
                 } else {
-                    (color.r, color.g, color.b)
+                    (color.r as f32 / 255.0, color.g as f32 / 255.0, color.b as f32 / 255.0)
                 };
                 // Premultiply
                 let a = color.a as f32 / 255.0;
-                let r = (r as f32 * a + 0.5) as u8;
-                let g = (g as f32 * a + 0.5) as u8;
-                let b = (b as f32 * a + 0.5) as u8;
-                (filters::fe_flood_impl(width, height, r, g, b, color.a), true)
+                let r = r * a;
+                let g = g * a;
+                let b = b * a;
+                (filters::fe_flood_impl_f32(width, height, r, g, b, a), true)
             }
             FilterPrimitive::Merge { nodes, .. } => {
-                let layers: Vec<Array3<u8>> = nodes.iter().map(|n| convert_input(n, true)).collect();
-                let views: Vec<ArrayView3<u8>> = layers.iter().map(|l| l.view()).collect();
-                (filters::fe_merge_impl(&views), true)
+                let layers: Vec<Array3<f32>> = nodes.iter().map(|n| convert_input(n, true)).collect();
+                let views: Vec<ArrayView3<f32>> = layers.iter().map(|l| l.view()).collect();
+                (filters::fe_merge_impl_f32(&views), true)
             }
             FilterPrimitive::ColorMatrix { matrix_type, values, input, .. } => {
                 // Spec: "If the input graphic is premultiplied, the matrix operation is applied to the premultiplied components."
                 let src = convert_input(input, true);
-                (filters::fe_color_matrix_impl(&src.view(), *matrix_type, values), true)
+                (filters::fe_color_matrix_impl_f32(&src.view(), *matrix_type, values), true)
             }
             FilterPrimitive::Blend { mode, in1, in2, .. } => {
                 let src1 = convert_input(in1, true);
                 let src2 = convert_input(in2, true);
-                (filters::fe_blend_impl(&src1.view(), &src2.view(), *mode), true)
+                (filters::fe_blend_impl_f32(&src1.view(), &src2.view(), *mode), true)
             }
             FilterPrimitive::Composite { operator, k1, k2, k3, k4, in1, in2, .. } => {
                 let src1 = convert_input(in1, true);
                 let src2 = convert_input(in2, true);
-                (filters::fe_composite_impl(&src1.view(), &src2.view(), *operator, *k1, *k2, *k3, *k4), true)
+                (filters::fe_composite_impl_f32(&src1.view(), &src2.view(), *operator, *k1, *k2, *k3, *k4), true)
             }
             FilterPrimitive::Morphology { operator, radius_x, radius_y, input, .. } => {
                 let src = convert_input(input, true);
-                let scaled_rx = (*radius_x as f64 * scale_x) as f32;
-                let scaled_ry = (*radius_y as f64 * scale_y) as f32;
-                (filters::fe_morphology_impl(&src.view(), *operator, scaled_rx, scaled_ry), true)
+                let scaled_rx = (*radius_x as f64 * prim_scale_x) as f32;
+                let scaled_ry = (*radius_y as f64 * prim_scale_y) as f32;
+                (filters::fe_morphology_impl_f32(&src.view(), *operator, scaled_rx, scaled_ry), true)
             }
             FilterPrimitive::Turbulence { base_freq_x, base_freq_y, num_octaves, seed, noise_type, .. } => {
-                let freq_x = if scale_x > 0.0 { *base_freq_x / scale_x } else { *base_freq_x };
-                let freq_y = if scale_y > 0.0 { *base_freq_y / scale_y } else { *base_freq_y };
-                (filters::fe_turbulence_impl(width, height, freq_x, freq_y, *num_octaves, *seed, *noise_type, false), false)
+                let freq_x = if prim_scale_x > 0.0 { *base_freq_x / prim_scale_x } else { *base_freq_x };
+                let freq_y = if prim_scale_y > 0.0 { *base_freq_y / prim_scale_y } else { *base_freq_y };
+                (filters::fe_turbulence_impl_f32(width, height, freq_x, freq_y, *num_octaves, *seed, *noise_type, false), false)
             }
             FilterPrimitive::Tile { input, .. } => {
                 let src = convert_input(input, true);
-                (filters::fe_tile_impl(&src.view(), width, height), true)
+                (filters::fe_tile_impl_f32(&src.view(), width, height), true)
             }
             FilterPrimitive::ComponentTransfer { func_r, func_g, func_b, func_a, input, .. } => {
                 // Spec 15.11: "The transfer functions are defined to operate on unpremultiplied color values."
                 // So we must provide Unpremultiplied input.
                 let src = convert_input(input, false);
-                (filters::fe_component_transfer_impl(&src.view(), func_r, func_g, func_b, func_a), false)
+                (filters::fe_component_transfer_impl_f32(&src.view(), func_r, func_g, func_b, func_a), false)
             }
             FilterPrimitive::ConvolveMatrix { order_x, order_y, kernel, divisor, bias, target_x, target_y, edge_mode, preserve_alpha, input, .. } => {
                 let src = convert_input(input, true);
-                (filters::fe_convolve_matrix_impl(&src.view(), *order_x, *order_y, kernel, *divisor, *bias, *target_x, *target_y, *edge_mode, *preserve_alpha), true)
+                (filters::fe_convolve_matrix_impl_f32(&src.view(), *order_x, *order_y, kernel, *divisor, *bias, *target_x, *target_y, *edge_mode, *preserve_alpha), true)
             }
             FilterPrimitive::DiffuseLighting { surface_scale, diffuse_constant, light_color, light_type, azimuth, elevation, light_x, light_y, light_z, points_at_x, points_at_y, points_at_z, specular_exponent, limiting_cone_angle, input, .. } => {
                 // Lighting inputs: Source Alpha (opaque)
@@ -610,22 +624,22 @@ pub fn apply_filter(
                 let src = convert_input(input, true);
                 
                 let (r, g, b) = if interpolation == ColorInterpolation::LinearRGB {
-                    (srgb_to_linear(light_color.0), srgb_to_linear(light_color.1), srgb_to_linear(light_color.2))
+                    (srgb_to_linear_f32(light_color.0 as f32 / 255.0), srgb_to_linear_f32(light_color.1 as f32 / 255.0), srgb_to_linear_f32(light_color.2 as f32 / 255.0))
                 } else {
-                    (light_color.0, light_color.1, light_color.2)
+                    (light_color.0 as f32 / 255.0, light_color.1 as f32 / 255.0, light_color.2 as f32 / 255.0)
                 };
                 let lc = (r, g, b);
-                (filters::fe_diffuse_lighting_impl(&src.view(), *surface_scale, *diffuse_constant, lc, *light_type, *azimuth, *elevation, *light_x, *light_y, *light_z, *points_at_x, *points_at_y, *points_at_z, *specular_exponent, *limiting_cone_angle), false)
+                (filters::fe_diffuse_lighting_impl_f32(&src.view(), *surface_scale, *diffuse_constant, lc, *light_type, *azimuth, *elevation, *light_x, *light_y, *light_z, *points_at_x, *points_at_y, *points_at_z, *specular_exponent, *limiting_cone_angle), false)
             }
             FilterPrimitive::SpecularLighting { surface_scale, specular_constant, specular_exponent, light_color, light_type, azimuth, elevation, light_x, light_y, light_z, points_at_x, points_at_y, points_at_z, spot_exponent, limiting_cone_angle, input, .. } => {
                 let src = convert_input(input, true);
                 let (r, g, b) = if interpolation == ColorInterpolation::LinearRGB {
-                    (srgb_to_linear(light_color.0), srgb_to_linear(light_color.1), srgb_to_linear(light_color.2))
+                    (srgb_to_linear_f32(light_color.0 as f32 / 255.0), srgb_to_linear_f32(light_color.1 as f32 / 255.0), srgb_to_linear_f32(light_color.2 as f32 / 255.0))
                 } else {
-                    (light_color.0, light_color.1, light_color.2)
+                    (light_color.0 as f32 / 255.0, light_color.1 as f32 / 255.0, light_color.2 as f32 / 255.0)
                 };
                 let lc = (r, g, b);
-                (filters::fe_specular_lighting_impl(&src.view(), *surface_scale, *specular_constant, *specular_exponent, lc, *light_type, *azimuth, *elevation, *light_x, *light_y, *light_z, *points_at_x, *points_at_y, *points_at_z, *spot_exponent, *limiting_cone_angle), false)
+                (filters::fe_specular_lighting_impl_f32(&src.view(), *surface_scale, *specular_constant, *specular_exponent, lc, *light_type, *azimuth, *elevation, *light_x, *light_y, *light_z, *points_at_x, *points_at_y, *points_at_z, *spot_exponent, *limiting_cone_angle), false)
             }
             FilterPrimitive::DisplacementMap { scale: disp_scale, x_channel, y_channel, in1, in2, .. } => {
                 let src = convert_input(in1, true);
@@ -633,31 +647,31 @@ pub fn apply_filter(
                 // Using Premultiplied map means color channels are scaled by alpha.
                 // Spec doesn't strictly specify un/premul for map input, but browsers likely use premultiplied.
                 let map = convert_input(in2, true);
-                let avg_scale = (scale_x + scale_y) / 2.0;
+                let avg_scale = (prim_scale_x + prim_scale_y) / 2.0;
                 let scaled_disp = *disp_scale * avg_scale as f32;
-                (filters::fe_displacement_map_impl(&src.view(), &map.view(), scaled_disp, *x_channel, *y_channel), true)
+                (filters::fe_displacement_map_impl_f32(&src.view(), &map.view(), scaled_disp, *x_channel, *y_channel), true)
             }
             FilterPrimitive::DropShadow { dx, dy, std_dev_x, std_dev_y, flood_color, input, .. } => {
                 let src = convert_input(input, true);
-                let scaled_dx = (*dx * scale_x) as f32;
-                let scaled_dy = (*dy * scale_y) as f32;
-                let scaled_std_x = (*std_dev_x as f64 * scale_x) as f32;
-                let scaled_std_y = (*std_dev_y as f64 * scale_y) as f32;
+                let scaled_dx = (*dx * prim_scale_x) as f32;
+                let scaled_dy = (*dy * prim_scale_y) as f32;
+                let scaled_std_x = (*std_dev_x as f64 * prim_scale_x) as f32;
+                let scaled_std_y = (*std_dev_y as f64 * prim_scale_y) as f32;
                 let (r, g, b) = if interpolation == ColorInterpolation::LinearRGB {
-                    (srgb_to_linear(flood_color.r), srgb_to_linear(flood_color.g), srgb_to_linear(flood_color.b))
+                    (srgb_to_linear_f32(flood_color.r as f32 / 255.0), srgb_to_linear_f32(flood_color.g as f32 / 255.0), srgb_to_linear_f32(flood_color.b as f32 / 255.0))
                 } else {
-                    (flood_color.r, flood_color.g, flood_color.b)
+                    (flood_color.r as f32 / 255.0, flood_color.g as f32 / 255.0, flood_color.b as f32 / 255.0)
                 };
-                (filters::fe_drop_shadow_impl(&src.view(), scaled_dx, scaled_dy, scaled_std_x, scaled_std_y, r, g, b, flood_color.a), true)
+                (filters::fe_drop_shadow_impl_f32(&src.view(), scaled_dx, scaled_dy, scaled_std_x, scaled_std_y, r, g, b, flood_color.a as f32 / 255.0), true)
             }
             FilterPrimitive::Image { .. } => {
-                (Array3::<u8>::zeros((height, width, 4)), false)
+                (Array3::<f32>::zeros((height, width, 4)), false)
             }
         };
 
         // If result is NOT premultiplied, premultiply it for storage
         if !is_premultiplied {
-            premultiply(&mut result);
+            premultiply_f32(&mut result);
         }
         
         // Convert back to Premultiplied sRGB if we were in Linear
@@ -678,23 +692,24 @@ pub fn apply_filter(
     }
 
     // Convert final result back to Vec<u8> (Unpremultiplied sRGB)
-    // last_result is Premultiplied sRGB
+    // last_result is Premultiplied sRGB (f32)
     let mut output = vec![0u8; width * height * 4];
     for y in 0..height {
         for x in 0..width {
             let idx = (y * width + x) * 4;
-            let a = last_result[[y, x, 3]] as f32 / 255.0;
+            let a = last_result[[y, x, 3]];
             if a > 0.0 {
-                // Unpremultiply
-                output[idx] = (last_result[[y, x, 0]] as f32 / a + 0.5).clamp(0.0, 255.0) as u8;
-                output[idx + 1] = (last_result[[y, x, 1]] as f32 / a + 0.5).clamp(0.0, 255.0) as u8;
-                output[idx + 2] = (last_result[[y, x, 2]] as f32 / a + 0.5).clamp(0.0, 255.0) as u8;
+                // Unpremultiply and clamp to u8
+                output[idx] = (last_result[[y, x, 0]] / a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                output[idx + 1] = (last_result[[y, x, 1]] / a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                output[idx + 2] = (last_result[[y, x, 2]] / a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                output[idx + 3] = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
             } else {
                 output[idx] = 0;
                 output[idx + 1] = 0;
                 output[idx + 2] = 0;
+                output[idx + 3] = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
             }
-            output[idx + 3] = last_result[[y, x, 3]];
         }
     }
 
@@ -746,7 +761,7 @@ fn calculate_filter_region(
 }
 
 /// Clip buffer to region
-fn clip_buffer(buffer: &mut Array3<u8>, min_x: i32, min_y: i32, max_x: i32, max_y: i32) {
+fn clip_buffer(buffer: &mut Array3<f32>, min_x: i32, min_y: i32, max_x: i32, max_y: i32) {
     let (h, w, _) = (buffer.shape()[0], buffer.shape()[1], buffer.shape()[2]);
     let h = h as i32;
     let w = w as i32;
@@ -761,23 +776,23 @@ fn clip_buffer(buffer: &mut Array3<u8>, min_x: i32, min_y: i32, max_x: i32, max_
     for y in 0..h {
         if y < min_y || y >= max_y {
             for x in 0..w {
-                buffer[[y as usize, x as usize, 0]] = 0;
-                buffer[[y as usize, x as usize, 1]] = 0;
-                buffer[[y as usize, x as usize, 2]] = 0;
-                buffer[[y as usize, x as usize, 3]] = 0;
+                buffer[[y as usize, x as usize, 0]] = 0.0;
+                buffer[[y as usize, x as usize, 1]] = 0.0;
+                buffer[[y as usize, x as usize, 2]] = 0.0;
+                buffer[[y as usize, x as usize, 3]] = 0.0;
             }
         } else {
             for x in 0..min_x {
-                buffer[[y as usize, x as usize, 0]] = 0;
-                buffer[[y as usize, x as usize, 1]] = 0;
-                buffer[[y as usize, x as usize, 2]] = 0;
-                buffer[[y as usize, x as usize, 3]] = 0;
+                buffer[[y as usize, x as usize, 0]] = 0.0;
+                buffer[[y as usize, x as usize, 1]] = 0.0;
+                buffer[[y as usize, x as usize, 2]] = 0.0;
+                buffer[[y as usize, x as usize, 3]] = 0.0;
             }
             for x in max_x..w {
-                buffer[[y as usize, x as usize, 0]] = 0;
-                buffer[[y as usize, x as usize, 1]] = 0;
-                buffer[[y as usize, x as usize, 2]] = 0;
-                buffer[[y as usize, x as usize, 3]] = 0;
+                buffer[[y as usize, x as usize, 0]] = 0.0;
+                buffer[[y as usize, x as usize, 1]] = 0.0;
+                buffer[[y as usize, x as usize, 2]] = 0.0;
+                buffer[[y as usize, x as usize, 3]] = 0.0;
             }
         }
     }
@@ -960,9 +975,9 @@ fn get_prim_color_interpolation(prim: &FilterPrimitive) -> ColorInterpolation {
 /// Get input array from results or use last result
 fn get_input<'a>(
     input: &str,
-    results: &'a HashMap<String, Array3<u8>>,
-    last_result: &'a Array3<u8>,
-) -> ArrayView3<'a, u8> {
+    results: &'a HashMap<String, Array3<f32>>,
+    last_result: &'a Array3<f32>,
+) -> ArrayView3<'a, f32> {
     if input.is_empty() {
         return last_result.view();
     }
