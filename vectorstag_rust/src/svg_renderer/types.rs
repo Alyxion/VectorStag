@@ -226,6 +226,10 @@ pub enum FilterPrimitive {
         input: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     Offset {
         dx: f64,
@@ -233,16 +237,28 @@ pub enum FilterPrimitive {
         input: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     Flood {
         color: Color,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     Merge {
         nodes: Vec<String>,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     ColorMatrix {
         matrix_type: u8,  // 0=matrix, 1=saturate, 2=hueRotate, 3=luminanceToAlpha
@@ -250,6 +266,10 @@ pub enum FilterPrimitive {
         input: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     Blend {
         mode: u8,
@@ -257,6 +277,10 @@ pub enum FilterPrimitive {
         in2: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     Composite {
         operator: u8,  // 0=over, 1=in, 2=out, 3=atop, 4=xor, 5=arithmetic
@@ -268,6 +292,10 @@ pub enum FilterPrimitive {
         in2: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     Morphology {
         operator: u8,  // 0=erode, 1=dilate
@@ -276,6 +304,10 @@ pub enum FilterPrimitive {
         input: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     Turbulence {
         base_freq_x: f64,
@@ -285,11 +317,19 @@ pub enum FilterPrimitive {
         noise_type: u8,  // 0=fractalNoise, 1=turbulence
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     Tile {
         input: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     ComponentTransfer {
         func_r: (u8, Vec<f32>, f32, f32, f32, f32, f32),
@@ -299,6 +339,10 @@ pub enum FilterPrimitive {
         input: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     ConvolveMatrix {
         order_x: usize,
@@ -313,6 +357,10 @@ pub enum FilterPrimitive {
         input: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     DiffuseLighting {
         surface_scale: f32,
@@ -332,6 +380,10 @@ pub enum FilterPrimitive {
         input: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     SpecularLighting {
         surface_scale: f32,
@@ -352,6 +404,10 @@ pub enum FilterPrimitive {
         input: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     DisplacementMap {
         scale: f32,
@@ -361,6 +417,10 @@ pub enum FilterPrimitive {
         in2: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     DropShadow {
         dx: f64,
@@ -371,11 +431,19 @@ pub enum FilterPrimitive {
         input: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
     Image {
         href: String,
         result: String,
         color_interpolation: ColorInterpolation,
+        x: Option<LengthVal>,
+        y: Option<LengthVal>,
+        width: Option<LengthVal>,
+        height: Option<LengthVal>,
     },
 }
 

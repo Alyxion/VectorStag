@@ -7,6 +7,83 @@ use super::types::*;
 use super::parsing::parse_color;
 use crate::filters;
 
+fn length_to_px_x(len: LengthVal, region_w: i32, scale_x: f64, primitive_units_user_space: bool) -> f64 {
+    if len.is_percent {
+        (len.value / 100.0) * region_w as f64
+    } else if primitive_units_user_space {
+        len.value * scale_x
+    } else {
+        len.value * region_w as f64
+    }
+}
+
+fn length_to_px_y(len: LengthVal, region_h: i32, scale_y: f64, primitive_units_user_space: bool) -> f64 {
+    if len.is_percent {
+        (len.value / 100.0) * region_h as f64
+    } else if primitive_units_user_space {
+        len.value * scale_y
+    } else {
+        len.value * region_h as f64
+    }
+}
+
+fn get_primitive_subregion_px(
+    prim: &FilterPrimitive,
+    filter: &FilterDef,
+    region_min_x: i32,
+    region_min_y: i32,
+    region_w: i32,
+    region_h: i32,
+    scale_x: f64,
+    scale_y: f64,
+) -> Option<(i32, i32, i32, i32)> {
+    let (x, y, w, h) = match prim {
+        FilterPrimitive::GaussianBlur { x, y, width, height, .. }
+        | FilterPrimitive::Offset { x, y, width, height, .. }
+        | FilterPrimitive::Flood { x, y, width, height, .. }
+        | FilterPrimitive::Merge { x, y, width, height, .. }
+        | FilterPrimitive::ColorMatrix { x, y, width, height, .. }
+        | FilterPrimitive::Blend { x, y, width, height, .. }
+        | FilterPrimitive::Composite { x, y, width, height, .. }
+        | FilterPrimitive::Morphology { x, y, width, height, .. }
+        | FilterPrimitive::Turbulence { x, y, width, height, .. }
+        | FilterPrimitive::Tile { x, y, width, height, .. }
+        | FilterPrimitive::ComponentTransfer { x, y, width, height, .. }
+        | FilterPrimitive::ConvolveMatrix { x, y, width, height, .. }
+        | FilterPrimitive::DiffuseLighting { x, y, width, height, .. }
+        | FilterPrimitive::SpecularLighting { x, y, width, height, .. }
+        | FilterPrimitive::DisplacementMap { x, y, width, height, .. }
+        | FilterPrimitive::DropShadow { x, y, width, height, .. }
+        | FilterPrimitive::Image { x, y, width, height, .. } => (*x, *y, *width, *height),
+    };
+
+    if x.is_none() && y.is_none() && w.is_none() && h.is_none() {
+        return None;
+    }
+
+    let primitive_units_user_space = filter.primitive_units;
+
+    let x_px = x
+        .map(|v| length_to_px_x(v, region_w, scale_x, primitive_units_user_space))
+        .unwrap_or(0.0);
+    let y_px = y
+        .map(|v| length_to_px_y(v, region_h, scale_y, primitive_units_user_space))
+        .unwrap_or(0.0);
+    let w_px = w
+        .map(|v| length_to_px_x(v, region_w, scale_x, primitive_units_user_space))
+        .unwrap_or(region_w as f64);
+    let h_px = h
+        .map(|v| length_to_px_y(v, region_h, scale_y, primitive_units_user_space))
+        .unwrap_or(region_h as f64);
+
+    let min_x = region_min_x as f64 + x_px;
+    let min_y = region_min_y as f64 + y_px;
+    let max_x = min_x + w_px;
+    let max_y = min_y + h_px;
+
+    Some((min_x.floor() as i32, min_y.floor() as i32, max_x.ceil() as i32, max_y.ceil() as i32))
+}
+
 /// Collect all filter definitions from the document
 pub fn collect_all_filters(ctx: &mut RenderContext, node: &Node) {
     if !node.is_element() {
@@ -108,6 +185,24 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
     let result = node.attribute("result").unwrap_or("").to_string();
     let color_interpolation = get_color_interpolation(node);
 
+    fn parse_opt_length(s: Option<&str>) -> Option<LengthVal> {
+        let s = s?.trim();
+        if s.is_empty() {
+            return None;
+        }
+        if let Some(pct) = s.strip_suffix('%') {
+            let val = pct.trim().parse::<f64>().ok()?;
+            return Some(LengthVal { value: val, is_percent: true });
+        }
+        let val = s.parse::<f64>().ok()?;
+        Some(LengthVal { value: val, is_percent: false })
+    }
+
+    let x = parse_opt_length(node.attribute("x"));
+    let y = parse_opt_length(node.attribute("y"));
+    let width = parse_opt_length(node.attribute("width"));
+    let height = parse_opt_length(node.attribute("height"));
+
     match tag {
         "feGaussianBlur" => {
             let std_dev = node.attribute("stdDeviation").unwrap_or("0");
@@ -123,12 +218,16 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
                 input,
                 result,
                 color_interpolation,
+                x,
+                y,
+                width,
+                height,
             })
         }
         "feOffset" => {
             let dx = node.attribute("dx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let dy = node.attribute("dy").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            Some(FilterPrimitive::Offset { dx, dy, input, result, color_interpolation })
+            Some(FilterPrimitive::Offset { dx, dy, input, result, color_interpolation, x, y, width, height })
         }
         "feFlood" => {
             let color_str = node.attribute("flood-color").unwrap_or("black");
@@ -137,7 +236,7 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
                 .unwrap_or(1.0);
             let mut color = parse_color(color_str).unwrap_or(Color::from_rgba(0, 0, 0, 255));
             color.a = (color.a as f64 * opacity) as u8;
-            Some(FilterPrimitive::Flood { color, result, color_interpolation })
+            Some(FilterPrimitive::Flood { color, result, color_interpolation, x, y, width, height })
         }
         "feMerge" => {
             let mut nodes = Vec::new();
@@ -148,7 +247,7 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
                     nodes.push(in_ref);
                 }
             }
-            Some(FilterPrimitive::Merge { nodes, result, color_interpolation })
+            Some(FilterPrimitive::Merge { nodes, result, color_interpolation, x, y, width, height })
         }
         "feColorMatrix" => {
             let matrix_type = match node.attribute("type").unwrap_or("matrix") {
@@ -163,7 +262,7 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
                 .split(|c: char| c.is_whitespace() || c == ',')
                 .filter_map(|s| s.parse().ok())
                 .collect();
-            Some(FilterPrimitive::ColorMatrix { matrix_type, values, input, result, color_interpolation })
+            Some(FilterPrimitive::ColorMatrix { matrix_type, values, input, result, color_interpolation, x, y, width, height })
         }
         "feBlend" => {
             let mode = match node.attribute("mode").unwrap_or("normal") {
@@ -187,7 +286,7 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
             };
             let in1 = node.attribute("in").unwrap_or("").to_string();
             let in2 = node.attribute("in2").unwrap_or("BackgroundImage").to_string();
-            Some(FilterPrimitive::Blend { mode, in1, in2, result, color_interpolation })
+            Some(FilterPrimitive::Blend { mode, in1, in2, result, color_interpolation, x, y, width, height })
         }
         "feComposite" => {
             let operator = match node.attribute("operator").unwrap_or("over") {
@@ -205,7 +304,7 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
             let k4: f32 = node.attribute("k4").and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let in1 = node.attribute("in").unwrap_or("").to_string();
             let in2 = node.attribute("in2").unwrap_or("BackgroundImage").to_string();
-            Some(FilterPrimitive::Composite { operator, k1, k2, k3, k4, in1, in2, result, color_interpolation })
+            Some(FilterPrimitive::Composite { operator, k1, k2, k3, k4, in1, in2, result, color_interpolation, x, y, width, height })
         }
         "feMorphology" => {
             let operator = match node.attribute("operator").unwrap_or("erode") {
@@ -220,7 +319,7 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
                 .collect();
             let radius_x = parts.first().copied().unwrap_or(0.0);
             let radius_y = parts.get(1).copied().unwrap_or(radius_x);
-            Some(FilterPrimitive::Morphology { operator, radius_x, radius_y, input, result, color_interpolation })
+            Some(FilterPrimitive::Morphology { operator, radius_x, radius_y, input, result, color_interpolation, x, y, width, height })
         }
         "feTurbulence" => {
             let freq_str = node.attribute("baseFrequency").unwrap_or("0");
@@ -241,10 +340,10 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
                 "turbulence" => 1,
                 _ => 1,
             };
-            Some(FilterPrimitive::Turbulence { base_freq_x, base_freq_y, num_octaves, seed, noise_type, result, color_interpolation })
+            Some(FilterPrimitive::Turbulence { base_freq_x, base_freq_y, num_octaves, seed, noise_type, result, color_interpolation, x, y, width, height })
         }
         "feTile" => {
-            Some(FilterPrimitive::Tile { input, result, color_interpolation })
+            Some(FilterPrimitive::Tile { input, result, color_interpolation, x, y, width, height })
         }
         "feDropShadow" => {
             let dx: f64 = node.attribute("dx").and_then(|s| s.parse().ok()).unwrap_or(2.0);
@@ -262,14 +361,14 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
                 .unwrap_or(1.0);
             let mut flood_color = parse_color(color_str).unwrap_or(Color::from_rgba(0, 0, 0, 255));
             flood_color.a = (flood_color.a as f64 * opacity) as u8;
-            Some(FilterPrimitive::DropShadow { dx, dy, std_dev_x, std_dev_y, flood_color, input, result, color_interpolation })
+            Some(FilterPrimitive::DropShadow { dx, dy, std_dev_x, std_dev_y, flood_color, input, result, color_interpolation, x, y, width, height })
         }
         "feComponentTransfer" => {
             let func_r = parse_component_transfer_func(node, "feFuncR");
             let func_g = parse_component_transfer_func(node, "feFuncG");
             let func_b = parse_component_transfer_func(node, "feFuncB");
             let func_a = parse_component_transfer_func(node, "feFuncA");
-            Some(FilterPrimitive::ComponentTransfer { func_r, func_g, func_b, func_a, input, result, color_interpolation })
+            Some(FilterPrimitive::ComponentTransfer { func_r, func_g, func_b, func_a, input, result, color_interpolation, x, y, width, height })
         }
         "feConvolveMatrix" => {
             let order = node.attribute("order").unwrap_or("3");
@@ -284,16 +383,28 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
                 .split(|c: char| c.is_whitespace() || c == ',')
                 .filter_map(|s| s.parse().ok())
                 .collect();
-            let divisor: f32 = node.attribute("divisor")
+            let divisor: f32 = node
+                .attribute("divisor")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| kernel.iter().sum::<f32>().max(1.0));
+                .unwrap_or_else(|| {
+                    let sum = kernel.iter().sum::<f32>();
+                    if sum.abs() < 1e-10 { 1.0 } else { sum }
+                });
             let bias: f32 = node.attribute("bias").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let target_x: usize = node.attribute("targetX")
+            let mut target_x: usize = node
+                .attribute("targetX")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(order_x / 2);
-            let target_y: usize = node.attribute("targetY")
+            let mut target_y: usize = node
+                .attribute("targetY")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(order_y / 2);
+            if order_x > 0 {
+                target_x = target_x.min(order_x - 1);
+            }
+            if order_y > 0 {
+                target_y = target_y.min(order_y - 1);
+            }
             let edge_mode = match node.attribute("edgeMode").unwrap_or("duplicate") {
                 "duplicate" => 0,
                 "wrap" => 1,
@@ -303,6 +414,7 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
             let preserve_alpha = node.attribute("preserveAlpha") == Some("true");
             Some(FilterPrimitive::ConvolveMatrix {
                 order_x, order_y, kernel, divisor, bias, target_x, target_y, edge_mode, preserve_alpha, input, result, color_interpolation
+                , x, y, width, height
             })
         }
         "feDiffuseLighting" => {
@@ -317,6 +429,7 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
                 light_type, azimuth, elevation, light_x, light_y, light_z,
                 points_at_x, points_at_y, points_at_z, specular_exponent, limiting_cone_angle,
                 input, result, color_interpolation
+                , x, y, width, height
             })
         }
         "feSpecularLighting" => {
@@ -332,6 +445,7 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
                 light_type, azimuth, elevation, light_x, light_y, light_z,
                 points_at_x, points_at_y, points_at_z, spot_exponent, limiting_cone_angle,
                 input, result, color_interpolation
+                , x, y, width, height
             })
         }
         "feDisplacementMap" => {
@@ -344,11 +458,11 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
             };
             let in1 = node.attribute("in").unwrap_or("").to_string();
             let in2 = node.attribute("in2").unwrap_or("").to_string();
-            Some(FilterPrimitive::DisplacementMap { scale, x_channel, y_channel, in1, in2, result, color_interpolation })
+            Some(FilterPrimitive::DisplacementMap { scale, x_channel, y_channel, in1, in2, result, color_interpolation, x, y, width, height })
         }
         "feImage" => {
             let href = node.attribute("href").or_else(|| node.attribute((crate::svg_renderer::parsing::XLINK_NS, "href"))).unwrap_or("").to_string();
-            Some(FilterPrimitive::Image { result, href, color_interpolation })
+            Some(FilterPrimitive::Image { result, href, color_interpolation, x, y, width, height })
         }
         _ => None,
     }
@@ -440,6 +554,8 @@ pub fn apply_filter(
 
     // Calculate filter region in screen pixels
     let (region_min_x, region_min_y, region_max_x, region_max_y) = calculate_filter_region(filter, bbox, transform, width, height);
+    let region_w = (region_max_x - region_min_x).max(0);
+    let region_h = (region_max_y - region_min_y).max(0);
 
     // Convert source to ndarray for filter operations (Premultiplied sRGB)
     // We store intermediate results in Premultiplied sRGB (f32) to maximize precision
@@ -581,7 +697,30 @@ pub fn apply_filter(
             FilterPrimitive::ColorMatrix { matrix_type, values, input, .. } => {
                 // Spec: "If the input graphic is premultiplied, the matrix operation is applied to the premultiplied components."
                 let src = convert_input(input, true);
-                (filters::fe_color_matrix_impl_f32(&src.view(), *matrix_type, values), true)
+                if *matrix_type == 1 {
+                    // resvg behavior: saturate values outside [0, 1] produce transparent output
+                    if let Some(s) = values.first() {
+                        if *s < 0.0 || *s > 1.0 {
+                            let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
+                            (Array3::<f32>::zeros((h, w, 4)), true)
+                        } else {
+                            if *matrix_type == 0 && values.len() != 20 {
+                                // resvg behavior: invalid matrix value count passes through the input
+                                (src, true)
+                            } else {
+                                (filters::fe_color_matrix_impl_f32(&src.view(), *matrix_type, values), true)
+                            }
+                        }
+                    } else {
+                        // No values provided; fall back to implementation default handling.
+                        (filters::fe_color_matrix_impl_f32(&src.view(), *matrix_type, values), true)
+                    }
+                } else if *matrix_type == 0 && values.len() != 20 {
+                    // resvg behavior: invalid matrix value count passes through the input
+                    (src, true)
+                } else {
+                    (filters::fe_color_matrix_impl_f32(&src.view(), *matrix_type, values), true)
+                }
             }
             FilterPrimitive::Blend { mode, in1, in2, .. } => {
                 let src1 = convert_input(in1, true);
@@ -615,8 +754,23 @@ pub fn apply_filter(
                 (filters::fe_component_transfer_impl_f32(&src.view(), func_r, func_g, func_b, func_a), false)
             }
             FilterPrimitive::ConvolveMatrix { order_x, order_y, kernel, divisor, bias, target_x, target_y, edge_mode, preserve_alpha, input, .. } => {
-                let src = convert_input(input, true);
-                (filters::fe_convolve_matrix_impl_f32(&src.view(), *order_x, *order_y, kernel, *divisor, *bias, *target_x, *target_y, *edge_mode, *preserve_alpha), true)
+                // feConvolveMatrix operates on unpremultiplied colors; we premultiply once for storage.
+                let src = convert_input(input, false);
+                (
+                    filters::fe_convolve_matrix_impl_f32(
+                        &src.view(),
+                        *order_x,
+                        *order_y,
+                        kernel,
+                        *divisor,
+                        *bias,
+                        *target_x,
+                        *target_y,
+                        *edge_mode,
+                        *preserve_alpha,
+                    ),
+                    false,
+                )
             }
             FilterPrimitive::DiffuseLighting { surface_scale, diffuse_constant, light_color, light_type, azimuth, elevation, light_x, light_y, light_z, points_at_x, points_at_y, points_at_z, specular_exponent, limiting_cone_angle, input, .. } => {
                 // Lighting inputs: Source Alpha (opaque)
@@ -677,6 +831,20 @@ pub fn apply_filter(
         // Convert back to Premultiplied sRGB if we were in Linear
         if interpolation == ColorInterpolation::LinearRGB {
             result = to_srgb_premul(result);
+        }
+
+        // Apply primitive subregion masking (x/y/width/height on primitive)
+        if let Some((pmin_x, pmin_y, pmax_x, pmax_y)) = get_primitive_subregion_px(
+            prim,
+            filter,
+            region_min_x,
+            region_min_y,
+            region_w,
+            region_h,
+            scale_x,
+            scale_y,
+        ) {
+            clip_buffer(&mut result, pmin_x, pmin_y, pmax_x, pmax_y);
         }
 
         // Clip to filter region
@@ -821,14 +989,14 @@ fn premultiply_f32(arr: &mut Array3<f32>) {
     for y in 0..h {
         for x in 0..w {
             let a = arr[[y, x, 3]];
-            if a > 0.0 && a < 1.0 {
-                arr[[y, x, 0]] *= a;
-                arr[[y, x, 1]] *= a;
-                arr[[y, x, 2]] *= a;
-            } else if a <= 0.0 {
+            if a == 0.0 {
                 arr[[y, x, 0]] = 0.0;
                 arr[[y, x, 1]] = 0.0;
                 arr[[y, x, 2]] = 0.0;
+            } else if a != 1.0 {
+                arr[[y, x, 0]] *= a;
+                arr[[y, x, 1]] *= a;
+                arr[[y, x, 2]] *= a;
             }
         }
     }
@@ -839,10 +1007,10 @@ fn unpremultiply_f32(arr: &mut Array3<f32>) {
     for y in 0..h {
         for x in 0..w {
             let a = arr[[y, x, 3]];
-            if a > 0.0 && a < 1.0 {
-                arr[[y, x, 0]] = (arr[[y, x, 0]] / a).clamp(0.0, 1.0);
-                arr[[y, x, 1]] = (arr[[y, x, 1]] / a).clamp(0.0, 1.0);
-                arr[[y, x, 2]] = (arr[[y, x, 2]] / a).clamp(0.0, 1.0);
+            if a != 0.0 && a != 1.0 {
+                arr[[y, x, 0]] = arr[[y, x, 0]] / a;
+                arr[[y, x, 1]] = arr[[y, x, 1]] / a;
+                arr[[y, x, 2]] = arr[[y, x, 2]] / a;
             }
         }
     }
