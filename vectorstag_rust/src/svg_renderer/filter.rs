@@ -3,45 +3,9 @@
 use roxmltree::Node;
 use ndarray::{Array3, ArrayView3};
 use std::collections::HashMap;
-use once_cell::sync::Lazy;
 use super::types::*;
 use super::parsing::parse_color;
 use crate::filters;
-
-// ============================================================================
-// Static Lookup Tables for sRGB <-> Linear RGB conversion
-// ============================================================================
-// These LUTs are computed once and eliminate expensive powf() calls
-
-/// sRGB u8 -> Linear RGB u8 lookup table
-static SRGB_TO_LINEAR_LUT: Lazy<[u8; 256]> = Lazy::new(|| {
-    let mut lut = [0u8; 256];
-    for i in 0..256 {
-        let v = i as f32 / 255.0;
-        let linear = if v <= 0.04045 {
-            v / 12.92
-        } else {
-            ((v + 0.055) / 1.055).powf(2.4)
-        };
-        lut[i] = (linear * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-    }
-    lut
-});
-
-/// Linear RGB u8 -> sRGB u8 lookup table
-static LINEAR_TO_SRGB_LUT: Lazy<[u8; 256]> = Lazy::new(|| {
-    let mut lut = [0u8; 256];
-    for i in 0..256 {
-        let v = i as f32 / 255.0;
-        let srgb = if v <= 0.0031308 {
-            12.92 * v
-        } else {
-            1.055 * v.powf(1.0 / 2.4) - 0.055
-        };
-        lut[i] = (srgb * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-    }
-    lut
-});
 
 /// Collect all filter definitions from the document
 pub fn collect_all_filters(ctx: &mut RenderContext, node: &Node) {
@@ -869,16 +833,26 @@ fn unpremultiply_f32(arr: &mut Array3<f32>) {
     }
 }
 
-/// Convert sRGB u8 to Linear RGB u8 (using LUT)
-#[inline(always)]
+/// Convert sRGB u8 to Linear RGB u8
 fn srgb_to_linear(val: u8) -> u8 {
-    SRGB_TO_LINEAR_LUT[val as usize]
+    let v = val as f32 / 255.0;
+    let linear = if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    };
+    (linear * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-/// Convert Linear RGB u8 to sRGB u8 (using LUT)
-#[inline(always)]
+/// Convert Linear RGB u8 to sRGB u8
 fn linear_to_srgb(val: u8) -> u8 {
-    LINEAR_TO_SRGB_LUT[val as usize]
+    let v = val as f32 / 255.0;
+    let srgb = if v <= 0.0031308 {
+        12.92 * v
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
+    (srgb * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
 /// Convert entire array from sRGB to Linear RGB (skipping alpha)
@@ -886,9 +860,9 @@ fn array_srgb_to_linear(arr: &ArrayView3<u8>) -> Array3<u8> {
     let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
     Array3::from_shape_fn((h, w, 4), |(y, x, c)| {
         if c == 3 {
-            arr[[y, x, 3]]  // Alpha unchanged
+            arr[[y, x, 3]]
         } else {
-            SRGB_TO_LINEAR_LUT[arr[[y, x, c]] as usize]
+            srgb_to_linear(arr[[y, x, c]])
         }
     })
 }
@@ -898,9 +872,9 @@ fn array_linear_to_srgb(arr: &Array3<u8>) -> Array3<u8> {
     let (h, w, _) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
     Array3::from_shape_fn((h, w, 4), |(y, x, c)| {
         if c == 3 {
-            arr[[y, x, 3]]  // Alpha unchanged
+            arr[[y, x, 3]]
         } else {
-            LINEAR_TO_SRGB_LUT[arr[[y, x, c]] as usize]
+            linear_to_srgb(arr[[y, x, c]])
         }
     })
 }
