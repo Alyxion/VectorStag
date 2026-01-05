@@ -3,9 +3,10 @@
 Unified SVG comparison tool for VectorStag.
 
 Features:
-- Pre-render references with Cairo and resvg
+- Pre-render references with Cairo, resvg, and Chrome (if available)
 - Fast comparison against pre-rendered references
 - Generate comparison grid PNGs (VectorStag | resvg | diff)
+- Multi-renderer similarity matrix across VectorStag, resvg, Cairo, Chrome
 - Support for multiple SVG collections
 
 Usage:
@@ -20,9 +21,13 @@ Usage:
 
     # List available collections
     python svg_compare.py list
+
+    # Multi-renderer similarity matrix (VectorStag, resvg, Cairo, Chrome)
+    python svg_compare.py matrix --emojis --limit 200 -j 8
 """
 
 import argparse
+import os
 import io
 import re
 import time
@@ -35,7 +40,10 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
+import subprocess
+import tempfile
+import shutil
 
 # Worker timeout in seconds (prevent infinite loops)
 WORKER_TIMEOUT = 30
@@ -54,6 +62,23 @@ except ImportError:
     HAS_RESVG = False
 
 from vectorstag import SVGRenderer
+
+# Optional: Playwright for robust Chromium rendering
+HAS_PLAYWRIGHT = False
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except Exception:
+    HAS_PLAYWRIGHT = False
+
+# Cached Playwright context (single process reuse)
+_PW = None
+_PW_BROWSER = None
+_PW_CONTEXT = None
+_PW_PAGE = None
+
+# Chrome backend selection: 'auto' (prefer playwright), 'playwright', or 'cli'
+CHROME_BACKEND = 'auto'
 
 
 # =============================================================================
@@ -88,6 +113,14 @@ def get_collections(base_ref_dir: Path = None, base_output_dir: Path = None) -> 
             output_dir=base_output_dir / "emojis",
             size=400,
             description="Noto Color Emojis (3427 files)"
+        ),
+        "resvgtests": Collection(
+            name="resvgtests",
+            svg_dir=Path("resvg-test-suite/tests"),
+            ref_dir=base_ref_dir / "resvgtests",
+            output_dir=base_output_dir / "resvgtests",
+            size=400,
+            description="resvg test suite (1679 tests)"
         ),
         "flags": Collection(
             name="flags",
@@ -338,27 +371,265 @@ def render_with_cairo(svg_path: Path, size: int) -> Optional[Image.Image]:
 
 def render_with_resvg(svg_path: Path, size: int) -> Optional[Image.Image]:
     """Render SVG with resvg."""
-    if not HAS_RESVG:
+    # Prefer Python binding if available, else CLI fallback
+    if HAS_RESVG:
+        try:
+            with open(svg_path, 'r') as f:
+                content = f.read()
+
+            png_data = bytes(svg_to_png(content))
+            img = Image.open(io.BytesIO(png_data)).convert("RGBA")
+
+            # Fit to size, preserving aspect ratio
+            stretch = should_stretch(svg_path)
+            if img.size != (size, size):
+                if stretch:
+                    img = img.resize((size, size), Image.Resampling.LANCZOS)
+                else:
+                    img = fit_to_canvas(img, size)
+
+            return img
+        except Exception:
+            pass
+
+    # CLI fallback
+    return render_with_resvg_cli(svg_path, size)
+
+
+def find_resvg_executable() -> Optional[str]:
+    """Locate a `resvg` CLI executable via env and PATH."""
+    for key in ("RESVG_BIN", "RESVG_PATH"):
+        val = os.environ.get(key)
+        if val and Path(val).exists():
+            return val
+    p = shutil.which("resvg")
+    return p
+
+
+def render_with_resvg_cli(svg_path: Path, size: int) -> Optional[Image.Image]:
+    """Render SVG with resvg CLI and fit to canvas.
+
+    Requires `resvg` available in PATH or via RESVG_BIN/RESVG_PATH.
+    """
+    exe = find_resvg_executable()
+    if not exe:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as tmpd:
+            tmp = Path(tmpd)
+            out_png = tmp / "out.png"
+            # Basic invocation: resvg input.svg output.png
+            cmd = [exe, str(svg_path), str(out_png)]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+            if not out_png.exists():
+                return None
+            img = Image.open(out_png).convert("RGBA")
+            # Fit to size, preserving aspect ratio unless stretch
+            stretch = should_stretch(svg_path)
+            if img.size != (size, size):
+                if stretch:
+                    img = img.resize((size, size), Image.Resampling.LANCZOS)
+                else:
+                    img = fit_to_canvas(img, size)
+            return img
+    except Exception:
+        return None
+
+
+def find_chrome_executable() -> Optional[str]:
+    """Locate a Chrome/Chromium executable on common paths.
+
+    Checks env vars CHROME_BIN/CHROME_PATH, common macOS and Linux locations, and PATH.
+    """
+    # Env overrides
+    for key in ("CHROME_BIN", "CHROME_PATH"):
+        val = os.environ.get(key)
+        if val and Path(val).exists():
+            return val
+
+    # Common macOS locations
+    mac_candidates = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ]
+    for c in mac_candidates:
+        if Path(c).exists():
+            return c
+
+    # PATH-based executables
+    for exe in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        p = shutil.which(exe)
+        if p:
+            return p
+
+    return None
+
+
+def render_with_chrome(svg_path: Path, size: int) -> Optional[Image.Image]:
+    """Render SVG with headless Chrome by screenshotting an HTML wrapper.
+
+    Requires a Chrome/Chromium binary. Attempts to keep transparent background and
+    preserve aspect via CSS so comparisons align with other renderers.
+    """
+    # Respect backend selection and prefer Playwright if available
+    if (CHROME_BACKEND in ('playwright', 'auto')) and HAS_PLAYWRIGHT:
+        try:
+            img = render_with_chrome_playwright(svg_path, size)
+            if img is not None:
+                return img
+        except Exception:
+            pass
+    if CHROME_BACKEND == 'playwright':
+        # Explicitly requested Playwright but it failed or is missing
+        return None
+    chrome = find_chrome_executable()
+    if not chrome:
         return None
 
     try:
-        with open(svg_path, 'r') as f:
-            content = f.read()
+        with tempfile.TemporaryDirectory() as tmpd:
+            tmp = Path(tmpd)
+            out_png = tmp / "out.png"
+            # HTML wrapper with transparent background and centered SVG using <img>
+            # object-fit: contain preserves aspect; size is enforced by viewport/window-size
+            stretch = should_stretch(svg_path)
+            fit_mode = "fill" if stretch else "contain"
+            html = f"""
+<!doctype html>
+<html>
+  <head>
+    <meta charset=\"utf-8\" />
+    <style>
+      html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background: rgba(0,0,0,0); }}
+      .wrap {{ width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0); }}
+      img {{ width: 100%; height: 100%; object-fit: {fit_mode}; image-rendering: auto; background: rgba(0,0,0,0); }}
+    </style>
+  </head>
+  <body>
+    <div class=\"wrap\"><img src=\"file://{svg_path.absolute().as_posix()}\" /></div>
+  </body>
+  </html>
+"""
+            html_path = tmp / "index.html"
+            html_path.write_text(html, encoding="utf-8")
 
-        png_data = bytes(svg_to_png(content))
-        img = Image.open(io.BytesIO(png_data)).convert("RGBA")
+            # Run Chrome headless to capture a screenshot of the fixed-size viewport
+            url = f"file://{html_path.absolute().as_posix()}"
+            cmd = [
+                chrome,
+                "--headless=new",
+                f"--screenshot={out_png}",
+                f"--window-size={size},{size}",
+                "--force-device-scale-factor=1",
+                "--disable-gpu",
+                "--hide-scrollbars",
+                "--disable-extensions",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--force-color-profile=srgb",
+                "--default-background-color=00000000",
+                "--virtual-time-budget=2000",
+                url,
+            ]
+            # Fallback for older versions not supporting headless=new
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+            except subprocess.CalledProcessError:
+                cmd[1] = "--headless"
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
 
-        # Fit to size, preserving aspect ratio
-        stretch = should_stretch(svg_path)
-        if img.size != (size, size):
-            if stretch:
+            if not out_png.exists():
+                return None
+            img = Image.open(out_png).convert("RGBA")
+            # Heuristic: crop 1px uniform border if present (Chrome sometimes adds it)
+            img = maybe_crop_uniform_border(img)
+            # Ensure exact size
+            if img.size != (size, size):
                 img = img.resize((size, size), Image.Resampling.LANCZOS)
-            else:
-                img = fit_to_canvas(img, size)
+            return img
+    except Exception:
+        return None
+
+
+def maybe_crop_uniform_border(img: Image.Image) -> Image.Image:
+    """Detect and crop a uniform 1px border around the image, if present.
+
+    Checks if the top/bottom rows and left/right cols are identical and equal to each other.
+    If so, crops by 1px on all sides. Otherwise returns the original image.
+    """
+    if img.width < 3 or img.height < 3:
+        return img
+    arr = np.array(img)
+    top = arr[0, :, :]
+    bottom = arr[-1, :, :]
+    left = arr[:, 0, :]
+    right = arr[:, -1, :]
+    # Compare uniformity
+    def is_uniform(edge):
+        first = edge[0]
+        return np.all(edge == first)
+    if is_uniform(top) and is_uniform(bottom) and is_uniform(left) and is_uniform(right):
+        # Also ensure all four borders match each other at corners
+        if np.array_equal(top[0], left[0]) and np.array_equal(top[-1], right[0]):
+            return img.crop((1, 1, img.width - 1, img.height - 1))
+    return img
+
+
+def render_with_chrome_playwright(svg_path: Path, size: int) -> Optional[Image.Image]:
+    """Render using Playwright/Chromium with a reusable browser.
+
+    Renders SVG at target size directly using viewport sizing.
+    """
+    global _PW, _PW_BROWSER, _PW_CONTEXT, _PW_PAGE
+    if not HAS_PLAYWRIGHT:
+        return None
+
+    # Lazy-init browser (once per process)
+    try:
+        if _PW is None:
+            _PW = sync_playwright().start()
+        if _PW_BROWSER is None:
+            executable = os.environ.get("CHROME_BIN") or os.environ.get("CHROME_PATH")
+            launch_kwargs = {"headless": True, "args": ["--force-color-profile=srgb", "--disable-gpu", "--disable-web-security"]}
+            if executable:
+                launch_kwargs["executable_path"] = executable
+            _PW_BROWSER = _PW.chromium.launch(**launch_kwargs)
+    except Exception:
+        return None
+
+    # Create fresh context/page for each render to avoid state issues
+    context = None
+    page = None
+    try:
+        context = _PW_BROWSER.new_context(viewport={"width": size, "height": size}, device_scale_factor=1)
+        page = context.new_page()
+
+        # Navigate directly to SVG file - Chrome renders it natively
+        page.goto(f"file://{svg_path.absolute()}", wait_until="load", timeout=5000)
+
+        # Take full page screenshot
+        data = page.screenshot(omit_background=True, full_page=False)
+        img = Image.open(io.BytesIO(data)).convert("RGBA")
+
+        # Should be exactly size x size from viewport
+        if img.size != (size, size):
+            img = img.resize((size, size), Image.Resampling.LANCZOS)
 
         return img
     except Exception:
         return None
+    finally:
+        if page:
+            try:
+                page.close()
+            except Exception:
+                pass
+        if context:
+            try:
+                context.close()
+            except Exception:
+                pass
 
 
 def render_with_vectorstag(svg_path: Path, size: int) -> Optional[Image.Image]:
@@ -385,32 +656,65 @@ def render_with_vectorstag(svg_path: Path, size: int) -> Optional[Image.Image]:
 
 def prerender_worker(args):
     """Worker function for pre-rendering."""
-    svg_path, base_dir, cairo_dir, resvg_dir, size = args
+    svg_path, base_dir, cairo_dir, resvg_dir, chrome_dir, size, force = args
     name = get_unique_name(svg_path, base_dir)
 
     cairo_ok = False
     resvg_ok = False
+    chrome_ok = False
+
+    def save_valid_image(img, path):
+        """Save image only if it's valid (has content and proper size)."""
+        if img is None:
+            return False
+        # Check image has reasonable dimensions
+        if img.width < 1 or img.height < 1:
+            return False
+        # Check image isn't completely transparent/empty
+        try:
+            extrema = img.getextrema()
+            # For RGBA, check if alpha channel has any non-zero pixels
+            if len(extrema) >= 4 and extrema[3] == (0, 0):
+                return False  # Completely transparent
+            img.save(path, "PNG")
+            return True
+        except Exception:
+            return False
 
     try:
         if cairo_dir:
-            img = render_with_cairo(svg_path, size)
-            if img:
-                img.save(cairo_dir / f"{name}.png")
-                cairo_ok = True
+            out_path = cairo_dir / f"{name}.png"
+            if force or not out_path.exists():
+                img = render_with_cairo(svg_path, size)
+                cairo_ok = save_valid_image(img, out_path)
+            else:
+                cairo_ok = True  # Already exists
 
         if resvg_dir:
-            img = render_with_resvg(svg_path, size)
-            if img:
-                img.save(resvg_dir / f"{name}.png")
-                resvg_ok = True
+            out_path = resvg_dir / f"{name}.png"
+            if force or not out_path.exists():
+                img = render_with_resvg(svg_path, size)
+                resvg_ok = save_valid_image(img, out_path)
+            else:
+                resvg_ok = True  # Already exists
+
+        if chrome_dir:
+            out_path = chrome_dir / f"{name}.png"
+            if force or not out_path.exists():
+                img = render_with_chrome(svg_path, size)
+                chrome_ok = save_valid_image(img, out_path)
+            else:
+                chrome_ok = True  # Already exists
     except Exception:
         pass
 
-    return name, cairo_ok, resvg_ok
+    return name, cairo_ok, resvg_ok, chrome_ok
 
 
 def prerender_collection(collection: Collection, num_workers: int = None,
-                         render_cairo: bool = True, render_resvg: bool = True):
+                         render_cairo: bool = True, render_resvg: bool = True,
+                         render_chrome: bool = True, override_size: Optional[int] = None,
+                         chrome_serial: bool = False, force: bool = False):
     """Pre-render all SVGs in a collection."""
     svg_files = sorted(collection.svg_dir.glob("**/*.svg"))
 
@@ -419,32 +723,72 @@ def prerender_collection(collection: Collection, num_workers: int = None,
         return
 
     cairo_dir = collection.ref_dir / "cairo" if render_cairo and HAS_CAIRO else None
-    resvg_dir = collection.ref_dir / "resvg" if render_resvg and HAS_RESVG else None
+    enable_resvg = False
+    if render_resvg:
+        try:
+            enable_resvg = HAS_RESVG or (find_resvg_executable() is not None)
+        except Exception:
+            enable_resvg = HAS_RESVG
+    resvg_dir = collection.ref_dir / "resvg" if enable_resvg else None
+    enable_chrome = False
+    chosen_backend = None
+    if render_chrome:
+        if CHROME_BACKEND == 'playwright':
+            enable_chrome = HAS_PLAYWRIGHT
+            chosen_backend = 'playwright'
+        elif CHROME_BACKEND == 'cli':
+            enable_chrome = find_chrome_executable() is not None
+            chosen_backend = 'cli'
+        else:  # auto
+            if HAS_PLAYWRIGHT:
+                enable_chrome = True
+                chosen_backend = 'playwright'
+            else:
+                enable_chrome = find_chrome_executable() is not None
+                chosen_backend = 'cli' if enable_chrome else None
+    chrome_dir = collection.ref_dir / "chrome" if enable_chrome else None
 
     if cairo_dir:
         cairo_dir.mkdir(parents=True, exist_ok=True)
     if resvg_dir:
         resvg_dir.mkdir(parents=True, exist_ok=True)
+    if chrome_dir:
+        chrome_dir.mkdir(parents=True, exist_ok=True)
 
     if num_workers is None:
         num_workers = min(cpu_count(), 16)
+    # Optionally serialize Chrome to avoid UI bouncing on macOS
+    exec_workers = 1 if (chrome_dir and chrome_serial) else num_workers
 
+    size = override_size or collection.size
     print(f"Pre-rendering {len(svg_files)} SVGs from {collection.svg_dir}")
     print(f"Output: {collection.ref_dir}")
-    print(f"Size: {collection.size}x{collection.size}")
-    print(f"Workers: {num_workers}")
+    print(f"Size: {size}x{size}")
+    if exec_workers != num_workers and chrome_dir:
+        print(f"Workers: {num_workers} (chrome serialized -> {exec_workers})")
+    else:
+        print(f"Workers: {num_workers}")
     if cairo_dir:
         print(f"Cairo: enabled")
+    else:
+        print(f"Cairo: disabled (cairosvg not installed)")
     if resvg_dir:
         print(f"resvg: enabled")
+    else:
+        print(f"resvg: disabled (binding/CLI not found)")
+    if chrome_dir:
+        print(f"Chrome: enabled via {chosen_backend}")
+    else:
+        reason = 'playwright not installed' if (CHROME_BACKEND in ('playwright','auto') and not HAS_PLAYWRIGHT) else 'chrome/Chromium not found'
+        print(f"Chrome: disabled ({reason})")
     print()
 
-    tasks = [(svg_path, collection.svg_dir, cairo_dir, resvg_dir, collection.size) for svg_path in svg_files]
+    tasks = [(svg_path, collection.svg_dir, cairo_dir, resvg_dir, chrome_dir, size, force) for svg_path in svg_files]
 
     start_time = time.time()
-    cairo_ok = resvg_ok = 0
+    cairo_ok = resvg_ok = chrome_ok = 0
 
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+    with ProcessPoolExecutor(max_workers=exec_workers) as executor:
         future_to_task = {executor.submit(prerender_worker, task): task for task in tasks}
 
         completed = 0
@@ -452,9 +796,10 @@ def prerender_collection(collection: Collection, num_workers: int = None,
             completed += 1
 
             try:
-                name, c_ok, r_ok = future.result(timeout=WORKER_TIMEOUT)
+                name, c_ok, r_ok, ch_ok = future.result(timeout=WORKER_TIMEOUT)
                 cairo_ok += c_ok
                 resvg_ok += r_ok
+                chrome_ok += ch_ok
             except FuturesTimeoutError:
                 pass  # Timeout, skip this file
             except Exception:
@@ -471,6 +816,8 @@ def prerender_collection(collection: Collection, num_workers: int = None,
         print(f"Cairo: {cairo_ok}/{len(svg_files)} successful")
     if resvg_dir:
         print(f"resvg: {resvg_ok}/{len(svg_files)} successful")
+    if chrome_dir:
+        print(f"Chrome: {chrome_ok}/{len(svg_files)} successful")
 
 
 # =============================================================================
@@ -674,6 +1021,308 @@ def print_summary(results, errors, buckets, title=""):
 
 
 # =============================================================================
+# Multi-renderer matrix comparison
+# =============================================================================
+
+def matrix_worker(args):
+    svg_path, base_dir, ref_dir, size = args
+    name = get_unique_name(svg_path, base_dir)
+    try:
+        # Load available references
+        imgs = {}
+        # Pre-rendered backends
+        for backend in ("resvg", "cairo", "chrome"):
+            p = (ref_dir / backend / f"{name}.png")
+            if p.exists():
+                try:
+                    imgs[backend] = Image.open(p).convert("RGBA")
+                except Exception:
+                    pass
+
+        # VectorStag on-the-fly
+        vs = render_vectorstag_for_comparison(svg_path, size)
+        if vs is not None:
+            imgs["vectorstag"] = vs
+
+        # Compute pairwise similarities
+        keys = sorted(imgs.keys())
+        sims = {}
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                a, b = keys[i], keys[j]
+                sims[(a, b)] = compute_similarity(imgs[a], imgs[b])
+
+        # Compute a per-file summary: minimal similarity across available pairs
+        worst = 1.0
+        for v in sims.values():
+            if v < worst:
+                worst = v
+        return {"name": name, "sims": sims, "present": set(keys), "worst": worst}
+    except Exception as e:
+        return {"name": name, "error": str(e)[:80]}
+
+
+def matrix_collection(collection: Collection, num_workers: int = None, limit: int = None):
+    svg_files = sorted(collection.svg_dir.glob("**/*.svg"))
+    if limit:
+        svg_files = svg_files[:limit]
+
+    if not svg_files:
+        print(f"No SVG files found in {collection.svg_dir}")
+        return {}
+
+    if num_workers is None:
+        num_workers = min(cpu_count(), 16)
+
+    print(f"Matrix compare on {len(svg_files)} SVGs from {collection.svg_dir}")
+    print(f"References: {collection.ref_dir} (expect resvg/cairo/chrome subdirs)")
+    print(f"Size: {collection.size}x{collection.size}")
+    print(f"Workers: {num_workers}")
+    print()
+
+    tasks = [(svg_path, collection.svg_dir, collection.ref_dir, collection.size) for svg_path in svg_files]
+
+    # Accumulators
+    sums: Dict[tuple, float] = defaultdict(float)
+    counts: Dict[tuple, int] = defaultdict(int)
+    errors = []
+    per_file = []
+
+    start_time = time.time()
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        future_to_task = {executor.submit(matrix_worker, t): t for t in tasks}
+        completed = 0
+        for future in as_completed(future_to_task):
+            completed += 1
+            t = future_to_task[future]
+            name = get_unique_name(t[0], t[1])
+            try:
+                res = future.result(timeout=WORKER_TIMEOUT)
+                if "error" in res:
+                    errors.append((name, res["error"]))
+                else:
+                    per_file.append({"name": res["name"], "sims": res["sims"], "present": res["present"], "worst": res.get("worst", 1.0), "svg_path": t[0]})
+                    for k, v in res["sims"].items():
+                        sums[k] += v
+                        counts[k] += 1
+            except FuturesTimeoutError:
+                errors.append((name, "timeout"))
+            except Exception as e:
+                errors.append((name, str(e)[:80]))
+
+            if completed % 500 == 0 or completed == len(svg_files):
+                elapsed = time.time() - start_time
+                rate = completed / elapsed if elapsed > 0 else 0
+                print(f"  {completed}/{len(svg_files)} - {rate:.1f} files/sec")
+
+    elapsed = time.time() - start_time
+    print(f"  Completed in {elapsed:.1f}s ({len(svg_files)/elapsed:.1f} files/sec)")
+
+    return {"sums": sums, "counts": counts, "errors": errors, "per_file": per_file}
+
+
+def print_matrix(matrix_res, title: str = ""):
+    sums: Dict[tuple, float] = matrix_res["sums"]
+    counts: Dict[tuple, int] = matrix_res["counts"]
+    errors = matrix_res.get("errors", [])
+
+    print("\n" + "=" * 99)
+    print(f"PAIRWISE SIMILARITY MATRIX{' - ' + title if title else ''}")
+    print("=" * 99)
+    pairs = [
+        ("vectorstag", "resvg"),
+        ("vectorstag", "cairo"),
+        ("vectorstag", "chrome"),
+        ("resvg", "cairo"),
+        ("resvg", "chrome"),
+        ("cairo", "chrome"),
+    ]
+
+    def get_pair_data(p):
+        """Get count and sum for a pair, checking both orderings."""
+        # Keys are sorted alphabetically in matrix_worker, so check canonical order
+        canonical = tuple(sorted(p))
+        if canonical in counts and counts[canonical] > 0:
+            return counts[canonical], sums[canonical]
+        return 0, 0.0
+
+    # Header
+    print("\nPair                     |  Avg   |  Count")
+    print("-" * 99)
+    for p in pairs:
+        count, total = get_pair_data(p)
+        if count > 0:
+            avg = total / count
+            print(f"{p[0]:>10} vs {p[1]:<10} | {avg:6.1%} | {count:6}")
+        else:
+            print(f"{p[0]:>10} vs {p[1]:<10} |   n/a  |      0")
+
+    if errors:
+        print(f"\nErrors: {len(errors)} (showing up to 5)")
+        for n, e in errors[:5]:
+            print(f"  {n}: {e}")
+
+
+def create_big4_grid(vs_img: Optional[Image.Image], resvg_img: Optional[Image.Image],
+                     cairo_img: Optional[Image.Image], chrome_img: Optional[Image.Image], size: int,
+                     show_labels: bool = True) -> Image.Image:
+    """Create a 3x4 grid:
+    Row1: VectorStag | resvg | Cairo | Chrome (composited on white)
+    Row2: VS vs resvg | VS vs Cairo | VS vs Chrome | label tile
+    Row3: resvg vs VS | resvg vs Cairo | resvg vs Chrome | label tile
+    """
+    cols = 4
+    rows = 3
+    cell_w = size
+    cell_h = size
+
+    grid = Image.new("RGB", (cols * cell_w, rows * cell_h), (255, 255, 255))
+    white = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+
+    def fit(img):
+        return fit_to_canvas(img, size) if img is not None else Image.new("RGBA", (size, size), (220, 220, 220, 255))
+
+    # Row 1: originals
+    tiles = [vs_img, resvg_img, cairo_img, chrome_img]
+    for i, t in enumerate(tiles):
+        comp = Image.alpha_composite(white, fit(t)).convert("RGB")
+        grid.paste(comp, (i * cell_w, 0))
+    # Labels row 1
+    if show_labels:
+        labels_r1 = ["VectorStag", "resvg", "Cairo", "Chrome"]
+        _label_grid_row(grid, 0, labels_r1, cell_w, cell_h)
+
+    # Row 2: VS diffs
+    diffs_vs = [create_diff_image(fit(vs_img), fit(resvg_img), size),
+                create_diff_image(fit(vs_img), fit(cairo_img), size),
+                create_diff_image(fit(vs_img), fit(chrome_img), size)]
+    for i, d in enumerate(diffs_vs):
+        grid.paste(d, (i * cell_w, 1 * cell_h))
+    # Label tile for column 4
+    grid.paste(Image.new("RGB", (cell_w, cell_h), (245, 245, 245)), (3 * cell_w, 1 * cell_h))
+    if show_labels:
+        labels_r2 = ["VS vs resvg", "VS vs Cairo", "VS vs Chrome", "VS diffs"]
+        _label_grid_row(grid, 1, labels_r2, cell_w, cell_h)
+
+    # Row 3: resvg diffs
+    diffs_rs = [create_diff_image(fit(resvg_img), fit(vs_img), size),
+                create_diff_image(fit(resvg_img), fit(cairo_img), size),
+                create_diff_image(fit(resvg_img), fit(chrome_img), size)]
+    for i, d in enumerate(diffs_rs):
+        grid.paste(d, (i * cell_w, 2 * cell_h))
+    # Label tile for column 4
+    grid.paste(Image.new("RGB", (cell_w, cell_h), (245, 245, 245)), (3 * cell_w, 2 * cell_h))
+    if show_labels:
+        labels_r3 = ["resvg vs VS", "resvg vs Cairo", "resvg vs Chrome", "resvg diffs"]
+        _label_grid_row(grid, 2, labels_r3, cell_w, cell_h)
+
+    # Similarity percentages on diff tiles (only when labels are on)
+    if show_labels:
+        # Prepare fitted images for similarity computation
+        fvs, frs, fca, fch = fit(vs_img), fit(resvg_img), fit(cairo_img), fit(chrome_img)
+
+        def fmt_sim(a: Optional[Image.Image], b: Optional[Image.Image]) -> str:
+            if a is None or b is None:
+                return "n/a"
+            try:
+                sim = compute_similarity(a, b)
+                return f"{sim*100:.1f}%"
+            except Exception:
+                return "n/a"
+
+        # Row 2
+        sims_r2 = [fmt_sim(fvs, frs), fmt_sim(fvs, fca), fmt_sim(fvs, fch)]
+        for i, s in enumerate(sims_r2):
+            _label_cell(grid, 1, i, s, cell_w, cell_h, anchor="br")
+        # Row 3
+        sims_r3 = [fmt_sim(frs, fvs), fmt_sim(frs, fca), fmt_sim(frs, fch)]
+        for i, s in enumerate(sims_r3):
+            _label_cell(grid, 2, i, s, cell_w, cell_h, anchor="br")
+
+    return grid
+
+
+def _label_grid_row(grid: Image.Image, row: int, labels: List[str], cell_w: int, cell_h: int) -> None:
+    """Draw simple labels in the top-left of each cell in a row."""
+    draw = ImageDraw.Draw(grid)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    pad = 4
+    for col, text in enumerate(labels):
+        if not text:
+            continue
+        x = col * cell_w + pad
+        y = row * cell_h + pad
+        # background box sized to text
+        try:
+            bbox = draw.textbbox((x, y), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except Exception:
+            tw, th = (8 * len(text), 10)
+        box = [x - 2, y - 2, x + tw + 2, y + th + 2]
+        draw.rectangle(box, fill=(255, 255, 255))
+        draw.text((x, y), text, fill=(0, 0, 0), font=font)
+
+
+def _label_cell(grid: Image.Image, row: int, col: int, text: str, cell_w: int, cell_h: int, anchor: str = "tl") -> None:
+    """Draw a label inside a single cell. anchor: 'tl' top-left, 'br' bottom-right."""
+    if not text:
+        return
+    draw = ImageDraw.Draw(grid)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    pad = 4
+    try:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except Exception:
+        tw, th = (8 * len(text), 10)
+    if anchor == "br":
+        x = (col + 1) * cell_w - tw - pad
+        y = (row + 1) * cell_h - th - pad
+    else:  # default top-left
+        x = col * cell_w + pad
+        y = row * cell_h + pad
+    box = [x - 2, y - 2, x + tw + 2, y + th + 2]
+    draw.rectangle(box, fill=(255, 255, 255))
+    draw.text((x, y), text, fill=(0, 0, 0), font=font)
+
+
+def build_and_save_grid(svg_path: Path, base_dir: Path, ref_dir: Path, size: int, out_path: Path,
+                        show_labels: bool = True):
+    name = get_unique_name(svg_path, base_dir)
+    resvg_img = None
+    cairo_img = None
+    chrome_img = None
+    p = ref_dir / "resvg" / f"{name}.png"
+    if p.exists():
+        try:
+            resvg_img = Image.open(p).convert("RGBA")
+        except Exception:
+            pass
+    p = ref_dir / "cairo" / f"{name}.png"
+    if p.exists():
+        try:
+            cairo_img = Image.open(p).convert("RGBA")
+        except Exception:
+            pass
+    p = ref_dir / "chrome" / f"{name}.png"
+    if p.exists():
+        try:
+            chrome_img = Image.open(p).convert("RGBA")
+        except Exception:
+            pass
+    vs_img = render_vectorstag_for_comparison(svg_path, size)
+    grid = create_big4_grid(vs_img, resvg_img, cairo_img, chrome_img, size, show_labels=show_labels)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    grid.save(out_path)
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -681,11 +1330,20 @@ def cmd_prerender(args):
     """Handle prerender command."""
     collections = get_collections()
 
+    # Apply Chrome backend selection globally
+    global CHROME_BACKEND
+    CHROME_BACKEND = getattr(args, 'chrome_backend', 'playwright')
+
+    # High-level backend info
+    print("\nChrome rendering backend:")
+    print(f"  requested: {CHROME_BACKEND}")
+    print(f"  playwright available: {'yes' if HAS_PLAYWRIGHT else 'no'}")
+
     selected = []
     if args.all:
         selected = list(collections.values())
     else:
-        for name in ['emojis', 'flags', 'material', 'fontawesome', 'lucide', 'w3c']:
+        for name in ['emojis', 'flags', 'material', 'fontawesome', 'lucide', 'w3c', 'resvgtests']:
             if getattr(args, name, False):
                 if name in collections:
                     selected.append(collections[name])
@@ -706,7 +1364,11 @@ def cmd_prerender(args):
             collection,
             num_workers=args.workers,
             render_cairo=not args.no_cairo,
-            render_resvg=not args.no_resvg
+            render_resvg=not args.no_resvg,
+            render_chrome=not args.no_chrome,
+            override_size=args.size,
+            chrome_serial=args.chrome_serial,
+            force=args.force
         )
 
 
@@ -718,7 +1380,7 @@ def cmd_compare(args):
     if args.all:
         selected = list(collections.values())
     else:
-        for name in ['emojis', 'flags', 'material', 'fontawesome', 'lucide', 'w3c']:
+        for name in ['emojis', 'flags', 'material', 'fontawesome', 'lucide', 'w3c', 'resvgtests']:
             if getattr(args, name, False):
                 if name in collections:
                     selected.append(collections[name])
@@ -759,6 +1421,70 @@ def cmd_list(args):
         print(f"  {name:15} {count:5} files  [{status}]  {col.description}")
 
 
+def cmd_matrix(args):
+    """Handle matrix command."""
+    collections = get_collections()
+
+    selected = []
+    if args.all:
+        selected = list(collections.values())
+    else:
+        for name in ['emojis', 'flags', 'material', 'fontawesome', 'lucide', 'w3c', 'resvgtests']:
+            if getattr(args, name, False):
+                if name in collections:
+                    selected.append(collections[name])
+
+    if not selected:
+        print("No collections selected. Use --emojis, --flags, --material, etc. or --all")
+        return
+
+    for collection in selected:
+        if not collection.svg_dir.exists():
+            print(f"Skipping {collection.name}: {collection.svg_dir} not found")
+            continue
+
+        print("\n" + "=" * 70)
+        print(f"MATRIX: {collection.name.upper()}")
+        print("=" * 70)
+        matrix = matrix_collection(collection, num_workers=args.workers, limit=args.limit)
+        print_matrix(matrix, collection.name.upper())
+
+        # Optional saving of grids
+        if args.save or args.save_all or args.save_top:
+            per_file = matrix.get("per_file", [])
+            out_dir = Path(args.save_dir) if args.save_dir else (collection.output_dir / "matrix")
+
+            selected = per_file
+            if args.save_all:
+                selected = per_file
+            elif args.save_top is not None:
+                selected = sorted(per_file, key=lambda x: x.get("worst", 1.0))[: max(0, args.save_top)]
+            elif args.save:
+                # Default to top-4 worst if only --save is given
+                selected = sorted(per_file, key=lambda x: x.get("worst", 1.0))[:4]
+
+            print(f"\nSaving {len(selected)} grids to: {out_dir}")
+            start = time.time()
+            saved = 0
+            for item in selected:
+                name = item["name"]
+                svg_path = item["svg_path"]
+                out_path = out_dir / f"{name}.png"
+                try:
+                    build_and_save_grid(
+                        svg_path,
+                        collection.svg_dir,
+                        collection.ref_dir,
+                        collection.size,
+                        out_path,
+                        show_labels=(not args.labels_off),
+                    )
+                    saved += 1
+                except Exception:
+                    pass
+            print(f"Saved {saved}/{len(selected)} grids in {time.time()-start:.1f}s")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Unified SVG comparison tool for VectorStag",
@@ -767,17 +1493,24 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # Prerender command
-    pre_parser = subparsers.add_parser("prerender", help="Pre-render references with Cairo and resvg")
+    pre_parser = subparsers.add_parser("prerender", help="Pre-render references with Cairo, resvg, and Chrome")
     pre_parser.add_argument("--emojis", action="store_true", help="Noto emojis")
     pre_parser.add_argument("--flags", action="store_true", help="Noto flags")
     pre_parser.add_argument("--material", action="store_true", help="Material icons")
     pre_parser.add_argument("--fontawesome", action="store_true", help="FontAwesome icons")
     pre_parser.add_argument("--lucide", action="store_true", help="Lucide icons")
     pre_parser.add_argument("--w3c", action="store_true", help="W3C samples")
+    pre_parser.add_argument("--resvgtests", action="store_true", help="resvg test suite")
     pre_parser.add_argument("--all", action="store_true", help="All collections")
     pre_parser.add_argument("-j", "--workers", type=int, help="Number of workers")
     pre_parser.add_argument("--no-cairo", action="store_true", help="Skip Cairo rendering")
     pre_parser.add_argument("--no-resvg", action="store_true", help="Skip resvg rendering")
+    pre_parser.add_argument("--no-chrome", action="store_true", help="Skip Chrome rendering")
+    pre_parser.add_argument("--chrome-backend", choices=["auto", "playwright", "cli"], default="playwright",
+                            help="Chrome rendering backend (default: playwright)")
+    pre_parser.add_argument("--size", type=int, help="Override render size for all references (e.g., 400)")
+    pre_parser.add_argument("--chrome-serial", action="store_true", help="Run Chrome prerendering with a single worker to prevent UI popups")
+    pre_parser.add_argument("--force", action="store_true", help="Re-render even if output file exists")
 
     # Compare command
     cmp_parser = subparsers.add_parser("compare", help="Compare VectorStag against references")
@@ -787,6 +1520,7 @@ def main():
     cmp_parser.add_argument("--fontawesome", action="store_true", help="FontAwesome icons")
     cmp_parser.add_argument("--lucide", action="store_true", help="Lucide icons")
     cmp_parser.add_argument("--w3c", action="store_true", help="W3C samples")
+    cmp_parser.add_argument("--resvgtests", action="store_true", help="resvg test suite")
     cmp_parser.add_argument("--all", action="store_true", help="All collections")
     cmp_parser.add_argument("-j", "--workers", type=int, help="Number of workers")
     cmp_parser.add_argument("--save", action="store_true", help="Save comparison grid PNGs")
@@ -795,12 +1529,32 @@ def main():
     # List command
     subparsers.add_parser("list", help="List available collections")
 
+    # Matrix command
+    mat_parser = subparsers.add_parser("matrix", help="Pairwise similarity across VectorStag/resvg/Cairo/Chrome")
+    mat_parser.add_argument("--emojis", action="store_true", help="Noto emojis")
+    mat_parser.add_argument("--flags", action="store_true", help="Noto flags")
+    mat_parser.add_argument("--material", action="store_true", help="Material icons")
+    mat_parser.add_argument("--fontawesome", action="store_true", help="FontAwesome icons")
+    mat_parser.add_argument("--lucide", action="store_true", help="Lucide icons")
+    mat_parser.add_argument("--w3c", action="store_true", help="W3C samples")
+    mat_parser.add_argument("--resvgtests", action="store_true", help="resvg test suite")
+    mat_parser.add_argument("--all", action="store_true", help="All collections")
+    mat_parser.add_argument("-j", "--workers", type=int, help="Number of workers")
+    mat_parser.add_argument("--limit", type=int, help="Limit number of files")
+    mat_parser.add_argument("--save", action="store_true", help="Save 3x4 grids for visual review")
+    mat_parser.add_argument("--save-top", type=int, help="Save top-N worst cases (by min pairwise similarity)")
+    mat_parser.add_argument("--save-all", action="store_true", help="Save grids for all files (careful: large)")
+    mat_parser.add_argument("--save-dir", type=str, help="Custom output directory for saved grids")
+    mat_parser.add_argument("--labels-off", action="store_true", help="Disable labels/percentages on grids")
+
     args = parser.parse_args()
 
     if args.command == "prerender":
         cmd_prerender(args)
     elif args.command == "compare":
         cmd_compare(args)
+    elif args.command == "matrix":
+        cmd_matrix(args)
     elif args.command == "list":
         cmd_list(args)
     else:

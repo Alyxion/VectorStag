@@ -1554,9 +1554,25 @@ class SVGParser:
         local_transform = self._parse_transform(transform_str) if transform_str else Transform.identity()
         transform = parent_transform.multiply(local_transform)
 
-        # Parse clip-path and mask attributes
+        # Parse clip-path and mask attributes (from both attribute and CSS style)
         clip_path_id = self._parse_url_reference(elem.get("clip-path", ""))
+        if not clip_path_id and "clip-path" in style_str:
+            for part in style_str.split(";"):
+                if "clip-path" in part:
+                    key, _, value = part.partition(":")
+                    if key.strip() == "clip-path":
+                        clip_path_id = self._parse_url_reference(value.strip())
+                        break
+
         mask_id = self._parse_url_reference(elem.get("mask", ""))
+        if not mask_id and "mask" in style_str:
+            for part in style_str.split(";"):
+                # Avoid matching 'mask-type' etc
+                if part.strip().startswith("mask:") or part.strip().startswith("mask "):
+                    key, _, value = part.partition(":")
+                    if key.strip() == "mask":
+                        mask_id = self._parse_url_reference(value.strip())
+                        break
 
         result = None
         if tag == "rect":

@@ -244,7 +244,7 @@ pub fn collect_all_markers(ctx: &mut RenderContext, node: &Node) {
 }
 
 /// Collect all clipPath and mask definitions from the document
-pub fn collect_clip_paths_and_masks(ctx: &mut RenderContext, node: &Node, transform: &Transform) {
+pub fn collect_clip_paths_and_masks<'a>(ctx: &mut RenderContext, node: &Node<'a, '_>, transform: &Transform, root: &Node<'a, '_>) {
     if !node.is_element() {
         return;
     }
@@ -252,7 +252,7 @@ pub fn collect_clip_paths_and_masks(ctx: &mut RenderContext, node: &Node, transf
     let tag = node.tag_name().name();
 
     if tag == "clipPath" {
-        collect_clip_path(ctx, node, transform);
+        collect_clip_path(ctx, node, transform, root);
         return;
     }
 
@@ -262,12 +262,12 @@ pub fn collect_clip_paths_and_masks(ctx: &mut RenderContext, node: &Node, transf
     }
 
     for child in node.children() {
-        collect_clip_paths_and_masks(ctx, &child, transform);
+        collect_clip_paths_and_masks(ctx, &child, transform, root);
     }
 }
 
 /// Collect a clipPath definition
-fn collect_clip_path(ctx: &mut RenderContext, node: &Node, transform: &Transform) {
+fn collect_clip_path<'a>(ctx: &mut RenderContext, node: &Node<'a, '_>, transform: &Transform, root: &Node<'a, '_>) {
     let id = match node.attribute("id") {
         Some(id) => id,
         None => return,
@@ -361,6 +361,104 @@ fn collect_clip_path(ctx: &mut RenderContext, node: &Node, transform: &Transform
                     ellipse.push(combined.apply(px, py));
                 }
                 polygons.push(ellipse);
+            }
+            "use" => {
+                // Handle <use> elements that reference other shapes
+                let href = child.attribute("href")
+                    .or_else(|| child.attribute(("http://www.w3.org/1999/xlink", "href")));
+
+                if let Some(href) = href {
+                    let target_id = href.trim_start_matches('#');
+                    if let Some(target) = super::path_utils::find_element_by_id(root, target_id) {
+                        // Get x/y offset from use element
+                        let use_x: f64 = child.attribute("x").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let use_y: f64 = child.attribute("y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+
+                        let use_transform = child.attribute("transform")
+                            .map(parse_transform)
+                            .unwrap_or_default();
+
+                        // Combine use transform with translation
+                        let translation = Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: use_x, f: use_y };
+                        let use_combined = use_transform.multiply(&translation);
+
+                        let combined = if user_space {
+                            transform.multiply(&use_combined)
+                        } else {
+                            use_combined
+                        };
+
+                        // Extract polygons from the referenced element
+                        let target_tag = target.tag_name().name();
+                        match target_tag {
+                            "path" => {
+                                if let Some(d) = target.attribute("d") {
+                                    let target_transform = target.attribute("transform")
+                                        .map(parse_transform)
+                                        .unwrap_or_default();
+                                    let final_transform = combined.multiply(&target_transform);
+                                    let polys = super::path_utils::path_to_polygons(d, &final_transform);
+                                    polygons.extend(polys);
+                                }
+                            }
+                            "rect" => {
+                                let x: f64 = target.attribute("x").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let y: f64 = target.attribute("y").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let w: f64 = target.attribute("width").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let h: f64 = target.attribute("height").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let target_transform = target.attribute("transform")
+                                    .map(parse_transform)
+                                    .unwrap_or_default();
+                                let final_transform = combined.multiply(&target_transform);
+                                let rect_poly = vec![
+                                    final_transform.apply(x, y),
+                                    final_transform.apply(x + w, y),
+                                    final_transform.apply(x + w, y + h),
+                                    final_transform.apply(x, y + h),
+                                ];
+                                polygons.push(rect_poly);
+                            }
+                            "circle" => {
+                                let cx: f64 = target.attribute("cx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let cy: f64 = target.attribute("cy").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let r: f64 = target.attribute("r").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let target_transform = target.attribute("transform")
+                                    .map(parse_transform)
+                                    .unwrap_or_default();
+                                let final_transform = combined.multiply(&target_transform);
+                                let segments = 32;
+                                let mut circle: Vec<(f64, f64)> = Vec::with_capacity(segments);
+                                for i in 0..segments {
+                                    let angle = 2.0 * std::f64::consts::PI * (i as f64) / (segments as f64);
+                                    let px = cx + r * angle.cos();
+                                    let py = cy + r * angle.sin();
+                                    circle.push(final_transform.apply(px, py));
+                                }
+                                polygons.push(circle);
+                            }
+                            "ellipse" => {
+                                let cx: f64 = target.attribute("cx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let cy: f64 = target.attribute("cy").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let rx: f64 = target.attribute("rx").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let ry: f64 = target.attribute("ry").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                                let target_transform = target.attribute("transform")
+                                    .map(parse_transform)
+                                    .unwrap_or_default();
+                                let final_transform = combined.multiply(&target_transform);
+                                let segments = 32;
+                                let mut ellipse: Vec<(f64, f64)> = Vec::with_capacity(segments);
+                                for i in 0..segments {
+                                    let angle = 2.0 * std::f64::consts::PI * (i as f64) / (segments as f64);
+                                    let px = cx + rx * angle.cos();
+                                    let py = cy + ry * angle.sin();
+                                    ellipse.push(final_transform.apply(px, py));
+                                }
+                                polygons.push(ellipse);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             _ => {}
         }

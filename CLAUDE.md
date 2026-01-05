@@ -14,14 +14,10 @@ We installed resvg-python as an alternative reference renderer. resvg confirms:
 - **clippath.svg**: Our RED rendering is correct. CairoSVG's BLACK is wrong.
 - **lineargradient1/2.svg**: Our gap rendering is correct. CairoSVG filling it is wrong.
 
-## Tools (Consolidated)
-- `scripts/benchmark.py` - Full benchmark (all collections + resvg-test-suite)
-- `svg_compare.py` - Main comparison tool for errors on single images
-- `render.py` - Simple single-file rendering
+## Tools
 
-## Testing
-
-### Full Benchmark (Collections + resvg-test-suite)
+### scripts/benchmark.py - Fast Benchmark
+Compares VectorStag against pre-rendered resvg PNGs from resvg-test-suite.
 ```bash
 # Full benchmark with table output
 poetry run python scripts/benchmark.py -j 16
@@ -39,6 +35,46 @@ poetry run python scripts/benchmark.py --resvg --resvg-category shapes -j 16
 poetry run python scripts/benchmark.py --list-resvg-categories
 ```
 
+### svg_compare.py - Multi-Renderer Comparison
+Compares VectorStag against multiple renderers (resvg, Cairo, Chrome).
+
+**Commands:**
+- `prerender` - Pre-render reference images with Cairo, resvg, and Chrome
+- `compare` - Compare VectorStag against pre-rendered references
+- `matrix` - Pairwise similarity matrix across all renderers
+- `list` - List available collections
+
+**Collections:** emojis, flags, material, lucide, fontawesome, w3c, resvgtests
+
+```bash
+# Pre-render references (run once per collection)
+poetry run python svg_compare.py prerender --emojis --flags -j 8
+poetry run python svg_compare.py prerender --all -j 8
+poetry run python svg_compare.py prerender --emojis --no-cairo --no-resvg -j 8  # Chrome only
+poetry run python svg_compare.py prerender --emojis --force -j 8  # Re-render existing
+
+# Compare VectorStag against references
+poetry run python svg_compare.py compare --emojis -j 8
+poetry run python svg_compare.py compare --emojis --save -j 8  # Save comparison grids
+
+# Multi-renderer similarity matrix
+poetry run python svg_compare.py matrix --emojis -j 8
+poetry run python svg_compare.py matrix --emojis --save-top 10 -j 8  # Save worst 10 grids
+
+# List collections and their status
+poetry run python svg_compare.py list
+```
+
+**Output directories:**
+- `references/<collection>/{cairo,resvg,chrome}/` - Pre-rendered PNGs
+- `comparisons/<collection>/` - Comparison grid images
+
+### render.py - Single File Rendering
+```bash
+poetry run python render.py input.svg output.png -b white
+poetry run python render.py input.svg output.png -w 500 -H 500
+```
+
 ## Accuracy Expectations
 - **Anti-aliasing differences account for AT MOST 0.1%** - anything beyond that indicates real rendering bugs
 - **Target: 99.9%+ for all SVGs** - especially simple shapes like android.svg
@@ -50,60 +86,30 @@ poetry run python scripts/benchmark.py --list-resvg-categories
 - Use `ProcessPoolExecutor` with `as_completed()` for timeout support
 - Worker timeout is 30 seconds (WORKER_TIMEOUT in svg_compare.py)
 
----
+## How to Build
 
-  How to Build
+```bash
+cd /projects/VectorStag
 
-  cd /projects/VectorStag
+# Install dependencies
+poetry install
 
-  # Install dependencies
-  poetry install
+# Build the Rust extension
+poetry run maturin develop --release -m vectorstag_rust/Cargo.toml
+```
 
-  # Build the Rust extension
-  poetry run maturin develop --release -m vectorstag_rust/Cargo.toml
+## Key Files
 
-  ---
-  How to Test
+- Main renderer: `vectorstag_rust/src/svg_renderer.rs` (~2200 lines)
+- Benchmark script: `scripts/benchmark.py`
+- Multi-renderer comparison: `svg_compare.py`
+- Python wrapper: `vectorstag/rust_renderer.py`
+- Status doc: `plan.md`
 
-  Full Benchmark (All Collections + resvg tests)
-
-  poetry run python scripts/benchmark.py -j 8
-
-  Icon Collections Only (Faster)
-
-  poetry run python scripts/benchmark.py --collections -j 8
-
-  Specific resvg Category
-
-  poetry run python scripts/benchmark.py --resvg --resvg-category masking -j 8
-  poetry run python scripts/benchmark.py --resvg --resvg-category filters -j 8
-  poetry run python scripts/benchmark.py --resvg --resvg-category structure -j 8
-
-  List Available Categories
-
-  poetry run python scripts/benchmark.py --list-resvg-categories
-
-  Render Single File
-
-  poetry run python render.py input.svg output.png -b white
-  poetry run python render.py input.svg output.png -w 500 -H 500
-
-  Compare with Reference
-
-  The benchmark compares against resvg (pre-rendered PNGs in resvg-test-suite/tests/) and CairoSVG.
-
-  ---
-  Key Files
-
-  - Main renderer: vectorstag_rust/src/svg_renderer.rs (~2200 lines)
-  - Benchmark script: scripts/benchmark.py
-  - Python wrapper: vectorstag/rust_renderer.py
-  - Status doc: plan.md
-
-  Todos
-  ☐ Implement efficient clipPath with render-to-temp approach
-  ☐ Implement mask support
-  ☐ Implement basic filters (feGaussianBlur, feColorMatrix)
-  ☐ Implement text rendering
-  ☐ Implement preserveAspectRatio parsing
-  ☐ Fix gradientTransform for objectBoundingBox
+## Todos
+- [ ] Implement efficient clipPath with render-to-temp approach
+- [ ] Implement mask support
+- [ ] Implement basic filters (feGaussianBlur, feColorMatrix)
+- [ ] Implement text rendering
+- [ ] Implement preserveAspectRatio parsing
+- [ ] Fix gradientTransform for objectBoundingBox

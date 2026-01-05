@@ -150,7 +150,7 @@ impl VectorStagRenderer {
 
         // Second pass: collect clipPaths and masks
         for child in root.children() {
-            collect_clip_paths_and_masks(&mut ctx, &child, &base_transform);
+            collect_clip_paths_and_masks(&mut ctx, &child, &base_transform, &root);
         }
 
         // Third pass: render tree
