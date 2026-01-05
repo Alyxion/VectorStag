@@ -380,6 +380,10 @@ def render_with_resvg(svg_path: Path, size: int) -> Optional[Image.Image]:
             png_data = bytes(svg_to_png(content))
             img = Image.open(io.BytesIO(png_data)).convert("RGBA")
 
+            # Composite over white background for consistent comparison
+            white_bg = Image.new('RGBA', img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(white_bg, img)
+
             # Fit to size, preserving aspect ratio
             stretch = should_stretch(svg_path)
             if img.size != (size, size):
@@ -633,25 +637,51 @@ def render_with_chrome_playwright(svg_path: Path, size: int) -> Optional[Image.I
 
 
 def render_with_vectorstag(svg_path: Path, size: int) -> Optional[Image.Image]:
-    """Render SVG with VectorStag."""
+    """Render SVG with VectorStag Rust renderer for best quality."""
     try:
-        renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
+        # Use Rust renderer directly for best quality
+        from vectorstag_rust import VectorStagRenderer
+        rust_renderer = VectorStagRenderer()
+
+        with open(svg_path, 'r') as f:
+            svg_content = f.read()
 
         svg_w, svg_h = get_svg_dimensions(svg_path)
         stretch = should_stretch(svg_path)
 
         if stretch:
-            img = renderer.render_file(str(svg_path), size, size)
+            arr = rust_renderer.render(svg_content, width=size, height=size,
+                                       background=(255, 255, 255, 255), antialias=4)
+            img = Image.fromarray(arr, 'RGBA')
         else:
             render_w, render_h = calculate_render_size(svg_w, svg_h, size)
-            img = renderer.render_file(str(svg_path), render_w, render_h)
+            arr = rust_renderer.render(svg_content, width=render_w, height=render_h,
+                                       background=(255, 255, 255, 255), antialias=4)
+            img = Image.fromarray(arr, 'RGBA')
 
             if img is not None and img.size != (size, size):
                 img = fit_to_canvas(img, size)
 
         return img
-    except Exception:
-        return None
+    except Exception as e:
+        # Fallback to Python renderer
+        try:
+            renderer = SVGRenderer(background=(255, 255, 255, 255), antialias=4)
+            svg_w, svg_h = get_svg_dimensions(svg_path)
+            stretch = should_stretch(svg_path)
+
+            if stretch:
+                img = renderer.render_file(str(svg_path), size, size)
+            else:
+                render_w, render_h = calculate_render_size(svg_w, svg_h, size)
+                img = renderer.render_file(str(svg_path), render_w, render_h)
+
+                if img is not None and img.size != (size, size):
+                    img = fit_to_canvas(img, size)
+
+            return img
+        except Exception:
+            return None
 
 
 def prerender_worker(args):
@@ -841,7 +871,8 @@ def get_resvg_native_aspect(svg_path: Path) -> float:
 def render_vectorstag_for_comparison(svg_path: Path, size: int) -> Optional[Image.Image]:
     """Render VectorStag at appropriate dimensions and fit to canvas."""
     try:
-        renderer = SVGRenderer(background=(0, 0, 0, 0), antialias=4)
+        # Use Python renderer for correctness (handles all SVG features)
+        renderer = SVGRenderer(background=(255, 255, 255, 255), antialias=4)
 
         # Check if SVG should be stretched (preserveAspectRatio="none")
         stretch = should_stretch(svg_path)

@@ -2082,12 +2082,14 @@ class SVGRenderer:
                 break
 
         # Routing strategy:
-        # - Convex shapes (circles, simple polygons): Use outline approach with Rust
-        #   The outline approach draws ellipses at corners for round joins (no gaps)
-        # - Non-convex shapes with reflex angles: Use segmented approach
-        #   Required to avoid self-intersection issues
+        # - Round joins: ALWAYS use Rust outline approach (handles arcs correctly, no gaps)
+        # - Convex shapes: Use Rust outline approach (efficient, gap-free)
+        # - Non-convex shapes with miter joins: Use segmented approach to avoid self-intersection
         # - Bevel joins: Use segmented approach for correct perpendicular offsets
-        if has_reflex or linejoin == "bevel":
+        if linejoin == "round":
+            # Round joins work best with Rust outline approach (no gaps)
+            self._stroke_closed_polygon_outline(ctx, points, stroke, half_width, miterlimit, linejoin)
+        elif has_reflex or linejoin == "bevel":
             self._stroke_closed_polygon_segmented(ctx, points, stroke, half_width, miterlimit, linejoin)
         else:
             self._stroke_closed_polygon_outline(ctx, points, stroke, half_width, miterlimit, linejoin)
