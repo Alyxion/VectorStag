@@ -448,6 +448,15 @@ fn render_with_filter(
     // We render the element normally (the filter attribute is already extracted)
     render_node_without_filter(ctx, node, parent_transform, parent_style, depth, root);
 
+    // Check if element rendered any content - skip filter if empty
+    // This matches resvg behavior: filters on empty groups don't render BackgroundImage
+    let has_content = ctx.buffer.chunks(4).any(|px| px[3] > 0);
+    if !has_content {
+        // Restore original buffer and skip filter
+        ctx.buffer = original_buffer;
+        return;
+    }
+
     // Get element bbox for filter units
     let bbox = get_element_bbox(node);
 

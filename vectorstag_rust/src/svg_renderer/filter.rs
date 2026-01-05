@@ -63,23 +63,25 @@ fn get_primitive_subregion_px(
 
     let primitive_units_user_space = filter.primitive_units;
 
-    let x_px = x
-        .map(|v| length_to_px_x(v, region_w, scale_x, primitive_units_user_space))
-        .unwrap_or(0.0);
-    let y_px = y
-        .map(|v| length_to_px_y(v, region_h, scale_y, primitive_units_user_space))
-        .unwrap_or(0.0);
-    let w_px = w
-        .map(|v| length_to_px_x(v, region_w, scale_x, primitive_units_user_space))
-        .unwrap_or(region_w as f64);
-    let h_px = h
-        .map(|v| length_to_px_y(v, region_h, scale_y, primitive_units_user_space))
-        .unwrap_or(region_h as f64);
-
-    let min_x = region_min_x as f64 + x_px;
-    let min_y = region_min_y as f64 + y_px;
-    let max_x = min_x + w_px;
-    let max_y = min_y + h_px;
+    // For primitiveUnits="userSpaceOnUse": x/y are absolute positions in user space
+    // For primitiveUnits="objectBoundingBox": x/y are relative to filter region
+    let (min_x, min_y, max_x, max_y) = if primitive_units_user_space {
+        // User space: x/y are absolute, scaled to screen space
+        let x_px = x.map(|v| v.value * scale_x).unwrap_or(region_min_x as f64);
+        let y_px = y.map(|v| v.value * scale_y).unwrap_or(region_min_y as f64);
+        let w_px = w.map(|v| v.value * scale_x).unwrap_or(region_w as f64);
+        let h_px = h.map(|v| v.value * scale_y).unwrap_or(region_h as f64);
+        (x_px, y_px, x_px + w_px, y_px + h_px)
+    } else {
+        // Object bounding box: x/y are fractions/percentages of filter region
+        let x_frac = x.map(|v| if v.is_percent { v.value / 100.0 } else { v.value }).unwrap_or(0.0);
+        let y_frac = y.map(|v| if v.is_percent { v.value / 100.0 } else { v.value }).unwrap_or(0.0);
+        let w_frac = w.map(|v| if v.is_percent { v.value / 100.0 } else { v.value }).unwrap_or(1.0);
+        let h_frac = h.map(|v| if v.is_percent { v.value / 100.0 } else { v.value }).unwrap_or(1.0);
+        let min_x = region_min_x as f64 + x_frac * region_w as f64;
+        let min_y = region_min_y as f64 + y_frac * region_h as f64;
+        (min_x, min_y, min_x + w_frac * region_w as f64, min_y + h_frac * region_h as f64)
+    };
 
     Some((min_x.floor() as i32, min_y.floor() as i32, max_x.ceil() as i32, max_y.ceil() as i32))
 }
@@ -994,15 +996,20 @@ fn clip_buffer(buffer: &mut Array3<f32>, min_x: i32, min_y: i32, max_x: i32, max
     let h = h as i32;
     let w = w as i32;
 
-    if min_x <= 0 && min_y <= 0 && max_x >= w && max_y >= h {
+    // Clamp bounds to valid buffer range [0, dimension]
+    let clip_min_x = min_x.max(0).min(w);
+    let clip_min_y = min_y.max(0).min(h);
+    let clip_max_x = max_x.max(0).min(w);
+    let clip_max_y = max_y.max(0).min(h);
+
+    if clip_min_x <= 0 && clip_min_y <= 0 && clip_max_x >= w && clip_max_y >= h {
         return;
     }
 
-    // Optimization: iterate over outside regions?
-    // Or just iterate everything if region is small?
-    // Let's just iterate everything for safety now.
+    // Clear pixels outside the clipping region
     for y in 0..h {
-        if y < min_y || y >= max_y {
+        if y < clip_min_y || y >= clip_max_y {
+            // Entire row is outside
             for x in 0..w {
                 buffer[[y as usize, x as usize, 0]] = 0.0;
                 buffer[[y as usize, x as usize, 1]] = 0.0;
@@ -1010,13 +1017,15 @@ fn clip_buffer(buffer: &mut Array3<f32>, min_x: i32, min_y: i32, max_x: i32, max
                 buffer[[y as usize, x as usize, 3]] = 0.0;
             }
         } else {
-            for x in 0..min_x {
+            // Clear left side (x < clip_min_x)
+            for x in 0..clip_min_x {
                 buffer[[y as usize, x as usize, 0]] = 0.0;
                 buffer[[y as usize, x as usize, 1]] = 0.0;
                 buffer[[y as usize, x as usize, 2]] = 0.0;
                 buffer[[y as usize, x as usize, 3]] = 0.0;
             }
-            for x in max_x..w {
+            // Clear right side (x >= clip_max_x)
+            for x in clip_max_x..w {
                 buffer[[y as usize, x as usize, 0]] = 0.0;
                 buffer[[y as usize, x as usize, 1]] = 0.0;
                 buffer[[y as usize, x as usize, 2]] = 0.0;
