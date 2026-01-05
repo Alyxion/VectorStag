@@ -256,8 +256,30 @@ class SVGRenderer:
             return
 
         if isinstance(element, GroupElement):
-            for child in element.children:
-                self._render_element(ctx, child, depth + 1)
+            # Handle group opacity: render to temp buffer if opacity < 1
+            group_opacity = element.style.opacity
+            if group_opacity < 1.0:
+                # Render children to temporary context
+                temp_ctx = ctx.create_child_context()
+                for child in element.children:
+                    self._render_element(temp_ctx, child, depth + 1)
+                # Composite temp context onto main context with group opacity
+                if temp_ctx.image_arr is not None:
+                    # Using numpy arrays - multiply alpha by group opacity
+                    temp_arr = temp_ctx.image_arr.copy()
+                    temp_arr[:, :, 3] = (temp_arr[:, :, 3] * group_opacity).astype(np.uint8)
+                    vectorstag_rust.alpha_composite_inplace(ctx.image_arr, temp_arr, 0, 0)
+                elif temp_ctx.image is not None:
+                    # Using PIL images
+                    temp_img = temp_ctx.image
+                    if temp_img.mode == 'RGBA':
+                        r, g, b, a = temp_img.split()
+                        a = a.point(lambda x: int(x * group_opacity))
+                        temp_img = Image.merge('RGBA', (r, g, b, a))
+                    ctx.image = Image.alpha_composite(ctx.image, temp_img)
+            else:
+                for child in element.children:
+                    self._render_element(ctx, child, depth + 1)
         elif isinstance(element, RectElement):
             self._render_rect(ctx, element)
         elif isinstance(element, CircleElement):
@@ -4442,3 +4464,45 @@ class RenderContext:
         if self.image_arr is not None:
             return (self.image_arr.shape[1], self.image_arr.shape[0])
         return self.image.size
+
+    def create_child_context(self) -> "RenderContext":
+        """Create a child context with transparent background for group opacity."""
+        import numpy as np
+
+        # Create context matching parent's rendering mode (numpy array or PIL image)
+        if self.image_arr is not None:
+            # Parent uses numpy array - create child with numpy array too
+            child_arr = np.zeros_like(self.image_arr)
+            child_ctx = RenderContext(
+                image=None,
+                gradients=self.gradients,
+                base_transform=self.base_transform,
+                clip_paths=self.clip_paths,
+                masks=self.masks,
+                filters=self.filters,
+                patterns=self.patterns,
+                elements_by_id=self.elements_by_id,
+                path_elements=self.path_elements,
+                viewport_width=self.viewport_width,
+                viewport_height=self.viewport_height
+            )
+            child_ctx.image_arr = child_arr
+        else:
+            # Parent uses PIL image
+            child_image = Image.new('RGBA', self.image_size, (0, 0, 0, 0))
+            child_ctx = RenderContext(
+                image=child_image,
+                gradients=self.gradients,
+                base_transform=self.base_transform,
+                clip_paths=self.clip_paths,
+                masks=self.masks,
+                filters=self.filters,
+                patterns=self.patterns,
+                elements_by_id=self.elements_by_id,
+                path_elements=self.path_elements,
+                viewport_width=self.viewport_width,
+                viewport_height=self.viewport_height
+            )
+        # Share clip mask cache
+        child_ctx.clip_mask_cache = self.clip_mask_cache
+        return child_ctx

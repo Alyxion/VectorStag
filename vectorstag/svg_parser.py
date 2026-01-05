@@ -1673,7 +1673,7 @@ class SVGParser:
             stroke_linecap=parent_style.stroke_linecap,
             stroke_linejoin=parent_style.stroke_linejoin,
             stroke_miterlimit=parent_style.stroke_miterlimit,
-            opacity=parent_style.opacity,
+            opacity=1.0,  # opacity is NOT inherited per SVG spec - defaults to 1.0
             fill_rule=parent_style.fill_rule,
             display=parent_style.display,
             visibility=parent_style.visibility
