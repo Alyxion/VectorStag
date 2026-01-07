@@ -493,6 +493,40 @@ pub struct FilterDef {
     pub primitive_units: bool,  // true = userSpaceOnUse, false = objectBoundingBox (default)
 }
 
+impl FilterDef {
+    /// Check if any filter primitive uses BackgroundImage or BackgroundAlpha as input
+    pub fn uses_background(&self) -> bool {
+        for prim in &self.primitives {
+            let inputs: Vec<&str> = match prim {
+                FilterPrimitive::GaussianBlur { input, .. } => vec![input.as_str()],
+                FilterPrimitive::Offset { input, .. } => vec![input.as_str()],
+                FilterPrimitive::Flood { .. } => vec![],
+                FilterPrimitive::Merge { nodes, .. } => nodes.iter().map(|s| s.as_str()).collect(),
+                FilterPrimitive::ColorMatrix { input, .. } => vec![input.as_str()],
+                FilterPrimitive::Blend { in1, in2, .. } => vec![in1.as_str(), in2.as_str()],
+                FilterPrimitive::Composite { in1, in2, .. } => vec![in1.as_str(), in2.as_str()],
+                FilterPrimitive::Morphology { input, .. } => vec![input.as_str()],
+                FilterPrimitive::Turbulence { .. } => vec![],
+                FilterPrimitive::Tile { input, .. } => vec![input.as_str()],
+                FilterPrimitive::ComponentTransfer { input, .. } => vec![input.as_str()],
+                FilterPrimitive::ConvolveMatrix { input, .. } => vec![input.as_str()],
+                FilterPrimitive::DiffuseLighting { input, .. } => vec![input.as_str()],
+                FilterPrimitive::SpecularLighting { input, .. } => vec![input.as_str()],
+                FilterPrimitive::DisplacementMap { in1, in2, .. } => vec![in1.as_str(), in2.as_str()],
+                FilterPrimitive::DropShadow { input, .. } => vec![input.as_str()],
+                FilterPrimitive::Image { .. } => vec![],
+            };
+
+            for input in inputs {
+                if input == "BackgroundImage" || input == "BackgroundAlpha" {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 /// Marker orientation
 #[derive(Clone, Debug)]
 pub enum MarkerOrient {

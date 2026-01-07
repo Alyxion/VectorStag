@@ -611,6 +611,35 @@ pub fn get_element_bbox(node: &Node) -> Option<(f64, f64, f64, f64)> {
     }
 }
 
+/// Check if an element is structurally empty (has no renderable content)
+/// This is different from checking if the rendered buffer is empty (which could be due to clip-path)
+pub fn is_element_empty(node: &Node) -> bool {
+    let tag = node.tag_name().name();
+
+    match tag {
+        // Shape elements are never structurally empty (they have implicit content)
+        "rect" | "circle" | "ellipse" | "line" | "polyline" | "polygon" | "path" => false,
+        // Text elements are not empty if they have text content or children
+        "text" | "tspan" => {
+            !node.children().any(|c| c.is_text() || c.is_element())
+        }
+        // Image elements are not empty
+        "image" => false,
+        // Use elements reference other content
+        "use" => false,
+        // Groups are empty if they have no element children
+        "g" | "a" | "switch" => {
+            !node.children().any(|c| c.is_element())
+        }
+        // SVG containers - check for element children
+        "svg" => {
+            !node.children().any(|c| c.is_element())
+        }
+        // Default: assume not empty
+        _ => false,
+    }
+}
+
 /// Apply transform-origin to a transform
 pub fn apply_transform_origin(transform: &Transform, origin: &TransformOrigin, bbox: Option<(f64, f64, f64, f64)>) -> Transform {
     if let Some((x, y, w, h)) = bbox {

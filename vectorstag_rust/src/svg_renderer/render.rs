@@ -2,7 +2,7 @@
 
 use roxmltree::Node;
 use super::types::*;
-use super::parsing::{parse_transform, parse_style, parse_viewbox, parse_length, parse_length_percent, parse_transform_origin, get_element_bbox, apply_transform_origin};
+use super::parsing::{parse_transform, parse_style, parse_viewbox, parse_length_percent, parse_transform_origin, get_element_bbox, apply_transform_origin, is_element_empty};
 use super::defs::collect_defs;
 use super::shapes::*;
 use super::elements::*;
@@ -432,10 +432,16 @@ fn render_with_filter(
     let width = ctx.width;
     let height = ctx.height;
 
-    // Calculate scale factor from transform for scaling filter parameters
-    // The transform includes both viewBox->output scale and antialiasing
-    let scale_x = (parent_transform.a * parent_transform.a + parent_transform.b * parent_transform.b).sqrt();
-    let scale_y = (parent_transform.c * parent_transform.c + parent_transform.d * parent_transform.d).sqrt();
+    // Calculate the full transform including the node's local transform
+    // This is needed for correct filter region calculation
+    let local_transform = node.attribute("transform")
+        .map(parse_transform)
+        .unwrap_or_default();
+    let full_transform = parent_transform.multiply(&local_transform);
+
+    // Calculate scale factor from full transform for scaling filter parameters
+    let scale_x = (full_transform.a * full_transform.a + full_transform.b * full_transform.b).sqrt();
+    let scale_y = (full_transform.c * full_transform.c + full_transform.d * full_transform.d).sqrt();
     let scale = (scale_x + scale_y) / 2.0;
 
     // Save current buffer
@@ -448,20 +454,27 @@ fn render_with_filter(
     // We render the element normally (the filter attribute is already extracted)
     render_node_without_filter(ctx, node, parent_transform, parent_style, depth, root);
 
-    // Check if element rendered any content - skip filter if empty
-    // This matches resvg behavior: filters on empty groups don't render BackgroundImage
-    let has_content = ctx.buffer.chunks(4).any(|px| px[3] > 0);
-    if !has_content {
-        // Restore original buffer and skip filter
-        ctx.buffer = original_buffer;
-        return;
+    // Check if element is structurally empty (no renderable children)
+    // Skip filter only if:
+    // 1. Element is structurally empty (e.g., <g/> with no children)
+    // 2. Filter doesn't use BackgroundImage/BackgroundAlpha
+    // 3. No content was rendered to the temp buffer
+    // This prevents filters on empty elements from producing noise while still
+    // allowing BackgroundImage-based filters to work on empty elements.
+    if is_element_empty(node) && !filter_def.uses_background() {
+        let has_rendered_content = ctx.buffer.chunks(4).any(|px| px[3] > 0);
+        if !has_rendered_content {
+            // Truly empty element with no background input - skip filter
+            ctx.buffer = original_buffer;
+            return;
+        }
     }
 
     // Get element bbox for filter units
     let bbox = get_element_bbox(node);
 
-    // Apply filter to the temporary buffer with scale factor
-    let filtered = apply_filter(filter_def, &ctx.buffer, &original_buffer, width, height, parent_transform, bbox);
+    // Apply filter to the temporary buffer with full transform
+    let filtered = apply_filter(filter_def, &ctx.buffer, &original_buffer, width, height, &full_transform, bbox);
 
     // Restore original buffer
     ctx.buffer = original_buffer;
