@@ -223,6 +223,19 @@ fn get_color_interpolation(node: &Node) -> ColorInterpolation {
     ColorInterpolation::LinearRGB // Default per SVG spec
 }
 
+/// Create a transparent flood primitive for invalid filter primitives (SVG spec: produce transparent black)
+fn make_error_primitive(result: String) -> FilterPrimitive {
+    FilterPrimitive::Flood {
+        color: Color::from_rgba(0, 0, 0, 0), // Transparent black
+        result,
+        color_interpolation: ColorInterpolation::SRGB,
+        x: None,
+        y: None,
+        width: None,
+        height: None,
+    }
+}
+
 /// Parse a filter primitive element
 fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
     let tag = node.tag_name().name();
@@ -278,7 +291,14 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
         "feFlood" => {
             let color_str = node.attribute("flood-color").unwrap_or("black");
             let opacity: f64 = node.attribute("flood-opacity")
-                .and_then(|s| s.parse().ok())
+                .and_then(|s| {
+                    let s = s.trim();
+                    if s.ends_with('%') {
+                        s.trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)
+                    } else {
+                        s.parse().ok()
+                    }
+                })
                 .unwrap_or(1.0);
             let mut color = parse_color(color_str).unwrap_or(Color::from_rgba(0, 0, 0, 255));
             color.a = (color.a as f64 * opacity) as u8;
@@ -371,20 +391,39 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
             let freq_str = node.attribute("baseFrequency").unwrap_or("0");
             let parts: Vec<f64> = freq_str
                 .split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|s| !s.is_empty())
                 .filter_map(|s| s.parse().ok())
                 .collect();
             let base_freq_x = parts.first().copied().unwrap_or(0.0);
             let base_freq_y = parts.get(1).copied().unwrap_or(base_freq_x);
-            let num_octaves: usize = node.attribute("numOctaves")
+
+            // SVG spec: if baseFrequency is negative, it's an error -> transparent
+            // If both are 0, no pattern is generated -> transparent
+            // But if only one is 0, it creates stripes
+            if base_freq_x < 0.0 || base_freq_y < 0.0 {
+                return Some(make_error_primitive(result)); // Negative is error
+            }
+            if base_freq_x == 0.0 && base_freq_y == 0.0 {
+                return Some(make_error_primitive(result)); // Both zero -> no pattern
+            }
+
+            // Parse numOctaves as i32 first to detect negative values
+            let num_octaves_raw: i32 = node.attribute("numOctaves")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1);
+            // SVG spec: if numOctaves is <= 0, no pattern is generated -> transparent
+            if num_octaves_raw <= 0 {
+                return Some(make_error_primitive(result));
+            }
+            let num_octaves = num_octaves_raw as usize;
+
             let seed: i32 = node.attribute("seed")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             let noise_type = match node.attribute("type").unwrap_or("turbulence") {
                 "fractalNoise" => 0,
                 "turbulence" => 1,
-                _ => 1,
+                _ => 1,  // Invalid type defaults to turbulence
             };
             Some(FilterPrimitive::Turbulence { base_freq_x, base_freq_y, num_octaves, seed, noise_type, result, color_interpolation, x, y, width, height })
         }
@@ -403,7 +442,14 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
             let std_dev_y = parts.get(1).copied().unwrap_or(std_dev_x);
             let color_str = node.attribute("flood-color").unwrap_or("black");
             let opacity: f64 = node.attribute("flood-opacity")
-                .and_then(|s| s.parse().ok())
+                .and_then(|s| {
+                    let s = s.trim();
+                    if s.ends_with('%') {
+                        s.trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)
+                    } else {
+                        s.parse().ok()
+                    }
+                })
                 .unwrap_or(1.0);
             let mut flood_color = parse_color(color_str).unwrap_or(Color::from_rgba(0, 0, 0, 255));
             flood_color.a = (flood_color.a as f64 * opacity) as u8;
@@ -418,17 +464,34 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
         }
         "feConvolveMatrix" => {
             let order = node.attribute("order").unwrap_or("3");
-            let parts: Vec<usize> = order
+            // Parse order values as i32 first to detect negative values
+            let parts: Vec<i32> = order
                 .split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|s| !s.is_empty())
                 .filter_map(|s| s.parse().ok())
                 .collect();
-            let order_x = parts.first().copied().unwrap_or(3);
-            let order_y = parts.get(1).copied().unwrap_or(order_x);
+
+            // Check for invalid order values (negative or zero)
+            let order_x_i32 = parts.first().copied().unwrap_or(3);
+            let order_y_i32 = parts.get(1).copied().unwrap_or(order_x_i32);
+            if order_x_i32 <= 0 || order_y_i32 <= 0 {
+                return Some(make_error_primitive(result)); // Invalid order -> transparent black
+            }
+            let order_x = order_x_i32 as usize;
+            let order_y = order_y_i32 as usize;
+            let expected_kernel_size = order_x * order_y;
             let kernel: Vec<f32> = node.attribute("kernelMatrix")
                 .unwrap_or("")
                 .split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|s| !s.is_empty())
                 .filter_map(|s| s.parse().ok())
                 .collect();
+
+            // Kernel must have exactly order_x * order_y values
+            if kernel.len() != expected_kernel_size {
+                return Some(make_error_primitive(result)); // Invalid kernel -> transparent black
+            }
+
             let divisor: f32 = node
                 .attribute("divisor")
                 .and_then(|s| s.parse().ok())
@@ -437,20 +500,26 @@ fn parse_filter_primitive(node: &Node) -> Option<FilterPrimitive> {
                     if sum.abs() < 1e-10 { 1.0 } else { sum }
                 });
             let bias: f32 = node.attribute("bias").and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let mut target_x: usize = node
-                .attribute("targetX")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(order_x / 2);
-            let mut target_y: usize = node
-                .attribute("targetY")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(order_y / 2);
-            if order_x > 0 {
-                target_x = target_x.min(order_x - 1);
+
+            // targetX/targetY: if explicitly specified and out of range (negative or >= order), filter is disabled
+            // Parse as i32 first to detect negative values
+            let explicit_target_x: Option<i32> = node.attribute("targetX").and_then(|s| s.parse().ok());
+            let explicit_target_y: Option<i32> = node.attribute("targetY").and_then(|s| s.parse().ok());
+
+            // Check for out-of-range explicit targets (SVG spec says this is an error)
+            if let Some(tx) = explicit_target_x {
+                if tx < 0 || order_x == 0 || tx as usize >= order_x {
+                    return Some(make_error_primitive(result)); // Invalid targetX -> transparent black
+                }
             }
-            if order_y > 0 {
-                target_y = target_y.min(order_y - 1);
+            if let Some(ty) = explicit_target_y {
+                if ty < 0 || order_y == 0 || ty as usize >= order_y {
+                    return Some(make_error_primitive(result)); // Invalid targetY -> transparent black
+                }
             }
+
+            let target_x = explicit_target_x.map(|t| t as usize).unwrap_or(order_x / 2);
+            let target_y = explicit_target_y.map(|t| t as usize).unwrap_or(order_y / 2);
             let edge_mode = match node.attribute("edgeMode").unwrap_or("duplicate") {
                 "duplicate" => 0,
                 "wrap" => 1,
@@ -589,8 +658,15 @@ pub fn apply_filter(
     transform: &Transform,
     bbox: Option<(f64, f64, f64, f64)>,
 ) -> Vec<u8> {
+    // SVG spec: filter with no primitives produces transparent output
     if filter.primitives.is_empty() {
-        return source.to_vec();
+        return vec![0u8; width * height * 4];
+    }
+
+    // SVG spec: for filterUnits=objectBoundingBox, if element has no bbox (empty group),
+    // the filter region is empty (0x0), producing transparent output
+    if filter.filter_units && bbox.is_none() {
+        return vec![0u8; width * height * 4];
     }
 
     // Calculate scale factors from transform
@@ -736,9 +812,14 @@ pub fn apply_filter(
                 (filters::fe_flood_impl_f32(width, height, r, g, b, a), true)
             }
             FilterPrimitive::Merge { nodes, .. } => {
-                let layers: Vec<Array3<f32>> = nodes.iter().map(|n| convert_input(n, true)).collect();
-                let views: Vec<ArrayView3<f32>> = layers.iter().map(|l| l.view()).collect();
-                (filters::fe_merge_impl_f32(&views), true)
+                // SVG spec: feMerge with no children is an error - output transparent black
+                if nodes.is_empty() {
+                    (Array3::<f32>::zeros((height, width, 4)), true)
+                } else {
+                    let layers: Vec<Array3<f32>> = nodes.iter().map(|n| convert_input(n, true)).collect();
+                    let views: Vec<ArrayView3<f32>> = layers.iter().map(|l| l.view()).collect();
+                    (filters::fe_merge_impl_f32(&views), true)
+                }
             }
             FilterPrimitive::ColorMatrix { matrix_type, values, input, .. } => {
                 // Spec: "If the input graphic is premultiplied, the matrix operation is applied to the premultiplied components."
@@ -800,9 +881,10 @@ pub fn apply_filter(
                 (filters::fe_component_transfer_impl_f32(&src.view(), func_r, func_g, func_b, func_a), false)
             }
             FilterPrimitive::ConvolveMatrix { order_x, order_y, kernel, divisor, bias, target_x, target_y, edge_mode, preserve_alpha, input, .. } => {
+                // SVG spec: "By default, the convolution filter will be applied to premultiplied color component values."
                 // Important: edgeMode and sampling behavior are defined relative to the primitive subregion.
                 // If we convolve across the entire canvas, edgeMode=duplicate/wrap uses the wrong boundaries.
-                let full_src = convert_input(input, false);
+                let full_src = convert_input(input, true); // Use premultiplied
 
                 let (pmin_x, pmin_y, pmax_x, pmax_y) = get_primitive_subregion_px(
                     prim,
@@ -832,7 +914,7 @@ pub fn apply_filter(
 
                 let mut out = Array3::<f32>::zeros((height, width, 4));
                 paste_region(&mut out, &convolved, pmin_x, pmin_y);
-                (out, false)
+                (out, true) // Output is premultiplied
             }
             FilterPrimitive::DiffuseLighting { surface_scale, diffuse_constant, light_color, light_type, azimuth, elevation, light_x, light_y, light_z, points_at_x, points_at_y, points_at_z, specular_exponent, limiting_cone_angle, input, .. } => {
                 // Lighting inputs: Source Alpha (opaque)

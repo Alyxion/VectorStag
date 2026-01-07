@@ -569,6 +569,10 @@ pub struct RenderContext {
     pub viewport_width: f64,
     /// Current viewport height (for percent calculations)
     pub viewport_height: f64,
+    /// Scale factor from viewbox to render space (render_width / viewbox_width)
+    pub viewbox_scale_x: f64,
+    /// Scale factor from viewbox to render space (render_height / viewbox_height)
+    pub viewbox_scale_y: f64,
 }
 
 /// Maximum shapes to render (prevents infinite loops)

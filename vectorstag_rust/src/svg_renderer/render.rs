@@ -102,6 +102,9 @@ pub fn render_node(
         if let Some(filter_def) = ctx.filters.get(filter_id).cloned() {
             render_with_filter(ctx, node, parent_transform, parent_style, depth, root, &filter_def);
             return;
+        } else {
+            // SVG spec: if filter reference is invalid, element is not rendered at all
+            return;
         }
     }
 
@@ -454,21 +457,9 @@ fn render_with_filter(
     // We render the element normally (the filter attribute is already extracted)
     render_node_without_filter(ctx, node, parent_transform, parent_style, depth, root);
 
-    // Check if element is structurally empty (no renderable children)
-    // Skip filter only if:
-    // 1. Element is structurally empty (e.g., <g/> with no children)
-    // 2. Filter doesn't use BackgroundImage/BackgroundAlpha
-    // 3. No content was rendered to the temp buffer
-    // This prevents filters on empty elements from producing noise while still
-    // allowing BackgroundImage-based filters to work on empty elements.
-    if is_element_empty(node) && !filter_def.uses_background() {
-        let has_rendered_content = ctx.buffer.chunks(4).any(|px| px[3] > 0);
-        if !has_rendered_content {
-            // Truly empty element with no background input - skip filter
-            ctx.buffer = original_buffer;
-            return;
-        }
-    }
+    // Note: We always run the filter, even on empty elements, because filters
+    // like feFlood, feTurbulence, feImage can generate content independently
+    // without needing SourceGraphic input.
 
     // Get element bbox for filter units
     let bbox = get_element_bbox(node);

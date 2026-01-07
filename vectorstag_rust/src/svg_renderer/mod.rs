@@ -128,6 +128,11 @@ impl VectorStagRenderer {
             par
         );
 
+        // Set viewbox scale for pattern sampling (userSpaceOnUse)
+        // This is the scale from viewbox coordinates to render coordinates
+        ctx.viewbox_scale_x = render_width / vb_w;
+        ctx.viewbox_scale_y = render_height / vb_h;
+
         // First pass: collect all gradients from the entire document
         for child in root.children() {
             collect_all_gradients(&mut ctx, &child);

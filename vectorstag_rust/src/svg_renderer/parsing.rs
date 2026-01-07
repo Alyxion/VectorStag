@@ -600,11 +600,34 @@ pub fn get_element_bbox(node: &Node) -> Option<(f64, f64, f64, f64)> {
             }
         }
         "g" | "svg" => {
-            // Groups: use viewBox if available
+            // Groups: use viewBox if available, otherwise compute from children
             if let Some(vb) = node.attribute("viewBox").and_then(parse_viewbox) {
                 Some(vb)
             } else {
-                None
+                // Compute bounding box from children
+                let mut min_x = f64::INFINITY;
+                let mut min_y = f64::INFINITY;
+                let mut max_x = f64::NEG_INFINITY;
+                let mut max_y = f64::NEG_INFINITY;
+                let mut has_bbox = false;
+
+                for child in node.children() {
+                    if child.is_element() {
+                        if let Some((cx, cy, cw, ch)) = get_element_bbox(&child) {
+                            min_x = min_x.min(cx);
+                            min_y = min_y.min(cy);
+                            max_x = max_x.max(cx + cw);
+                            max_y = max_y.max(cy + ch);
+                            has_bbox = true;
+                        }
+                    }
+                }
+
+                if has_bbox {
+                    Some((min_x, min_y, max_x - min_x, max_y - min_y))
+                } else {
+                    None
+                }
             }
         }
         _ => None,

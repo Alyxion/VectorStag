@@ -36,6 +36,8 @@ impl RenderContext {
             font_manager,
             viewport_width: render_width as f64,
             viewport_height: render_height as f64,
+            viewbox_scale_x: 1.0,  // Will be set after viewbox transform is computed
+            viewbox_scale_y: 1.0,
         }
     }
 
@@ -505,10 +507,17 @@ impl RenderContext {
             edges.push((x1, y1, x2, y2, dir));
         }
 
+        // Scale factors for userSpaceOnUse: convert pixel coords to viewbox coords
+        let scale_x = self.viewbox_scale_x;
+        let scale_y = self.viewbox_scale_y;
+
         let sample_color = |px: f64, py: f64| -> Color {
-            // userSpaceOnUse only for now
-            let mut x = px - pattern.x;
-            let mut y = py - pattern.y;
+            // userSpaceOnUse: transform pixel coordinates back to viewbox coordinates
+            let vx = px / scale_x;
+            let vy = py / scale_y;
+
+            let mut x = vx - pattern.x;
+            let mut y = vy - pattern.y;
             x = x.rem_euclid(pattern.width);
             y = y.rem_euclid(pattern.height);
 
