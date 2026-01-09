@@ -871,18 +871,25 @@ def get_resvg_native_aspect(svg_path: Path) -> float:
 def render_vectorstag_for_comparison(svg_path: Path, size: int) -> Optional[Image.Image]:
     """Render VectorStag at appropriate dimensions and fit to canvas."""
     try:
-        # Use Python renderer for correctness (handles all SVG features)
-        renderer = SVGRenderer(background=(255, 255, 255, 255), antialias=4)
+        # Use pure Rust renderer for best quality and performance
+        from vectorstag_rust import VectorStagRenderer
+        rust_renderer = VectorStagRenderer()
 
-        # Check if SVG should be stretched (preserveAspectRatio="none")
+        with open(svg_path, 'r') as f:
+            svg_content = f.read()
+
+        svg_w, svg_h = get_svg_dimensions(svg_path)
         stretch = should_stretch(svg_path)
 
         if stretch:
-            # Render at target size (stretched to fill)
-            img = renderer.render_file(str(svg_path), size, size)
+            arr = rust_renderer.render(svg_content, width=size, height=size,
+                                       background=(255, 255, 255, 255), antialias=4)
+            img = Image.fromarray(arr, 'RGBA')
         else:
-            # Render at native dimensions to preserve aspect ratio
-            img = renderer.render_file(str(svg_path))
+            render_w, render_h = calculate_render_size(svg_w, svg_h, size)
+            arr = rust_renderer.render(svg_content, width=render_w, height=render_h,
+                                       background=(255, 255, 255, 255), antialias=4)
+            img = Image.fromarray(arr, 'RGBA')
 
         if img is None:
             return None

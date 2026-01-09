@@ -124,81 +124,66 @@ pub fn render_stroke(
             let p2_plus = (cx + perp2_x * half_width, cy + perp2_y * half_width);
             let p2_minus = (cx - perp2_x * half_width, cy - perp2_y * half_width);
 
+            // Normalize direction vectors
+            let d1_norm = (d1x / len1, d1y / len1);
+            let d2_norm = (d2x / len2, d2y / len2);
+
+            // perp = (-d.y, d.x) is 90° CCW rotation, so +perp is LEFT of path, -perp is RIGHT
+            // cross > 0 means left turn (counter-clockwise), outer/convex is on the RIGHT (-perp side)
+            // cross < 0 means right turn (clockwise), outer/convex is on the LEFT (+perp side)
+            let is_left_turn = cross > 0.0;
+
+            let (outer_p1, outer_p2) = if is_left_turn {
+                (p1_minus, p2_minus)  // Right side = -perp
+            } else {
+                (p1_plus, p2_plus)    // Left side = +perp
+            };
+
+            let (inner_p1, inner_p2) = if is_left_turn {
+                (p1_plus, p2_plus)    // Left side = +perp
+            } else {
+                (p1_minus, p2_minus)  // Right side = -perp
+            };
+
+            // Always fill the inner (concave) gap
+            let inner_bevel = vec![(cx, cy), inner_p1, inner_p2];
+            ctx.fill_polygon(&inner_bevel, color, FillRule::NonZero);
+
             match linejoin {
                 LineJoin::Round => {
                     draw_circle(ctx, cx, cy, half_width, color);
                 }
                 LineJoin::Miter => {
-                    // For miter joins, we need to handle convex and concave sides differently
-                    // The convex side gets a miter point, the concave side gets a bevel
-
                     if cross.abs() > 0.001 {
-                        // SVG miter limit: miter_ratio = 1/sin(θ/2) where θ is interior angle
-                        let dot = d1x * d2x + d1y * d2y;
-                        let cos_alpha = dot / (len1 * len2);
-                        let sin_half_theta_sq = (1.0 + cos_alpha) / 2.0;
+                        // Find miter point using line intersection
+                        // Extend outer_p1 forward along d1, outer_p2 backward along -d2
+                        let neg_d2 = (-d2_norm.0, -d2_norm.1);
+                        let miter_pt = line_intersection(outer_p1, d1_norm, outer_p2, neg_d2);
 
-                        let miter_limit_sq = miter_limit * miter_limit;
-                        let use_miter = sin_half_theta_sq >= 1.0 / miter_limit_sq && sin_half_theta_sq > 0.0001;
-
-                        // Calculate miter point position using line intersection
-                        let dx_perp = (perp2_x - perp1_x) * half_width;
-                        let dy_perp = (perp2_y - perp1_y) * half_width;
-                        let t = (dx_perp * d2y - dy_perp * d2x) / cross;
-
-                        if cross > 0.0 {
-                            // Left turn - convex on the - side (outer), concave on the + side (inner)
-                            // Fill concave gap on + side with bevel
-                            let bevel = vec![(cx, cy), p1_plus, p2_plus];
-                            ctx.fill_polygon(&bevel, color, FillRule::NonZero);
-
-                            // Miter on - side if within limit
-                            if use_miter {
-                                let miter_x = cx - perp1_x * half_width - t * d1x;
-                                let miter_y = cy - perp1_y * half_width - t * d1y;
-                                let tri1 = vec![p1_minus, (miter_x, miter_y), (cx, cy)];
-                                let tri2 = vec![(miter_x, miter_y), p2_minus, (cx, cy)];
-                                ctx.fill_polygon(&tri1, color, FillRule::NonZero);
-                                ctx.fill_polygon(&tri2, color, FillRule::NonZero);
+                        if let Some(mp) = miter_pt {
+                            let dist = ((mp.0 - cx).powi(2) + (mp.1 - cy).powi(2)).sqrt();
+                            if dist <= miter_limit * half_width {
+                                // Draw miter quad
+                                let miter_quad = vec![(cx, cy), outer_p1, mp, outer_p2];
+                                ctx.fill_polygon(&miter_quad, color, FillRule::NonZero);
                             } else {
                                 // Bevel fallback
-                                let bevel = vec![(cx, cy), p1_minus, p2_minus];
+                                let bevel = vec![(cx, cy), outer_p1, outer_p2];
                                 ctx.fill_polygon(&bevel, color, FillRule::NonZero);
                             }
                         } else {
-                            // Right turn - convex on the + side (outer), concave on the - side (inner)
-                            // Fill concave gap on - side with bevel
-                            let bevel = vec![(cx, cy), p1_minus, p2_minus];
+                            let bevel = vec![(cx, cy), outer_p1, outer_p2];
                             ctx.fill_polygon(&bevel, color, FillRule::NonZero);
-
-                            // Miter on + side if within limit
-                            if use_miter {
-                                let miter_x = cx + perp1_x * half_width + t * d1x;
-                                let miter_y = cy + perp1_y * half_width + t * d1y;
-                                let tri1 = vec![p1_plus, (miter_x, miter_y), (cx, cy)];
-                                let tri2 = vec![(miter_x, miter_y), p2_plus, (cx, cy)];
-                                ctx.fill_polygon(&tri1, color, FillRule::NonZero);
-                                ctx.fill_polygon(&tri2, color, FillRule::NonZero);
-                            } else {
-                                // Bevel fallback
-                                let bevel = vec![(cx, cy), p1_plus, p2_plus];
-                                ctx.fill_polygon(&bevel, color, FillRule::NonZero);
-                            }
                         }
                     } else {
-                        // Nearly parallel - just use bevel on both sides
-                        let bevel1 = vec![(cx, cy), p1_plus, p2_plus];
-                        let bevel2 = vec![(cx, cy), p1_minus, p2_minus];
-                        ctx.fill_polygon(&bevel1, color, FillRule::NonZero);
-                        ctx.fill_polygon(&bevel2, color, FillRule::NonZero);
+                        // Nearly parallel - just use bevel
+                        let bevel = vec![(cx, cy), outer_p1, outer_p2];
+                        ctx.fill_polygon(&bevel, color, FillRule::NonZero);
                     }
                 }
                 LineJoin::Bevel => {
-                    // Bevel join - triangles from center to edge points on both sides
-                    let bevel1 = vec![(cx, cy), p1_plus, p2_plus];
-                    let bevel2 = vec![(cx, cy), p1_minus, p2_minus];
-                    ctx.fill_polygon(&bevel1, color, FillRule::NonZero);
-                    ctx.fill_polygon(&bevel2, color, FillRule::NonZero);
+                    let bevel = vec![(cx, cy), outer_p1, outer_p2];
+                    ctx.fill_polygon(&bevel, color, FillRule::NonZero);
                 }
             }
         }
@@ -269,4 +254,17 @@ pub fn draw_circle(ctx: &mut RenderContext, cx: f64, cy: f64, radius: f64, color
         circle.push((cx + radius * angle.cos(), cy + radius * angle.sin()));
     }
     ctx.fill_polygon(&circle, color, FillRule::NonZero);
+}
+
+/// Find intersection of two lines defined by point and direction
+#[inline]
+fn line_intersection(p1: (f64, f64), d1: (f64, f64), p2: (f64, f64), d2: (f64, f64)) -> Option<(f64, f64)> {
+    let det = d1.0 * (-d2.1) - d1.1 * (-d2.0);
+    if det.abs() < 1e-10 {
+        return None;
+    }
+    let dx = p2.0 - p1.0;
+    let dy = p2.1 - p1.1;
+    let t = (dx * (-d2.1) - dy * (-d2.0)) / det;
+    Some((p1.0 + t * d1.0, p1.1 + t * d1.1))
 }

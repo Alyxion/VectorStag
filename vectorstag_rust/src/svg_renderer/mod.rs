@@ -67,8 +67,16 @@ impl VectorStagRenderer {
         let bg = background.unwrap_or((255, 255, 255, 255));
         let background = Color::from_rgba(bg.0, bg.1, bg.2, bg.3);
 
+        // Strip DOCTYPE declaration (not needed for rendering, causes roxmltree to reject)
+        let svg_clean = if svg_content.contains("<!DOCTYPE") {
+            let re = regex::Regex::new(r"<!DOCTYPE[^>]*>").unwrap();
+            re.replace(svg_content, "").to_string()
+        } else {
+            svg_content.to_string()
+        };
+
         // Parse SVG
-        let doc = Document::parse(svg_content)
+        let doc = Document::parse(&svg_clean)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("Failed to parse SVG: {}", e)
             ))?;
@@ -128,9 +136,6 @@ impl VectorStagRenderer {
             par
         );
         
-        eprintln!("RUST DEBUG: viewBox={:?} size={}x{} render={}x{} par={:?} transform={:?}", 
-                 viewbox, svg_width, svg_height, render_width, render_height, par, base_transform);
-
         // Set viewbox scale for pattern sampling (userSpaceOnUse)
         // This is the scale from viewbox coordinates to render coordinates
         ctx.viewbox_scale_x = render_width / vb_w;
