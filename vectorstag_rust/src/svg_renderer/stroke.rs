@@ -132,29 +132,14 @@ pub fn render_stroke(
                     // For miter joins, we need to handle convex and concave sides differently
                     // The convex side gets a miter point, the concave side gets a bevel
 
-                    // Debug for NP.svg blue stroke
-                    let is_debug_color = color.r == 0 && color.g == 56 && color.b == 147;
-
                     if cross.abs() > 0.001 {
                         // SVG miter limit: miter_ratio = 1/sin(θ/2) where θ is interior angle
-                        // Interior angle θ = 180° - angle_between_directions
-                        // Using half-angle: sin(θ/2) = sin((180° - α)/2) = cos(α/2)
-                        // where α is angle between direction vectors
-                        // cos(α/2) = sqrt((1 + cos(α))/2)
                         let dot = d1x * d2x + d1y * d2y;
                         let cos_alpha = dot / (len1 * len2);
-                        // sin(θ/2) = sqrt((1 + cos_alpha)/2)
                         let sin_half_theta_sq = (1.0 + cos_alpha) / 2.0;
 
-                        // miter_ratio = 1/sin(θ/2), check if <= miter_limit
-                        // Equivalent to: sin(θ/2)^2 >= 1/miter_limit^2
                         let miter_limit_sq = miter_limit * miter_limit;
                         let use_miter = sin_half_theta_sq >= 1.0 / miter_limit_sq && sin_half_theta_sq > 0.0001;
-
-                        if color.b > 100 { // Filter for blue-ish strokes to reduce noise but catch NP
-                             eprintln!("RUST DEBUG: Miter color={:?} cross={:.4} dot={:.4} cos={:.4} sin_sq={:.4} limit_sq={:.4} use={}", 
-                                       color, cross, dot, cos_alpha, sin_half_theta_sq, miter_limit_sq, use_miter);
-                        }
 
                         // Calculate miter point position using line intersection
                         let dx_perp = (perp2_x - perp1_x) * half_width;
@@ -171,12 +156,11 @@ pub fn render_stroke(
                             if use_miter {
                                 let miter_x = cx - perp1_x * half_width - t * d1x;
                                 let miter_y = cy - perp1_y * half_width - t * d1y;
-                                // Use quad instead of triangle to connect miter to corner center
-                                // This fills the gap between miter tip and stroke segments
-                                let quad = vec![p1_minus, (miter_x, miter_y), p2_minus, (cx, cy)];
-                                ctx.fill_polygon(&quad, color, FillRule::NonZero);
+                                let tri1 = vec![p1_minus, (miter_x, miter_y), (cx, cy)];
+                                let tri2 = vec![(miter_x, miter_y), p2_minus, (cx, cy)];
+                                ctx.fill_polygon(&tri1, color, FillRule::NonZero);
+                                ctx.fill_polygon(&tri2, color, FillRule::NonZero);
                             } else {
-                                if is_debug_color { eprintln!("RUST DEBUG: Miter limit exceeded, using bevel"); }
                                 // Bevel fallback
                                 let bevel = vec![(cx, cy), p1_minus, p2_minus];
                                 ctx.fill_polygon(&bevel, color, FillRule::NonZero);
@@ -191,12 +175,11 @@ pub fn render_stroke(
                             if use_miter {
                                 let miter_x = cx + perp1_x * half_width + t * d1x;
                                 let miter_y = cy + perp1_y * half_width + t * d1y;
-                                // Use quad instead of triangle to connect miter to corner center
-                                // This fills the gap between miter tip and stroke segments
-                                let quad = vec![p1_plus, (miter_x, miter_y), p2_plus, (cx, cy)];
-                                ctx.fill_polygon(&quad, color, FillRule::NonZero);
+                                let tri1 = vec![p1_plus, (miter_x, miter_y), (cx, cy)];
+                                let tri2 = vec![(miter_x, miter_y), p2_plus, (cx, cy)];
+                                ctx.fill_polygon(&tri1, color, FillRule::NonZero);
+                                ctx.fill_polygon(&tri2, color, FillRule::NonZero);
                             } else {
-                                if is_debug_color { eprintln!("RUST DEBUG: Miter limit exceeded, using bevel"); }
                                 // Bevel fallback
                                 let bevel = vec![(cx, cy), p1_plus, p2_plus];
                                 ctx.fill_polygon(&bevel, color, FillRule::NonZero);

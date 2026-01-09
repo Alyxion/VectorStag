@@ -2132,10 +2132,16 @@ class SVGRenderer:
             return
 
         # Get bounding box for stroke area
-        # For round joins, need extra space for the round corners
+        # For miter joins, need extra space for miter extensions (up to miterlimit * half_width)
+        # For round joins, need half_width * 1.5 for the round corners
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
-        padding = half_width * 1.5 if linejoin == "round" else half_width + 2
+        if linejoin == "round":
+            padding = half_width * 1.5
+        elif linejoin == "miter":
+            padding = miterlimit * half_width + 2
+        else:
+            padding = half_width + 2
         min_x = max(0, int(min(xs) - padding))
         min_y = max(0, int(min(ys) - padding))
         max_x = min(ctx.image_width, int(max(xs) + padding))
@@ -2214,17 +2220,20 @@ class SVGRenderer:
                 right_p1 = (p_curr[0] - perp1[0] * half_width, p_curr[1] - perp1[1] * half_width)
                 right_p2 = (p_curr[0] - perp2[0] * half_width, p_curr[1] - perp2[1] * half_width)
 
+                # For miter calculation, extend outer_p1 forward (d1) and outer_p2 backward (-d2)
+                neg_d2 = (-d2[0], -d2[1])
+
                 if cross > 0:
-                    # Left turn - miter on inside (right)
-                    miter_pt = self._line_intersection(right_p1, d1, right_p2, d2)
+                    # Left turn - outer/convex side is RIGHT (-perp)
+                    miter_pt = self._line_intersection(right_p1, d1, right_p2, neg_d2)
                     if miter_pt:
                         miter_dist = math.sqrt((miter_pt[0] - p_curr[0])**2 + (miter_pt[1] - p_curr[1])**2)
                         if miter_dist <= miterlimit * half_width:
                             tri = [right_p1, miter_pt, right_p2]
                             draw.polygon(tri, fill=stroke)
                 else:
-                    # Right turn - miter on inside (left)
-                    miter_pt = self._line_intersection(left_p1, d1, left_p2, d2)
+                    # Right turn - outer/convex side is LEFT (+perp)
+                    miter_pt = self._line_intersection(left_p1, d1, left_p2, neg_d2)
                     if miter_pt:
                         miter_dist = math.sqrt((miter_pt[0] - p_curr[0])**2 + (miter_pt[1] - p_curr[1])**2)
                         if miter_dist <= miterlimit * half_width:

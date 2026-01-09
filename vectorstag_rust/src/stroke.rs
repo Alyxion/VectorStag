@@ -61,28 +61,53 @@ pub fn render_stroke_closed_polygon<'py>(
         let perp1 = (-d1.1, d1.0);
         let perp2 = (-d2.1, d2.0);
 
-        let is_right_turn = cross > 0.0;
+        // perp = (-d.y, d.x) is 90° CCW rotation, so +perp is LEFT of path, -perp is RIGHT
+        // cross > 0 means left turn (counter-clockwise), outer/convex is on the RIGHT (-perp side)
+        // cross < 0 means right turn (clockwise), outer/convex is on the LEFT (+perp side)
+        let is_left_turn = cross > 0.0;
 
-        let (outer_p1, outer_p2) = if is_right_turn {
+        let (outer_p1, outer_p2) = if is_left_turn {
+            // Left turn - outer/convex side is on the RIGHT of the path (-perp)
+            (
+                (p_curr.0 - perp1.0 * half_width, p_curr.1 - perp1.1 * half_width),
+                (p_curr.0 - perp2.0 * half_width, p_curr.1 - perp2.1 * half_width)
+            )
+        } else {
+            // Right turn - outer/convex side is on the LEFT of the path (+perp)
+            (
+                (p_curr.0 + perp1.0 * half_width, p_curr.1 + perp1.1 * half_width),
+                (p_curr.0 + perp2.0 * half_width, p_curr.1 + perp2.1 * half_width)
+            )
+        };
+
+        // Inner (concave) side points - opposite of outer
+        let (inner_p1, inner_p2) = if is_left_turn {
+            // Left turn - inner/concave side is on the LEFT (+perp)
             (
                 (p_curr.0 + perp1.0 * half_width, p_curr.1 + perp1.1 * half_width),
                 (p_curr.0 + perp2.0 * half_width, p_curr.1 + perp2.1 * half_width)
             )
         } else {
+            // Right turn - inner/concave side is on the RIGHT (-perp)
             (
                 (p_curr.0 - perp1.0 * half_width, p_curr.1 - perp1.1 * half_width),
                 (p_curr.0 - perp2.0 * half_width, p_curr.1 - perp2.1 * half_width)
             )
         };
 
+        // Always fill the inner (concave) gap - segment rectangles may not fully cover it
+        quads.push(vec![p_curr, inner_p1, inner_p2]);
+
         if linejoin == "round" {
-            let angle1 = if is_right_turn {
+            // For round joins, arc from outer edge of incoming to outer edge of outgoing
+            // Left turn: outer is -perp direction, Right turn: outer is +perp direction
+            let angle1 = if is_left_turn {
                 (-perp1.1).atan2(-perp1.0)
             } else {
                 perp1.1.atan2(perp1.0)
             };
 
-            let angle2 = if is_right_turn {
+            let angle2 = if is_left_turn {
                 (-perp2.1).atan2(-perp2.0)
             } else {
                 perp2.1.atan2(perp2.0)
@@ -100,8 +125,11 @@ pub fn render_stroke_closed_polygon<'py>(
         } else if linejoin == "bevel" {
             quads.push(vec![p_curr, outer_p1, outer_p2]);
         } else {
-            // Miter
-            let miter_pt = line_intersection(outer_p1, d1, outer_p2, d2);
+            // Miter - extend outer edges to find intersection
+            // d1 points along incoming edge, we extend outer_p1 forward
+            // d2 points along outgoing edge, we need to go BACKWARD from outer_p2 (use -d2)
+            let neg_d2 = (-d2.0, -d2.1);
+            let miter_pt = line_intersection(outer_p1, d1, outer_p2, neg_d2);
 
             if let Some(mp) = miter_pt {
                 let dist = ((mp.0 - p_curr.0).powi(2) + (mp.1 - p_curr.1).powi(2)).sqrt();
