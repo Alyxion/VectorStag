@@ -672,7 +672,7 @@ pub fn apply_filter(
     // Calculate scale factors from transform
     let scale_x = (transform.a * transform.a + transform.b * transform.b).sqrt();
     let scale_y = (transform.c * transform.c + transform.d * transform.d).sqrt();
-    let scale = (scale_x + scale_y) / 2.0;
+    let _scale = (scale_x + scale_y) / 2.0;
 
     // Calculate filter region in screen pixels
     let (region_min_x, region_min_y, region_max_x, region_max_y) = calculate_filter_region(filter, bbox, transform, width, height);

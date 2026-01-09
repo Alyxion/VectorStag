@@ -78,6 +78,7 @@ poetry run python render.py input.svg output.png -w 500 -H 500
 ## Accuracy Expectations
 - **Anti-aliasing differences account for AT MOST 0.1%** - anything beyond that indicates real rendering bugs
 - **Target: 99.9%+ for all SVGs** - especially simple shapes like android.svg
+- **Pink Pixel Rule**: Comparison grids must NOT have more than 9 pink pixels (differences) in any 3x3 pixel area. Anything beyond that is a rendering error, not aliasing.
 
 ## Development Guidelines
 - **ALWAYS use 4x antialiasing**: The quality difference between 2x and 4x is massive. DO NOT CHANGE this default under any circumstances.

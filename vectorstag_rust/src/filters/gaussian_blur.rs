@@ -3,7 +3,7 @@
 use pyo3::prelude::*;
 use numpy::IntoPyArray;
 use ndarray::Array3;
-use super::blur_utils::box_blur_integral;
+use super::blur_utils::box_blur_integral_alpha_weighted;
 
 pub fn fe_gaussian_blur_impl_f32(src: &ndarray::ArrayView3<f32>, std_dev_x: f32, std_dev_y: f32) -> Array3<f32> {
     let (h, w, _) = (src.shape()[0], src.shape()[1], src.shape()[2]);
@@ -25,7 +25,7 @@ pub fn fe_gaussian_blur_impl_f32(src: &ndarray::ArrayView3<f32>, std_dev_x: f32,
     let mut buf_a = vec![0.0f32; total_pixels];
     let mut buf_b = vec![0.0f32; total_pixels];
 
-    // Copy src to buffer
+    // Copy src to buffer (premultiplied RGBA)
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) * 4;
@@ -40,8 +40,9 @@ pub fn fe_gaussian_blur_impl_f32(src: &ndarray::ArrayView3<f32>, std_dev_x: f32,
     let mut next = &mut buf_b;
 
     if box_radius_x > 0 || box_radius_y > 0 {
+        // Use alpha-weighted blur to prevent fade-to-black with transparent areas
         for _ in 0..3 {
-            box_blur_integral(current, next, w, h, box_radius_x, box_radius_y);
+            box_blur_integral_alpha_weighted(current, next, w, h, box_radius_x, box_radius_y);
             std::mem::swap(&mut current, &mut next);
         }
     }
@@ -85,7 +86,7 @@ pub fn fe_gaussian_blur_impl(src: &ndarray::ArrayView3<u8>, std_dev_x: f32, std_
     let mut buf_a = vec![0.0f32; total_pixels];
     let mut buf_b = vec![0.0f32; total_pixels];
 
-    // Copy src to buffer (assuming already premultiplied)
+    // Copy src to buffer (premultiplied RGBA)
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) * 4;
@@ -100,19 +101,14 @@ pub fn fe_gaussian_blur_impl(src: &ndarray::ArrayView3<u8>, std_dev_x: f32, std_
     let mut next = &mut buf_b;
 
     if box_radius_x > 0 || box_radius_y > 0 {
+        // Use alpha-weighted blur to prevent fade-to-black
         for _ in 0..3 {
-            box_blur_integral(current, next, w, h, box_radius_x, box_radius_y);
+            box_blur_integral_alpha_weighted(current, next, w, h, box_radius_x, box_radius_y);
             std::mem::swap(&mut current, &mut next);
         }
     }
 
     let mut dst = Array3::<u8>::zeros((h, w, 4));
-    for i in 0..total_pixels {
-        // Flat copy back to Array3 structure
-        // We can optimize this but let's stick to the loop for now or reuse index
-    }
-    
-    // Using explicit loops to map back to Array3
     for y in 0..h {
         for x in 0..w {
             let idx = (y * w + x) * 4;

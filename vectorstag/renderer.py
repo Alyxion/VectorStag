@@ -127,6 +127,8 @@ class SVGRenderer:
         # Determine whether to stretch or preserve aspect ratio
         # Only stretch if preserveAspectRatio="none"
         should_stretch = (doc.preserve_aspect_ratio == "none")
+        print(f"DEBUG: doc.preserve_aspect_ratio='{doc.preserve_aspect_ratio}' should_stretch={should_stretch}")
+        print(f"DEBUG: src={src_w}x{src_h} render={render_width}x{render_height}")
 
         if should_stretch:
             # Non-uniform scaling (stretch to fill)
@@ -135,6 +137,7 @@ class SVGRenderer:
             transform = Transform.translate(offset_x, offset_y).multiply(
                 Transform.scale(scale_x, scale_y)
             )
+            print(f"DEBUG: Stretched transform: {transform}")
         else:
             # Uniform scaling (preserve aspect ratio)
             scale = min(scale_x, scale_y)
@@ -144,6 +147,7 @@ class SVGRenderer:
             transform = Transform.translate(offset_x, offset_y).multiply(
                 Transform.scale(scale)
             )
+            print(f"DEBUG: Uniform transform: {transform} scale={scale} offset={offset_x},{offset_y}")
 
         # Create numpy array directly (skip PIL Image.new for Rust path)
         # Create numpy array with background color directly
@@ -204,10 +208,13 @@ class SVGRenderer:
             needs_clip = (clip_x2 > clip_x1 and clip_y2 > clip_y1 and
                          (clip_x1 > 0 or clip_y1 > 0 or
                           clip_x2 < render_width or clip_y2 < render_height))
+            
+            print(f"DEBUG: Clipping: needs_clip={needs_clip} box={clip_x1},{clip_y1},{clip_x2},{clip_y2} render={render_width}x{render_height}")
 
             if needs_clip:
                 # Set letterbox areas to background color
                 # (previous code zeroed alpha, making them transparent even with solid background)
+                print(f"DEBUG: Applying background {self.background} to letterbox areas")
                 img_arr[:clip_y1, :] = self.background  # Top
                 img_arr[clip_y2:, :] = self.background  # Bottom
                 img_arr[:, :clip_x1] = self.background  # Left

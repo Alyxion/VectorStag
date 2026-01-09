@@ -22,31 +22,56 @@ pub fn render_path_with_markers(
         return;
     }
 
-    let polygons = path_to_polygons(d, transform);
+    let raw_polygons = path_to_polygons(d, transform);
+    let mut processed_polygons = Vec::with_capacity(raw_polygons.len());
 
-    for poly in &polygons {
+    for mut poly in raw_polygons {
         if poly.len() > MAX_POLYGON_POINTS {
             continue;
         }
 
-        // Fill
-        if let Some(ref fill) = style.fill {
-            match fill {
-                Paint::Color(color) => {
-                    let mut c = *color;
-                    c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
+        // Check if polygon is closed (last point == first point)
+        // This handles paths ending with Z where the parser added the closing point
+        let is_closed = if poly.len() >= 3 {
+            let (x1, y1) = poly[0];
+            let (x2, y2) = poly[poly.len() - 1];
+            let dist_sq = (x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2);
+            if dist_sq < 0.000001 {
+                poly.pop(); // Remove duplicate point
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // eprintln!("RUST DEBUG: Path poly len={} closed={}", poly.len(), is_closed);
+        processed_polygons.push((poly, is_closed));
+    }
+
+    // Fill
+    if let Some(ref fill) = style.fill {
+        match fill {
+            Paint::Color(color) => {
+                let mut c = *color;
+                c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
+                for (poly, _) in &processed_polygons {
                     ctx.fill_polygon(poly, c, style.fill_rule);
                 }
-                Paint::Ref(id) => {
-                    let opacity = style.fill_opacity * style.opacity;
-                    if let Some(gradient) = ctx.gradients.get(id).cloned() {
+            }
+            Paint::Ref(id) => {
+                let opacity = style.fill_opacity * style.opacity;
+                if let Some(gradient) = ctx.gradients.get(id).cloned() {
+                    for (poly, _) in &processed_polygons {
                         ctx.fill_polygon_gradient(poly, &gradient, transform, style.fill_rule, opacity);
-                    } else if let Some(pattern) = ctx.patterns.get(id).cloned() {
+                    }
+                } else if let Some(pattern) = ctx.patterns.get(id).cloned() {
+                    for (poly, _) in &processed_polygons {
                         ctx.fill_polygon_pattern(poly, &pattern, style.fill_rule, opacity);
                     }
                 }
-                Paint::None => {}
             }
+            Paint::None => {}
         }
     }
 
@@ -58,12 +83,9 @@ pub fn render_path_with_markers(
             if let Paint::Color(color) = stroke {
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
-                for poly in &polygons {
-                    if poly.len() > MAX_POLYGON_POINTS {
-                        continue;
-                    }
+                for (poly, is_closed) in &processed_polygons {
                     render_stroke(ctx, poly, c, style.stroke_width * transform.a.abs(),
-                        style.stroke_linecap, style.stroke_linejoin, false);
+                        style.stroke_linecap, style.stroke_linejoin, *is_closed, style.stroke_miterlimit);
                 }
             }
         }
@@ -72,7 +94,7 @@ pub fn render_path_with_markers(
     // Render markers on each polygon
     let has_markers = style.marker_start.is_some() || style.marker_mid.is_some() || style.marker_end.is_some();
     if has_markers {
-        for poly in &polygons {
+        for (poly, _) in &processed_polygons {
             if poly.len() >= 2 && poly.len() <= MAX_POLYGON_POINTS {
                 render_markers(ctx, poly, style, transform, root);
             }

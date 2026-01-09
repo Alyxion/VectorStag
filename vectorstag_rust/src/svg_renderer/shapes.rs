@@ -119,7 +119,7 @@ pub fn render_rect(ctx: &mut RenderContext, node: &Node, transform: &Transform, 
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
                 render_stroke(ctx, &corners, c, style.stroke_width * transform.a.abs(),
-                    style.stroke_linecap, style.stroke_linejoin, true);
+                    style.stroke_linecap, style.stroke_linejoin, true, style.stroke_miterlimit);
             }
         }
     }
@@ -186,7 +186,7 @@ pub fn render_circle(ctx: &mut RenderContext, node: &Node, transform: &Transform
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
                 render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs(),
-                    style.stroke_linecap, style.stroke_linejoin, true);
+                    style.stroke_linecap, style.stroke_linejoin, true, style.stroke_miterlimit);
             }
         }
     }
@@ -274,7 +274,7 @@ pub fn render_ellipse(ctx: &mut RenderContext, node: &Node, transform: &Transfor
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
                 render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs(),
-                    style.stroke_linecap, style.stroke_linejoin, true);
+                    style.stroke_linecap, style.stroke_linejoin, true, style.stroke_miterlimit);
             }
         }
     }
@@ -301,7 +301,7 @@ pub fn render_line(ctx: &mut RenderContext, node: &Node, transform: &Transform, 
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
                 render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs(),
-                    style.stroke_linecap, style.stroke_linejoin, false);
+                    style.stroke_linecap, style.stroke_linejoin, false, style.stroke_miterlimit);
             }
         }
     }
@@ -331,7 +331,7 @@ pub fn render_polyline(ctx: &mut RenderContext, node: &Node, transform: &Transfo
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
                 render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs(),
-                    style.stroke_linecap, style.stroke_linejoin, false);
+                    style.stroke_linecap, style.stroke_linejoin, false, style.stroke_miterlimit);
             }
         }
     }
@@ -380,7 +380,7 @@ pub fn render_polygon_elem(ctx: &mut RenderContext, node: &Node, transform: &Tra
                 let mut c = *color;
                 c.a = (c.a as f64 * style.stroke_opacity * style.opacity) as u8;
                 render_stroke(ctx, &points, c, style.stroke_width * transform.a.abs(),
-                    style.stroke_linecap, style.stroke_linejoin, true);
+                    style.stroke_linecap, style.stroke_linejoin, true, style.stroke_miterlimit);
             }
         }
     }

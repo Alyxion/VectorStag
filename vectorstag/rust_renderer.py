@@ -51,6 +51,11 @@ class RustSVGRenderer:
         Returns:
             PIL Image in RGBA mode
         """
+        # Strip DTD if present (roxmltree doesn't support it)
+        if "<!DOCTYPE" in svg_content:
+            import re
+            svg_content = re.sub(r'<!DOCTYPE[^>]*>', '', svg_content, flags=re.DOTALL)
+
         arr = self._renderer.render(
             svg_content,
             width=width,

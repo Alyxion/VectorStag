@@ -127,11 +127,34 @@ impl VectorStagRenderer {
             render_width, render_height,
             par
         );
+        
+        eprintln!("RUST DEBUG: viewBox={:?} size={}x{} render={}x{} par={:?} transform={:?}", 
+                 viewbox, svg_width, svg_height, render_width, render_height, par, base_transform);
 
         // Set viewbox scale for pattern sampling (userSpaceOnUse)
         // This is the scale from viewbox coordinates to render coordinates
         ctx.viewbox_scale_x = render_width / vb_w;
         ctx.viewbox_scale_y = render_height / vb_h;
+
+        // Apply root-level clipping to viewBox (default overflow: hidden for <svg>)
+        let overflow = root.attribute("overflow").unwrap_or("hidden");
+        if overflow == "hidden" || overflow == "scroll" {
+            let (x1, y1) = base_transform.apply(vb_x, vb_y);
+            let (x2, y2) = base_transform.apply(vb_x + vb_w, vb_y);
+            let (x3, y3) = base_transform.apply(vb_x + vb_w, vb_y + vb_h);
+            let (x4, y4) = base_transform.apply(vb_x, vb_y + vb_h);
+
+            let clip_polygon = vec![(x1, y1), (x2, y2), (x3, y3), (x4, y4)];
+            
+            // Calculate bbox for the clip
+            let min_x = x1.min(x2).min(x3).min(x4);
+            let max_x = x1.max(x2).max(x3).max(x4);
+            let min_y = y1.min(y2).min(y3).min(y4);
+            let max_y = y1.max(y2).max(y3).max(y4);
+
+            ctx.active_clip = Some(vec![clip_polygon]);
+            ctx.active_clip_bbox = Some((min_x, min_y, max_x, max_y));
+        }
 
         // First pass: collect all gradients from the entire document
         for child in root.children() {

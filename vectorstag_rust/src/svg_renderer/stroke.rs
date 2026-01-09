@@ -21,6 +21,7 @@ pub fn render_stroke(
     linecap: LineCap,
     linejoin: LineJoin,
     closed: bool,
+    miter_limit: f64,
 ) {
     if color.a == 0 {
         return;
@@ -82,13 +83,141 @@ pub fn render_stroke(
         ctx.fill_polygon(&quad, color, FillRule::NonZero);
     }
 
-    // Draw round linejoins at internal vertices
-    if matches!(linejoin, LineJoin::Round) && points.len() > 2 {
+    // Draw linejoins at internal vertices
+    if points.len() > 2 {
         let start = if closed { 0 } else { 1 };
         let end = if closed { points.len() } else { points.len() - 1 };
         for i in start..end {
+            let prev_idx = if i == 0 { points.len() - 1 } else { i - 1 };
+            let next_idx = (i + 1) % points.len();
+
             let (cx, cy) = points[i];
-            draw_circle(ctx, cx, cy, half_width, color);
+            let (px, py) = points[prev_idx];
+            let (nx, ny) = points[next_idx];
+
+            let d1x = cx - px;
+            let d1y = cy - py;
+            let d2x = nx - cx;
+            let d2y = ny - cy;
+
+            let len1 = (d1x * d1x + d1y * d1y).sqrt();
+            let len2 = (d2x * d2x + d2y * d2y).sqrt();
+
+            if len1 < 0.001 || len2 < 0.001 {
+                continue;
+            }
+
+            // Perpendicular directions (normalized)
+            let perp1_x = -d1y / len1;
+            let perp1_y = d1x / len1;
+            let perp2_x = -d2y / len2;
+            let perp2_y = d2x / len2;
+
+            // Cross product determines turn direction
+            // Positive = left turn (convex on left side)
+            // Negative = right turn (convex on right side)
+            let cross = d1x * d2y - d1y * d2x;
+
+            // Edge points at this vertex for both segments
+            let p1_plus = (cx + perp1_x * half_width, cy + perp1_y * half_width);
+            let p1_minus = (cx - perp1_x * half_width, cy - perp1_y * half_width);
+            let p2_plus = (cx + perp2_x * half_width, cy + perp2_y * half_width);
+            let p2_minus = (cx - perp2_x * half_width, cy - perp2_y * half_width);
+
+            match linejoin {
+                LineJoin::Round => {
+                    draw_circle(ctx, cx, cy, half_width, color);
+                }
+                LineJoin::Miter => {
+                    // For miter joins, we need to handle convex and concave sides differently
+                    // The convex side gets a miter point, the concave side gets a bevel
+
+                    // Debug for NP.svg blue stroke
+                    let is_debug_color = color.r == 0 && color.g == 56 && color.b == 147;
+
+                    if cross.abs() > 0.001 {
+                        // SVG miter limit: miter_ratio = 1/sin(θ/2) where θ is interior angle
+                        // Interior angle θ = 180° - angle_between_directions
+                        // Using half-angle: sin(θ/2) = sin((180° - α)/2) = cos(α/2)
+                        // where α is angle between direction vectors
+                        // cos(α/2) = sqrt((1 + cos(α))/2)
+                        let dot = d1x * d2x + d1y * d2y;
+                        let cos_alpha = dot / (len1 * len2);
+                        // sin(θ/2) = sqrt((1 + cos_alpha)/2)
+                        let sin_half_theta_sq = (1.0 + cos_alpha) / 2.0;
+
+                        // miter_ratio = 1/sin(θ/2), check if <= miter_limit
+                        // Equivalent to: sin(θ/2)^2 >= 1/miter_limit^2
+                        let miter_limit_sq = miter_limit * miter_limit;
+                        let use_miter = sin_half_theta_sq >= 1.0 / miter_limit_sq && sin_half_theta_sq > 0.0001;
+
+                        if color.b > 100 { // Filter for blue-ish strokes to reduce noise but catch NP
+                             eprintln!("RUST DEBUG: Miter color={:?} cross={:.4} dot={:.4} cos={:.4} sin_sq={:.4} limit_sq={:.4} use={}", 
+                                       color, cross, dot, cos_alpha, sin_half_theta_sq, miter_limit_sq, use_miter);
+                        }
+
+                        // Calculate miter point position using line intersection
+                        let dx_perp = (perp2_x - perp1_x) * half_width;
+                        let dy_perp = (perp2_y - perp1_y) * half_width;
+                        let t = (dx_perp * d2y - dy_perp * d2x) / cross;
+
+                        if cross > 0.0 {
+                            // Left turn - convex on the - side (outer), concave on the + side (inner)
+                            // Fill concave gap on + side with bevel
+                            let bevel = vec![(cx, cy), p1_plus, p2_plus];
+                            ctx.fill_polygon(&bevel, color, FillRule::NonZero);
+
+                            // Miter on - side if within limit
+                            if use_miter {
+                                let miter_x = cx - perp1_x * half_width - t * d1x;
+                                let miter_y = cy - perp1_y * half_width - t * d1y;
+                                // Use quad instead of triangle to connect miter to corner center
+                                // This fills the gap between miter tip and stroke segments
+                                let quad = vec![p1_minus, (miter_x, miter_y), p2_minus, (cx, cy)];
+                                ctx.fill_polygon(&quad, color, FillRule::NonZero);
+                            } else {
+                                if is_debug_color { eprintln!("RUST DEBUG: Miter limit exceeded, using bevel"); }
+                                // Bevel fallback
+                                let bevel = vec![(cx, cy), p1_minus, p2_minus];
+                                ctx.fill_polygon(&bevel, color, FillRule::NonZero);
+                            }
+                        } else {
+                            // Right turn - convex on the + side (outer), concave on the - side (inner)
+                            // Fill concave gap on - side with bevel
+                            let bevel = vec![(cx, cy), p1_minus, p2_minus];
+                            ctx.fill_polygon(&bevel, color, FillRule::NonZero);
+
+                            // Miter on + side if within limit
+                            if use_miter {
+                                let miter_x = cx + perp1_x * half_width + t * d1x;
+                                let miter_y = cy + perp1_y * half_width + t * d1y;
+                                // Use quad instead of triangle to connect miter to corner center
+                                // This fills the gap between miter tip and stroke segments
+                                let quad = vec![p1_plus, (miter_x, miter_y), p2_plus, (cx, cy)];
+                                ctx.fill_polygon(&quad, color, FillRule::NonZero);
+                            } else {
+                                if is_debug_color { eprintln!("RUST DEBUG: Miter limit exceeded, using bevel"); }
+                                // Bevel fallback
+                                let bevel = vec![(cx, cy), p1_plus, p2_plus];
+                                ctx.fill_polygon(&bevel, color, FillRule::NonZero);
+                            }
+                        }
+                    } else {
+                        // Nearly parallel - just use bevel on both sides
+                        let bevel1 = vec![(cx, cy), p1_plus, p2_plus];
+                        let bevel2 = vec![(cx, cy), p1_minus, p2_minus];
+                        ctx.fill_polygon(&bevel1, color, FillRule::NonZero);
+                        ctx.fill_polygon(&bevel2, color, FillRule::NonZero);
+                    }
+                }
+                LineJoin::Bevel => {
+                    // Bevel join - triangles from center to edge points on both sides
+                    let bevel1 = vec![(cx, cy), p1_plus, p2_plus];
+                    let bevel2 = vec![(cx, cy), p1_minus, p2_minus];
+                    ctx.fill_polygon(&bevel1, color, FillRule::NonZero);
+                    ctx.fill_polygon(&bevel2, color, FillRule::NonZero);
+                }
+            }
         }
     }
 

@@ -37,10 +37,16 @@ pub fn commands_to_polygons(commands: &[PathCmd], transform: &Transform) -> Vec<
                 let p2 = transform.apply(*x2, *y2);
                 let p3 = transform.apply(*x, *y);
 
-                let dist = (p1.0 - p0.0).hypot(p1.1 - p0.1) +
-                           (p2.0 - p1.0).hypot(p2.1 - p1.1) +
-                           (p3.0 - p2.0).hypot(p3.1 - p2.1);
-                let segments = (dist / 2.0).max(4.0).min(100.0) as usize;
+                // Compute arc length estimate for adaptive sampling
+                let chord = (p3.0 - p0.0).hypot(p3.1 - p0.1);
+                let control_net = (p1.0 - p0.0).hypot(p1.1 - p0.1) +
+                                  (p2.0 - p1.0).hypot(p2.1 - p1.1) +
+                                  (p3.0 - p2.0).hypot(p3.1 - p2.1);
+                // Use control polygon length as arc length estimate
+                let arc_len = control_net;
+                // Also consider curvature: if control points deviate from chord, need more segments
+                let deviation = control_net - chord;
+                let segments = ((arc_len + deviation * 2.0) / 1.5).max(16.0).min(200.0) as usize;
 
                 let points = crate::path::sample_cubic_bezier(
                     p0.0, p0.1, p1.0, p1.1, p2.0, p2.1, p3.0, p3.1, segments
@@ -57,8 +63,11 @@ pub fn commands_to_polygons(commands: &[PathCmd], transform: &Transform) -> Vec<
                 let p1 = transform.apply(*x1, *y1);
                 let p2 = transform.apply(*x, *y);
 
-                let dist = (p1.0 - p0.0).hypot(p1.1 - p0.1) + (p2.0 - p1.0).hypot(p2.1 - p1.1);
-                let segments = (dist / 2.0).max(4.0).min(100.0) as usize;
+                // Compute arc length estimate for adaptive sampling
+                let chord = (p2.0 - p0.0).hypot(p2.1 - p0.1);
+                let control_net = (p1.0 - p0.0).hypot(p1.1 - p0.1) + (p2.0 - p1.0).hypot(p2.1 - p1.1);
+                let deviation = control_net - chord;
+                let segments = ((control_net + deviation * 2.0) / 1.5).max(16.0).min(200.0) as usize;
 
                 let points = crate::path::sample_quadratic_bezier(
                     p0.0, p0.1, p1.0, p1.1, p2.0, p2.1, segments

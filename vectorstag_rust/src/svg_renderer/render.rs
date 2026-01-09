@@ -445,7 +445,7 @@ fn render_with_filter(
     // Calculate scale factor from full transform for scaling filter parameters
     let scale_x = (full_transform.a * full_transform.a + full_transform.b * full_transform.b).sqrt();
     let scale_y = (full_transform.c * full_transform.c + full_transform.d * full_transform.d).sqrt();
-    let scale = (scale_x + scale_y) / 2.0;
+    let _scale = (scale_x + scale_y) / 2.0;
 
     // Save current buffer
     let original_buffer = std::mem::take(&mut ctx.buffer);
