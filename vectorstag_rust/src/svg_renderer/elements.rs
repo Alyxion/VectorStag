@@ -49,14 +49,29 @@ pub fn render_path_with_markers(
         processed_polygons.push((poly, is_closed));
     }
 
-    // Fill
+    // Fill - use compound fill for multiple subpaths to handle holes correctly
     if let Some(ref fill) = style.fill {
+        // Count valid polygons
+        let valid_count = processed_polygons.iter()
+            .filter(|(p, _)| p.len() >= 3)
+            .count();
+
         match fill {
             Paint::Color(color) => {
                 let mut c = *color;
                 c.a = (c.a as f64 * style.fill_opacity * style.opacity) as u8;
-                for (poly, _) in &processed_polygons {
-                    ctx.fill_polygon(poly, c, style.fill_rule);
+                if valid_count > 1 {
+                    // Multiple subpaths - use compound fill for proper hole handling
+                    let polys: Vec<Vec<(f64, f64)>> = processed_polygons.iter()
+                        .filter(|(p, _)| p.len() >= 3)
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    ctx.fill_compound_polygon(&polys, c, style.fill_rule);
+                } else {
+                    // Single subpath - use regular fill
+                    for (poly, _) in &processed_polygons {
+                        ctx.fill_polygon(poly, c, style.fill_rule);
+                    }
                 }
             }
             Paint::Ref(id) => {

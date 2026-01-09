@@ -223,6 +223,133 @@ impl RenderContext {
         }
     }
 
+    /// Fill multiple polygons as a compound shape (for paths with holes)
+    /// All subpaths are processed together so fill-rule works correctly
+    pub fn fill_compound_polygon(&mut self, polygons: &[Vec<(f64, f64)>], color: Color, fill_rule: FillRule) {
+        if color.a == 0 {
+            return;
+        }
+
+        // Compute bounding box across all polygons
+        let mut min_x = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        let mut total_points = 0;
+
+        for poly in polygons {
+            if poly.len() < 3 {
+                continue;
+            }
+            total_points += poly.len();
+            for &(x, y) in poly {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+
+        if total_points < 3 || total_points > MAX_POLYGON_POINTS * polygons.len() {
+            return;
+        }
+
+        if max_x < 0.0 || min_x >= self.width as f64 ||
+           max_y < 0.0 || min_y >= self.height as f64 {
+            return;
+        }
+
+        let y_start = (min_y.floor() as i32).max(0) as usize;
+        let y_end = (max_y.ceil() as i32).min(self.height as i32) as usize;
+        let x_start = (min_x.floor() as i32).max(0) as usize;
+        let x_end = (max_x.ceil() as i32).min(self.width as i32) as usize;
+
+        if y_start >= y_end || x_start >= x_end {
+            return;
+        }
+
+        // Collect edges from ALL polygons
+        let mut edges: Vec<(f64, f64, f64, f64, i32)> = Vec::new();
+        for poly in polygons {
+            let n = poly.len();
+            if n < 3 {
+                continue;
+            }
+            for i in 0..n {
+                let j = (i + 1) % n;
+                let (x1, y1) = poly[i];
+                let (x2, y2) = poly[j];
+
+                if (y1 - y2).abs() < 1e-10 {
+                    continue;
+                }
+
+                let (x1, y1, x2, y2, dir) = if y1 < y2 {
+                    (x1, y1, x2, y2, 1)
+                } else {
+                    (x2, y2, x1, y1, -1)
+                };
+
+                edges.push((x1, y1, x2, y2, dir));
+            }
+        }
+
+        // Process all edges together in scanline fill
+        for y in y_start..y_end {
+            let scan_y = y as f64 + 0.5;
+            let mut intersections: Vec<(f64, i32)> = Vec::new();
+
+            for &(x1, y1, x2, y2, dir) in &edges {
+                if y1 <= scan_y && scan_y < y2 {
+                    let t = (scan_y - y1) / (y2 - y1);
+                    let x = x1 + t * (x2 - x1);
+                    intersections.push((x, dir));
+                }
+            }
+
+            intersections.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+            match fill_rule {
+                FillRule::NonZero => {
+                    let mut winding = 0;
+                    let mut last_x: Option<f64> = None;
+
+                    for (x, dir) in intersections {
+                        if winding != 0 {
+                            if let Some(lx) = last_x {
+                                let x_s = (lx.floor() as usize).max(x_start);
+                                let x_e = (x.ceil() as usize).min(x_end);
+                                for px in x_s..x_e {
+                                    self.blend_pixel(px, y, color);
+                                }
+                            }
+                        }
+                        winding += dir;
+                        last_x = Some(x);
+                    }
+                }
+                FillRule::EvenOdd => {
+                    let mut inside = false;
+                    let mut last_x: Option<f64> = None;
+
+                    for (x, _) in intersections {
+                        if inside {
+                            if let Some(lx) = last_x {
+                                let x_s = (lx.floor() as usize).max(x_start);
+                                let x_e = (x.ceil() as usize).min(x_end);
+                                for px in x_s..x_e {
+                                    self.blend_pixel(px, y, color);
+                                }
+                            }
+                        }
+                        inside = !inside;
+                        last_x = Some(x);
+                    }
+                }
+            }
+        }
+    }
+
     /// Interpolate gradient color at position t (0.0 to 1.0)
     pub fn interpolate_gradient_color(stops: &[(f64, u8, u8, u8, u8)], t: f64) -> Color {
         if stops.is_empty() {
